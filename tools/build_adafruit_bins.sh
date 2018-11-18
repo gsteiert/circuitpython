@@ -6,6 +6,7 @@ rm -rf ports/nrf/build*
 
 # Alphabetical.
 HW_BOARDS="\
+arduino_mkr1300 \
 arduino_zero \
 circuitplayground_express \
 circuitplayground_express_crickit \
@@ -25,8 +26,10 @@ grandcentral_m4_express \
 hallowing_m0_express \
 itsybitsy_m0_express \
 itsybitsy_m4_express \
+makerdiary_nrf52840_mdk \
 metro_m0_express \
 metro_m4_express \
+meowmeow \
 pca10056 \
 pca10059 \
 pirkey_m0 \
@@ -81,6 +84,11 @@ for board in $boards; do
             (( exit_status = exit_status || $? ))
             temp_filename=ports/nrf/build-$board-s140/firmware.uf2
             extension=uf2
+        elif [[ $board == "makerdiary_nrf52840_mdk" ]]; then
+            make $PARALLEL -C ports/nrf TRANSLATION=$language BOARD=$board SD=s140
+            (( exit_status = exit_status || $? ))
+            temp_filename=ports/nrf/build-$board-s140/firmware.hex
+            extension=hex
         else
             time make $PARALLEL -C ports/atmel-samd TRANSLATION=$language BOARD=$board
             (( exit_status = exit_status || $? ))
