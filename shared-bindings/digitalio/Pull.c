@@ -26,25 +26,21 @@
 
 #include "shared-bindings/digitalio/Pull.h"
 
-//| .. currentmodule:: digitalio
+//| class Pull:
+//|     """Defines the pull of a digital input pin"""
 //|
-//| :class:`Pull` -- defines the pull of a digital input pin
-//| =============================================================
+//|     def __init__(self) -> None:
+//|         """Enum-like class to define the pull value, if any, used while reading
+//|         digital values in."""
+//|         ...
 //|
-//| .. class:: digitalio.Pull
+//|     UP: Pull
+//|     """When the input line isn't being driven the pull up can pull the state
+//|     of the line high so it reads as true."""
 //|
-//|     Enum-like class to define the pull value, if any, used while reading
-//|     digital values in.
-//|
-//|     .. data:: UP
-//|
-//|       When the input line isn't being driven the pull up can pull the state
-//|       of the line high so it reads as true.
-//|
-//|     .. data:: DOWN
-//|
-//|       When the input line isn't being driven the pull down can pull the
-//|       state of the line low so it reads as false.
+//|     DOWN: Pull
+//|     """When the input line isn't being driven the pull down can pull the
+//|     state of the line low so it reads as false."""
 //|
 const mp_obj_type_t digitalio_pull_type;
 
@@ -64,7 +60,7 @@ STATIC MP_DEFINE_CONST_DICT(digitalio_pull_locals_dict, digitalio_pull_locals_di
 
 STATIC void digitalio_pull_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t kind) {
     qstr pull = MP_QSTR_UP;
-    if (MP_OBJ_TO_PTR(self_in) == MP_ROM_PTR(&digitalio_pull_down_obj)) {
+    if (self_in == MP_ROM_PTR(&digitalio_pull_down_obj)) {
         pull = MP_QSTR_DOWN;
     }
     mp_printf(print, "%q.%q.%q", MP_QSTR_digitalio, MP_QSTR_Pull, pull);
@@ -74,5 +70,5 @@ const mp_obj_type_t digitalio_pull_type = {
     { &mp_type_type },
     .name = MP_QSTR_Pull,
     .print = digitalio_pull_print,
-    .locals_dict = (mp_obj_t)&digitalio_pull_locals_dict,
+    .locals_dict = (mp_obj_dict_t *)&digitalio_pull_locals_dict,
 };

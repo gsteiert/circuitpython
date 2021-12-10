@@ -24,11 +24,10 @@
  * THE SOFTWARE.
  */
 
-#include "boards/board.h"
+#include "supervisor/board.h"
 #include "mpconfigboard.h"
 
-void board_init(void)
-{
+void board_init(void) {
     // struct port_config pin_conf;
     // port_get_config_defaults(&pin_conf);
     //
@@ -45,4 +44,7 @@ bool board_requests_safe_mode(void) {
 }
 
 void reset_board(void) {
+}
+
+void board_deinit(void) {
 }

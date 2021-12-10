@@ -24,12 +24,34 @@
  * THE SOFTWARE.
  */
 
-#ifdef NRF52840
+#include "py/runtime.h"
+#include "supervisor/filesystem.h"
+#include "supervisor/port.h"
+#include "supervisor/shared/stack.h"
 #include "supervisor/usb.h"
+
+#if CIRCUITPY_DISPLAYIO
+#include "shared-module/displayio/__init__.h"
 #endif
 
-void run_background_tasks(void) {
-    #ifdef NRF52840
-        usb_background();
+#if CIRCUITPY_AUDIOBUSIO
+#include "common-hal/audiobusio/I2SOut.h"
+#endif
+
+#if CIRCUITPY_AUDIOPWMIO
+#include "common-hal/audiopwmio/PWMAudioOut.h"
+#endif
+
+void port_start_background_task(void) {
+}
+void port_finish_background_task(void) {
+}
+
+void port_background_task(void) {
+    #if CIRCUITPY_AUDIOPWMIO
+    audiopwmout_background();
+    #endif
+    #if CIRCUITPY_AUDIOBUSIO
+    i2s_background();
     #endif
 }

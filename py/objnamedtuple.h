@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * Copyright (c) 2013, 2014 Damien P. George
+ * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
  * Copyright (c) 2014 Paul Sokolovsky
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -38,7 +38,7 @@
 #if MICROPY_PY_COLLECTIONS
 
 typedef struct _mp_obj_namedtuple_type_t {
-    mp_obj_type_t base;
+    mp_obj_full_type_t base;
     size_t n_fields;
     qstr fields[];
 } mp_obj_namedtuple_type_t;

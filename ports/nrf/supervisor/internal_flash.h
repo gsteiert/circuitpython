@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * Copyright (c) 2013, 2014 Damien P. George
+ * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -30,9 +30,6 @@
 #include <stdint.h>
 
 #include "py/mpconfig.h"
-
-#define FLASH_PAGE_SIZE                 0x1000
-#define CIRCUITPY_INTERNAL_NVM_SIZE     0
 
 #define INTERNAL_FLASH_SYSTICK_MASK     (0x1ff) // 512ms
 #define INTERNAL_FLASH_IDLE_TICK(tick)  (((tick) & INTERNAL_FLASH_SYSTICK_MASK) == 2)

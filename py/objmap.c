@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * Copyright (c) 2013, 2014 Damien P. George
+ * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -49,7 +49,7 @@ STATIC mp_obj_t map_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_
 }
 
 STATIC mp_obj_t map_iternext(mp_obj_t self_in) {
-    mp_check_self(MP_OBJ_IS_TYPE(self_in, &mp_type_map));
+    mp_check_self(mp_obj_is_type(self_in, &mp_type_map));
     mp_obj_map_t *self = MP_OBJ_TO_PTR(self_in);
     mp_obj_t *nextses = m_new(mp_obj_t, self->n_iters);
 
@@ -66,8 +66,11 @@ STATIC mp_obj_t map_iternext(mp_obj_t self_in) {
 
 const mp_obj_type_t mp_type_map = {
     { &mp_type_type },
+    .flags = MP_TYPE_FLAG_EXTENDED,
     .name = MP_QSTR_map,
     .make_new = map_make_new,
-    .getiter = mp_identity_getiter,
-    .iternext = map_iternext,
+    MP_TYPE_EXTENDED_FIELDS(
+        .getiter = mp_identity_getiter,
+        .iternext = map_iternext,
+        ),
 };

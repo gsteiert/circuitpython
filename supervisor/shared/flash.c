@@ -28,30 +28,12 @@
 #include "extmod/vfs_fat.h"
 #include "py/runtime.h"
 #include "lib/oofatfs/ff.h"
+#include "supervisor/flash.h"
+#include "supervisor/shared/tick.h"
 
 #define VFS_INDEX 0
 
 #define PART1_START_BLOCK (0x1)
-
-void supervisor_flash_set_usb_writable(bool usb_writable) {
-    mp_vfs_mount_t* current_mount = MP_STATE_VM(vfs_mount_table);
-    for (uint8_t i = 0; current_mount != NULL; i++) {
-        if (i == VFS_INDEX) {
-            break;
-        }
-        current_mount = current_mount->next;
-    }
-    if (current_mount == NULL) {
-        return;
-    }
-    fs_user_mount_t *vfs = (fs_user_mount_t *) current_mount->obj;
-
-    if (usb_writable) {
-        vfs->flags |= FSUSER_USB_WRITABLE;
-    } else {
-        vfs->flags &= ~FSUSER_USB_WRITABLE;
-    }
-}
 
 // there is a singleton Flash object
 const mp_obj_type_t supervisor_flash_type;
@@ -65,7 +47,7 @@ STATIC mp_obj_t supervisor_flash_obj_make_new(const mp_obj_type_t *type, size_t 
     return (mp_obj_t)&supervisor_flash_obj;
 }
 
-uint32_t flash_get_block_count(void) {
+static uint32_t flash_get_block_count(void) {
     return PART1_START_BLOCK + supervisor_flash_get_block_count();
 }
 
@@ -105,11 +87,8 @@ static void build_partition(uint8_t *buf, int boot, int type, uint32_t start_blo
     buf[15] = num_blocks >> 24;
 }
 
-mp_uint_t flash_read_blocks(uint8_t *dest, uint32_t block_num, uint32_t num_blocks) {
+static mp_uint_t flash_read_blocks(uint8_t *dest, uint32_t block_num, uint32_t num_blocks) {
     if (block_num == 0) {
-        if (block_num > 1) {
-            return 1; // error
-        }
         // fake the MBR so we can decide on our own partition table
 
         for (int i = 0; i < 446; i++) {
@@ -123,14 +102,20 @@ mp_uint_t flash_read_blocks(uint8_t *dest, uint32_t block_num, uint32_t num_bloc
 
         dest[510] = 0x55;
         dest[511] = 0xaa;
-
-        return 0; // ok
-
+        if (num_blocks > 1) {
+            dest += 512;
+            num_blocks -= 1;
+            // Fall through and do a read from flash.
+        } else {
+            return 0; // Done and ok.
+        }
     }
     return supervisor_flash_read_blocks(dest, block_num - PART1_START_BLOCK, num_blocks);
 }
 
-mp_uint_t flash_write_blocks(const uint8_t *src, uint32_t block_num, uint32_t num_blocks) {
+volatile bool filesystem_dirty = false;
+
+static mp_uint_t flash_write_blocks(const uint8_t *src, uint32_t block_num, uint32_t num_blocks) {
     if (block_num == 0) {
         if (num_blocks > 1) {
             return 1; // error
@@ -138,8 +123,26 @@ mp_uint_t flash_write_blocks(const uint8_t *src, uint32_t block_num, uint32_t nu
         // can't write MBR, but pretend we did
         return 0;
     } else {
+        if (!filesystem_dirty) {
+            // Turn on ticks so that we can flush after a period of time elapses.
+            supervisor_enable_tick();
+            filesystem_dirty = true;
+        }
         return supervisor_flash_write_blocks(src, block_num - PART1_START_BLOCK, num_blocks);
     }
+}
+
+void supervisor_flash_flush(void) {
+    #if INTERNAL_FLASH_FILESYSTEM
+    port_internal_flash_flush();
+    #else
+    supervisor_external_flash_flush();
+    #endif
+    // Turn off ticks now that our filesystem has been flushed.
+    if (filesystem_dirty) {
+        supervisor_disable_tick();
+    }
+    filesystem_dirty = false;
 }
 
 STATIC mp_obj_t supervisor_flash_obj_readblocks(mp_obj_t self, mp_obj_t block_num, mp_obj_t buf) {
@@ -158,16 +161,37 @@ STATIC mp_obj_t supervisor_flash_obj_writeblocks(mp_obj_t self, mp_obj_t block_n
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_3(supervisor_flash_obj_writeblocks_obj, supervisor_flash_obj_writeblocks);
 
+static bool flash_ioctl(size_t cmd, mp_int_t *out_value) {
+    *out_value = 0;
+    switch (cmd) {
+        case MP_BLOCKDEV_IOCTL_INIT:
+            supervisor_flash_init();
+            break;
+        case MP_BLOCKDEV_IOCTL_DEINIT:
+            supervisor_flash_flush();
+            break; // TODO properly
+        case MP_BLOCKDEV_IOCTL_SYNC:
+            supervisor_flash_flush();
+            break;
+        case MP_BLOCKDEV_IOCTL_BLOCK_COUNT:
+            *out_value = flash_get_block_count();
+            break;
+        case MP_BLOCKDEV_IOCTL_BLOCK_SIZE:
+            *out_value = supervisor_flash_get_block_size();
+            break;
+        default:
+            return false;
+    }
+    return true;
+}
+
 STATIC mp_obj_t supervisor_flash_obj_ioctl(mp_obj_t self, mp_obj_t cmd_in, mp_obj_t arg_in) {
     mp_int_t cmd = mp_obj_get_int(cmd_in);
-    switch (cmd) {
-        case BP_IOCTL_INIT: supervisor_flash_init(); return MP_OBJ_NEW_SMALL_INT(0);
-        case BP_IOCTL_DEINIT: supervisor_flash_flush(); return MP_OBJ_NEW_SMALL_INT(0); // TODO properly
-        case BP_IOCTL_SYNC: supervisor_flash_flush(); return MP_OBJ_NEW_SMALL_INT(0);
-        case BP_IOCTL_SEC_COUNT: return MP_OBJ_NEW_SMALL_INT(flash_get_block_count());
-        case BP_IOCTL_SEC_SIZE: return MP_OBJ_NEW_SMALL_INT(supervisor_flash_get_block_size());
-        default: return mp_const_none;
+    mp_int_t out_value;
+    if (flash_ioctl(cmd, &out_value)) {
+        return MP_OBJ_NEW_SMALL_INT(out_value);
     }
+    return mp_const_none;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_3(supervisor_flash_obj_ioctl_obj, supervisor_flash_obj_ioctl);
 
@@ -183,20 +207,21 @@ const mp_obj_type_t supervisor_flash_type = {
     { &mp_type_type },
     .name = MP_QSTR_Flash,
     .make_new = supervisor_flash_obj_make_new,
-    .locals_dict = (mp_obj_t)&supervisor_flash_obj_locals_dict,
+    .locals_dict = (struct _mp_obj_dict_t *)&supervisor_flash_obj_locals_dict,
 };
 
 void supervisor_flash_init_vfs(fs_user_mount_t *vfs) {
     vfs->base.type = &mp_fat_vfs_type;
-    vfs->flags |= FSUSER_NATIVE | FSUSER_HAVE_IOCTL;
+    vfs->blockdev.flags |= MP_BLOCKDEV_FLAG_NATIVE | MP_BLOCKDEV_FLAG_HAVE_IOCTL;
     vfs->fatfs.drv = vfs;
-    vfs->fatfs.part = 1; // flash filesystem lives on first partition
-    vfs->readblocks[0] = (mp_obj_t)&supervisor_flash_obj_readblocks_obj;
-    vfs->readblocks[1] = (mp_obj_t)&supervisor_flash_obj;
-    vfs->readblocks[2] = (mp_obj_t)flash_read_blocks; // native version
-    vfs->writeblocks[0] = (mp_obj_t)&supervisor_flash_obj_writeblocks_obj;
-    vfs->writeblocks[1] = (mp_obj_t)&supervisor_flash_obj;
-    vfs->writeblocks[2] = (mp_obj_t)flash_write_blocks; // native version
-    vfs->u.ioctl[0] = (mp_obj_t)&supervisor_flash_obj_ioctl_obj;
-    vfs->u.ioctl[1] = (mp_obj_t)&supervisor_flash_obj;
+    vfs->fatfs.part = 1; // flash filesystem lives on first fake partition
+    vfs->blockdev.readblocks[0] = (mp_obj_t)&supervisor_flash_obj_readblocks_obj;
+    vfs->blockdev.readblocks[1] = (mp_obj_t)&supervisor_flash_obj;
+    vfs->blockdev.readblocks[2] = (mp_obj_t)flash_read_blocks; // native version
+    vfs->blockdev.writeblocks[0] = (mp_obj_t)&supervisor_flash_obj_writeblocks_obj;
+    vfs->blockdev.writeblocks[1] = (mp_obj_t)&supervisor_flash_obj;
+    vfs->blockdev.writeblocks[2] = (mp_obj_t)flash_write_blocks; // native version
+    vfs->blockdev.u.ioctl[0] = (mp_obj_t)&supervisor_flash_obj_ioctl_obj;
+    vfs->blockdev.u.ioctl[1] = (mp_obj_t)&supervisor_flash_obj;
+    vfs->blockdev.u.ioctl[2] = (mp_obj_t)flash_ioctl; // native version
 }
