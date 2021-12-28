@@ -1,3 +1,29 @@
+CFLAGS += \
+	-mthumb \
+	-mapcs \
+	-mcpu=cortex-m7 \
+	-mfloat-abi=hard \
+	-mfpu=fpv5-sp-d16 \
+	-DCPU_$(CHIP_VARIANT) \
+	-DDEBUG \
+	-DIMXRT10XX \
+	-D__PROGRAM_START \
+	-g3 -Wno-unused-parameter \
+	-ffunction-sections -fdata-sections -fstack-usage
+
+LDFLAGS += -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-sp-d16 -mthumb -mapcs
+
+# TinyUSB defines
+SRC_C += lib/tinyusb/src/portable/nxp/transdimension/dcd_transdimension.c
+
+CFLAGS += -DCFG_TUSB_MCU=OPT_MCU_MIMXRT10XX -DCFG_TUD_MIDI_RX_BUFSIZE=512 -DCFG_TUD_CDC_RX_BUFSIZE=512 -DCFG_TUD_MIDI_TX_BUFSIZE=512 -DCFG_TUD_CDC_TX_BUFSIZE=512 -DCFG_TUD_MSC_BUFSIZE=1024
+
+USB_HIGHSPEED = 1
+
+# Number of USB endpoint pairs.
+USB_NUM_ENDPOINT_PAIRS = 8
+
+# Path to library sources
 VPATH += \
     $(MCUX)/CMSIS/Core/Include \
     $(MCUX)/CMSIS/DSP \
@@ -38,6 +64,7 @@ VPATH += \
     $(MCUX)/devices/$(CHIP_FAMILY)/utilities \
     $(MCUX)/devices/$(CHIP_FAMILY)/xip \
 
+# Library includes
 INC += \
     -I$(MCUX)/CMSIS/Core/Include \
     -I$(MCUX)/CMSIS/DSP \
@@ -77,9 +104,6 @@ INC += \
     -I$(MCUX)/devices/$(CHIP_FAMILY)/drivers \
     -I$(MCUX)/devices/$(CHIP_FAMILY)/utilities \
     -I$(MCUX)/devices/$(CHIP_FAMILY)/xip
-
-#VPATH += $(DRIVER_PATH)
-#INC += $(DRIVER_PATH)
 
 # excluded libraries
     # /sdk/../../../middleware

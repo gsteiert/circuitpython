@@ -1,5 +1,3 @@
-LD_FILE = $(FLASH).ld $(CHIP_FAMILY).ld imxrt10xx.ld
-
 ifeq ($(LONGINT_IMPL),NONE)
 MPY_TOOL_LONGINT_IMPL = -mlongint-impl=none
 endif
@@ -13,11 +11,6 @@ MPY_TOOL_LONGINT_IMPL = -mlongint-impl=longlong
 endif
 
 INTERNAL_LIBM = 1
-
-USB_HIGHSPEED = 1
-
-# Number of USB endpoint pairs.
-USB_NUM_ENDPOINT_PAIRS = 8
 
 INTERNAL_FLASH_FILESYSTEM = 1
 

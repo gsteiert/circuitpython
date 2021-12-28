@@ -40,7 +40,7 @@ include ../../py/mkenv.mk
 # Board-specific
 include boards/$(BOARD)/mpconfigboard.mk
 # Device-specific
-include devices/$(CHIP_FAMILY)/vpath.mk
+include devices/$(CHIP_FAMILY)/device.mk
 # Port-specific
 include mpconfigport.mk
 # CircuitPython-specific
@@ -75,9 +75,6 @@ INC += \
 
 CFLAGS += -Os -ftree-vrp -DNDEBUG -ffreestanding
 
-# TinyUSB defines
-CFLAGS += -DCFG_TUSB_MCU=OPT_MCU_MIMXRT10XX -DCFG_TUD_MIDI_RX_BUFSIZE=512 -DCFG_TUD_CDC_RX_BUFSIZE=512 -DCFG_TUD_MIDI_TX_BUFSIZE=512 -DCFG_TUD_CDC_TX_BUFSIZE=512 -DCFG_TUD_MSC_BUFSIZE=1024
-
 #Debugging/Optimization
 # Never set -fno-inline because we use inline to move small functions into routines that must be
 # in RAM. If inlining is disallowed, then we may end up calling a function in flash when we cannot.
@@ -96,25 +93,12 @@ CFLAGS += $(INC) -ggdb -Wall -Werror -std=gnu11 -nostdlib -fshort-enums $(BASE_C
 # Disable some warnings, as do most ports. NXP SDK causes undef, tinyusb causes cast-align
 # CFLAGS += -Wno-undef -Wno-cast-align
 
-CFLAGS += \
-	-mthumb \
-	-mapcs \
-	-mcpu=cortex-m7 \
-	-mfloat-abi=hard \
-	-mfpu=fpv5-sp-d16 \
-	-DCPU_$(CHIP_VARIANT) \
-	-DDEBUG \
-	-DIMXRT10XX \
-	-D__PROGRAM_START \
-	-g3 -Wno-unused-parameter \
-	-ffunction-sections -fdata-sections -fstack-usage
-
 OPTIMIZATION_FLAGS ?= -O2 -fno-inline-functions
 
 # option to override compiler optimization level, set in boards/$(BOARD)/mpconfigboard.mk
 CFLAGS += $(OPTIMIZATION_FLAGS)
 
-LD_FILES = $(wildcard boards/$(BOARD)/*.ld) $(addprefix linking/, flash/$(FLASH).ld chip_family/$(CHIP_FAMILY).ld common.ld)
+LD_FILES = $(wildcard boards/$(BOARD)/*.ld) flash/$(FLASH).ld devices/$(CHIP_FAMILY)/$(CHIP_FAMILY).ld common.ld
 
 LD_SCRIPT_FLAG := -Wl,-T,
 
@@ -126,8 +110,6 @@ ifndef INTERNAL_LIBM
 LIBS += -lm
 endif
 
-LDFLAGS += -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-sp-d16 -mthumb -mapcs
-BOOTLOADER_SIZE := 0x6000C000
 
 SRC_SDK := \
 	fsl_adc.c \
@@ -155,7 +137,6 @@ SRC_C += \
 	boards/$(BOARD)/flash_config.c \
 	boards/$(BOARD)/pins.c \
 	fatfs_port.c \
-	lib/tinyusb/src/portable/nxp/transdimension/dcd_transdimension.c \
 	mphalport.c \
 	peripherals/$(CHIP_FAMILY)/clocks.c \
 	peripherals/$(CHIP_FAMILY)/periph.c \
@@ -206,7 +187,7 @@ $(BUILD)/firmware.bin: $(BUILD)/firmware.elf
 $(BUILD)/firmware.uf2: $(BUILD)/firmware.elf
 	$(STEPECHO) "Create $@"
 	$(Q)$(OBJCOPY) -O binary -j .text -j .ARM.exidx -j .data -j .itcm -j .dtcm_data $^ $@-binpart
-	$(Q)$(PYTHON) $(TOP)/tools/uf2/utils/uf2conv.py -b $(BOOTLOADER_SIZE) -f MIMXRT10XX -c -o $@ $@-binpart
+	$(Q)$(PYTHON) $(TOP)/tools/uf2/utils/uf2conv.py -b $(APP_BASE_ADDR) -f MIMXRT10XX -c -o $@ $@-binpart
 	$(Q)rm $@-binpart
 
 $(BUILD)/firmware.hex: $(BUILD)/firmware.elf
