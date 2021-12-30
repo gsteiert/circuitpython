@@ -67,9 +67,10 @@ INC += \
 	-I../../lib/tinyusb/src \
 	-I../../supervisor/shared/usb \
 	-I$(BUILD) \
-	-Iboards/ \
+	-Iboards \
 	-Iboards/$(BOARD) \
-	-Iperipherals/ \
+    -Idevices/$(CHIP_FAMILY) \
+	-Iperipherals \
 
 # NDEBUG disables assert() statements. This reduces code size pretty dramatically, per tannewt.
 
@@ -138,9 +139,9 @@ SRC_C += \
 	boards/$(BOARD)/pins.c \
 	fatfs_port.c \
 	mphalport.c \
-	peripherals/$(CHIP_FAMILY)/clocks.c \
-	peripherals/$(CHIP_FAMILY)/periph.c \
-	peripherals/$(CHIP_FAMILY)/pins.c \
+	clocks.c \
+	periph.c \
+	pins.c \
 	reset.c \
 	supervisor/flexspi_nor_flash_ops.c
 

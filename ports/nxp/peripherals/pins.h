@@ -72,12 +72,7 @@ typedef struct {
         .pad_reset = p_pad_reset, \
     }
 
-#ifdef MIMXRT1011_SERIES
-#include "MIMXRT1011/pins.h"
-#elif defined(MIMXRT1021_SERIES)
-#include "MIMXRT1021/pins.h"
-#elif defined(MIMXRT1062_SERIES)
-#include "MIMXRT1062/pins.h"
-#endif
+// device specific files located in devices/$(CHIP_FAMILY)
+#include "dev_pins.h"
 
 #endif // MICROPY_INCLUDED_MIMXRT10XX_PERIPHERALS_PINS_H

@@ -25,6 +25,7 @@ USB_NUM_ENDPOINT_PAIRS = 8
 
 # Path to library sources
 VPATH += \
+    devices/$(CHIP_FAMILY) \
     $(MCUX)/CMSIS/Core/Include \
     $(MCUX)/CMSIS/DSP \
     $(MCUX)/drivers/adc_12b1msps_sar \
@@ -59,7 +60,7 @@ VPATH += \
     $(MCUX)/drivers/trng \
     $(MCUX)/drivers/wdog01 \
     $(MCUX)/drivers/xbara \
-    $(MCUX)/devices/$(CHIP_FAMILY)/. \
+    $(MCUX)/devices/$(CHIP_FAMILY) \
     $(MCUX)/devices/$(CHIP_FAMILY)/drivers \
     $(MCUX)/devices/$(CHIP_FAMILY)/utilities \
     $(MCUX)/devices/$(CHIP_FAMILY)/xip \
@@ -100,7 +101,7 @@ INC += \
     -I$(MCUX)/drivers/trng \
     -I$(MCUX)/drivers/wdog01 \
     -I$(MCUX)/drivers/xbara \
-    -I$(MCUX)/devices/$(CHIP_FAMILY)/. \
+    -I$(MCUX)/devices/$(CHIP_FAMILY) \
     -I$(MCUX)/devices/$(CHIP_FAMILY)/drivers \
     -I$(MCUX)/devices/$(CHIP_FAMILY)/utilities \
     -I$(MCUX)/devices/$(CHIP_FAMILY)/xip

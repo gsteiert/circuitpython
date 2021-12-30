@@ -76,12 +76,7 @@ extern LPI2C_Type *mcu_i2c_banks[];
 extern LPSPI_Type *mcu_spi_banks[];
 extern LPUART_Type *mcu_uart_banks[];
 
-#ifdef MIMXRT1011_SERIES
-#include "MIMXRT1011/periph.h"
-#elif defined(MIMXRT1021_SERIES)
-#include "MIMXRT1021/periph.h"
-#elif defined(MIMXRT1062_SERIES)
-#include "MIMXRT1062/periph.h"
-#endif
+// device specific files located in devices/$(CHIP_FAMILY)
+#include "dev_periph.h"
 
 #endif // MICROPY_INCLUDED_MIMXRT10XX_PERIPHERALS_PERIPH_H
