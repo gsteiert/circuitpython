@@ -1,30 +1,9 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 Scott Shawcroft for Adafruit Industries LLC
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-#ifndef MICROPY_INCLUDED_SUPERVISOR_SHARED_EXTERNAL_FLASH_DEVICE_H
-#define MICROPY_INCLUDED_SUPERVISOR_SHARED_EXTERNAL_FLASH_DEVICE_H
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 Scott Shawcroft for Adafruit Industries LLC
+//
+// SPDX-License-Identifier: MIT
+#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -45,7 +24,11 @@ typedef struct {
     // status register.
     uint8_t quad_enable_bit_mask;
 
+    // Device has sector-level write protection
     bool has_sector_protection : 1;
+
+    // Device uses global block protection lock instead of status register bits to enable sector writes
+    bool use_global_block_protection_lock : 1;
 
     // Supports the 0x0b fast read command with 8 dummy cycles.
     bool supports_fast_read : 1;
@@ -74,5 +57,3 @@ typedef struct {
     // Device does not have a reset command
     bool no_reset_cmd : 1;
 } external_flash_device;
-
-#endif  // MICROPY_INCLUDED_SUPERVISOR_SHARED_EXTERNAL_FLASH_DEVICE_H

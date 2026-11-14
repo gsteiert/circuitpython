@@ -1,29 +1,21 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #pragma once
 
+#include <stdint.h>
+
+#include "supervisor/filesystem.h"
+
 extern bool supervisor_workflow_connecting(void);
+
+// File system helpers for workflow code. All of them take full paths (such as
+// "/code.py"), resolve them to a mount and return supervisor_fs_err_t. Paths
+// may name either FAT or littlefs mounts.
+supervisor_fs_err_t supervisor_workflow_move(const char *old_path, const char *new_path);
+supervisor_fs_err_t supervisor_workflow_mkdir(uint64_t mtime_ns, const char *full_path);
+supervisor_fs_err_t supervisor_workflow_mkdir_parents(uint64_t mtime_ns, char *path);
+supervisor_fs_err_t supervisor_workflow_delete_recursive(const char *full_path);

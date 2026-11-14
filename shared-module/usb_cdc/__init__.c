@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Dan Halbert for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Dan Halbert for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "py/gc.h"
 #include "py/obj.h"
@@ -36,8 +16,7 @@
 #include "tusb.h"
 
 #if CIRCUITPY_USB_VENDOR
-// todo - this doesn't feel like it should be here.
-#include "supervisor/memory.h"
+#include "supervisor/port.h"
 #endif
 
 #if CFG_TUD_CDC != 2
@@ -126,7 +105,7 @@ static const uint8_t usb_cdc_descriptor_template[] = {
     0xFF,        // 54 bEndpointAddress (OUT/H2D) [SET AT RUNTIME]
 #define CDC_DATA_OUT_ENDPOINT_INDEX 54
     0x02,        // 55 bmAttributes (Bulk)
-    #if USB_HIGHSPEED
+    #if CIRCUITPY_USB_DEVICE_HIGH_SPEED == 1
     0x00, 0x02,  // 56,57  wMaxPacketSize 512
     #else
     0x40, 0x00,  // 56,57  wMaxPacketSize 64
@@ -139,7 +118,7 @@ static const uint8_t usb_cdc_descriptor_template[] = {
     0xFF,        // 61 bEndpointAddress (IN/D2H) [SET AT RUNTIME: 0x80 | number]
 #define CDC_DATA_IN_ENDPOINT_INDEX 61
     0x02,        // 62 bmAttributes (Bulk)
-    #if USB_HIGHSPEED
+    #if CIRCUITPY_USB_DEVICE_HIGH_SPEED == 1
     0x00, 0x02,  // 63,64 wMaxPacketSize 512
     #else
     0x40, 0x00,  // 63,64 wMaxPacketSize 64
@@ -147,10 +126,10 @@ static const uint8_t usb_cdc_descriptor_template[] = {
     0x00,        // 65 bInterval 0 (unit depends on device speed)
 };
 
-static const char console_cdc_comm_interface_name[] = USB_INTERFACE_NAME " CDC control";
-static const char data_cdc_comm_interface_name[] = USB_INTERFACE_NAME " CDC2 control";
-static const char console_cdc_data_interface_name[] = USB_INTERFACE_NAME " CDC data";
-static const char data_cdc_data_interface_name[] = USB_INTERFACE_NAME " CDC2 data";
+static const char console_cdc_comm_interface_name[] = "CDC control";
+static const char data_cdc_comm_interface_name[] = "CDC2 control";
+static const char console_cdc_data_interface_name[] = "CDC data";
+static const char data_cdc_data_interface_name[] = "CDC2 data";
 
 // .idx is set later.
 
@@ -213,6 +192,11 @@ size_t usb_cdc_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *desc
         ? (USB_CDC_EP_NUM_DATA_IN ? USB_CDC_EP_NUM_DATA_IN : descriptor_counts->current_endpoint)
         : (USB_CDC2_EP_NUM_DATA_IN ? USB_CDC2_EP_NUM_DATA_IN : descriptor_counts->current_endpoint));
     descriptor_counts->num_in_endpoints++;
+    // Some TinyUSB devices have issues with bi-directional endpoints
+    #ifdef TUD_ENDPOINT_ONE_DIRECTION_ONLY
+    descriptor_counts->current_endpoint++;
+    #endif
+
     descriptor_buf[CDC_DATA_OUT_ENDPOINT_INDEX] =
         console
         ? (USB_CDC_EP_NUM_DATA_OUT ? USB_CDC_EP_NUM_DATA_OUT : descriptor_counts->current_endpoint)
@@ -220,12 +204,22 @@ size_t usb_cdc_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *desc
     descriptor_counts->num_out_endpoints++;
     descriptor_counts->current_endpoint++;
 
-    usb_add_interface_string(*current_interface_string,
+    #if CIRCUITPY_FULL_BUILD
+    const char *custom_control_interface_name =
+        console ? custom_usb_cdc_console_control_interface_name : custom_usb_cdc_data_control_interface_name;
+    const char *custom_data_interface_name =
+        console ? custom_usb_cdc_console_data_interface_name : custom_usb_cdc_data_data_interface_name;
+    #else
+    const char *custom_control_interface_name = NULL;
+    const char *custom_data_interface_name = NULL;
+    #endif
+
+    usb_add_interface_name(*current_interface_string, custom_control_interface_name,
         console ? console_cdc_comm_interface_name : data_cdc_comm_interface_name);
     descriptor_buf[CDC_COMM_INTERFACE_STRING_INDEX] = *current_interface_string;
     (*current_interface_string)++;
 
-    usb_add_interface_string(*current_interface_string,
+    usb_add_interface_name(*current_interface_string, custom_data_interface_name,
         console ? console_cdc_data_interface_name : data_cdc_data_interface_name);
     descriptor_buf[CDC_DATA_INTERFACE_STRING_INDEX] = *current_interface_string;
     (*current_interface_string)++;
@@ -342,7 +336,7 @@ static const uint8_t usb_vendor_descriptor_template[] = {
     0xFF,        // 11 bEndpointAddress (IN/D2H) [SET AT RUNTIME: number]
 #define VENDOR_OUT_ENDPOINT_INDEX 11
     0x02,        // 12 bmAttributes (Bulk)
-    #if USB_HIGHSPEED
+    #if CIRCUITPY_USB_DEVICE_HIGH_SPEED == 1
     0x00, 0x02,  // 13,14  wMaxPacketSize 512
     #else
     0x40, 0x00,  // 13,14  wMaxPacketSize 64
@@ -359,7 +353,7 @@ static const uint8_t usb_vendor_descriptor_template[] = {
     0x0          // 22  bInterval 0
 };
 
-static const char vendor_interface_name[] = USB_INTERFACE_NAME " WebUSB";
+static const char vendor_interface_name[] = "WebUSB";
 
 
 bool usb_vendor_enabled(void) {
@@ -370,27 +364,25 @@ size_t usb_vendor_descriptor_length(void) {
     return sizeof(usb_vendor_descriptor_template);
 }
 
-static supervisor_allocation *ms_os_20_descriptor_allocation;
+static uint8_t *ms_os_20_descriptor = NULL;
 
-size_t vendor_ms_os_20_descriptor_length() {
-    return sizeof(ms_os_20_descriptor_template);
+size_t vendor_ms_os_20_descriptor_length(void) {
+    return ms_os_20_descriptor != NULL ? sizeof(ms_os_20_descriptor_template) : 0;
 }
-uint8_t const *vendor_ms_os_20_descriptor() {
-    return (uint8_t *)ms_os_20_descriptor_allocation->ptr;
+uint8_t const *vendor_ms_os_20_descriptor(void) {
+    return ms_os_20_descriptor;
 }
-
 
 size_t usb_vendor_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *descriptor_counts, uint8_t *current_interface_string) {
-
-    if (ms_os_20_descriptor_template[MS_OS_20_ITF_NUM_OFFSET] == MS_OS_20_ITF_NUM_MAGIC) {
-        ms_os_20_descriptor_allocation =
-            allocate_memory(align32_size(sizeof(ms_os_20_descriptor_template)),
-                /*high_address*/ false, /*movable*/ false);
-        uint8_t *ms_os_20_descriptor_buf = (uint8_t *)ms_os_20_descriptor_allocation->ptr;
-        memcpy(ms_os_20_descriptor_buf, ms_os_20_descriptor_template, sizeof(ms_os_20_descriptor_template));
-        ms_os_20_descriptor_buf[MS_OS_20_ITF_NUM_OFFSET] = descriptor_counts->current_interface;
-        ms_os_20_descriptor_buf[VENDOR_IN_ENDPOINT_INDEX] = 0x80 | descriptor_counts->current_endpoint;
-        ms_os_20_descriptor_buf[VENDOR_OUT_ENDPOINT_INDEX] = descriptor_counts->current_endpoint;
+    if (ms_os_20_descriptor == NULL) {
+        ms_os_20_descriptor = port_malloc(sizeof(ms_os_20_descriptor_template), false);
+        if (ms_os_20_descriptor == NULL) {
+            return 0;
+        }
+        memcpy(ms_os_20_descriptor, ms_os_20_descriptor_template, sizeof(ms_os_20_descriptor_template));
+        ms_os_20_descriptor[MS_OS_20_ITF_NUM_OFFSET] = descriptor_counts->current_interface;
+        ms_os_20_descriptor[VENDOR_IN_ENDPOINT_INDEX] = 0x80 | descriptor_counts->current_endpoint;
+        ms_os_20_descriptor[VENDOR_OUT_ENDPOINT_INDEX] = descriptor_counts->current_endpoint;
     }
 
     memcpy(descriptor_buf, usb_vendor_descriptor_template, sizeof(usb_vendor_descriptor_template));
@@ -404,14 +396,11 @@ size_t usb_vendor_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *d
     descriptor_counts->num_out_endpoints++;
     descriptor_counts->current_endpoint++;
 
-    usb_add_interface_string(*current_interface_string, vendor_interface_name);
+    usb_add_interface_name(*current_interface_string, NULL, vendor_interface_name);
     descriptor_buf[VENDOR_INTERFACE_STRING_INDEX] = *current_interface_string;
     (*current_interface_string)++;
 
     return sizeof(usb_vendor_descriptor_template);
 }
-
-
-
 
 #endif

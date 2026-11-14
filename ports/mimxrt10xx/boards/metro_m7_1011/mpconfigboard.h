@@ -1,3 +1,12 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2019 Scott Shawcroft for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2019 Artur Pacholec
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
 #define MICROPY_HW_BOARD_NAME "Metro MIMXRT1011"
 #define MICROPY_HW_MCU_NAME "IMXRT1011DAE5A"
 
@@ -7,7 +16,7 @@
 // make sure you don't overwrite code
 #define CIRCUITPY_INTERNAL_NVM_SIZE 0
 
-#define BOARD_FLASH_SIZE (4 * 1024 * 1024)
+#define BOARD_FLASH_SIZE (8 * 1024 * 1024)
 
 #define DEFAULT_I2C_BUS_SCL (&pin_GPIO_02)
 #define DEFAULT_I2C_BUS_SDA (&pin_GPIO_01)

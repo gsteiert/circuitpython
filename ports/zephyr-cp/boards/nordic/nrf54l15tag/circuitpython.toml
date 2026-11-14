@@ -1,0 +1,13 @@
+CIRCUITPY_BUILD_EXTENSIONS = ["hex"]
+# The ru build had only 8 bytes of flash left.
+DISABLED_MODULES = ["msgpack"]
+
+# QFN48 package pin numbers.
+[pins]
+# board.I2C() pins: the sensor I2C bus, P1.11/P1.12.
+SCL = 39
+SDA = 40
+# board.SPI() pins: the bmi270's bus, P1.08/P1.06/P1.05.
+SCK = 9
+MOSI = 7
+MISO = 6

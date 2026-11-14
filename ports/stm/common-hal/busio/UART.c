@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2019 Lucian Copeland for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2019 Lucian Copeland for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/microcontroller/__init__.h"
 #include "shared-bindings/microcontroller/Pin.h"
@@ -35,45 +15,20 @@
 #include "py/mperrno.h"
 #include "py/runtime.h"
 #include "py/stream.h"
-#include "supervisor/shared/translate.h"
 
 #define ALL_UARTS 0xFFFF
 
 // arrays use 0 based numbering: UART1 is stored at index 0
-STATIC bool reserved_uart[MAX_UART];
-STATIC bool never_reset_uart[MAX_UART];
+static bool reserved_uart[MAX_UART];
 int errflag; // Used to restart read halts
 
-STATIC void uart_clock_enable(uint16_t mask);
-STATIC void uart_clock_disable(uint16_t mask);
-STATIC void uart_assign_irq(busio_uart_obj_t *self, USART_TypeDef *USARTx);
+static void uart_clock_enable(uint16_t mask);
+static void uart_clock_disable(uint16_t mask);
+static void uart_assign_irq(busio_uart_obj_t *self, USART_TypeDef *USARTx);
 
-STATIC USART_TypeDef *assign_uart_or_throw(busio_uart_obj_t *self, bool pin_eval,
-    int periph_index, bool uart_taken) {
-    if (pin_eval) {
-        // assign a root pointer pointer for IRQ
-        MP_STATE_PORT(cpy_uart_obj_all)[periph_index] = self;
-        return mcu_uart_banks[periph_index];
-    } else {
-        if (uart_taken) {
-            mp_raise_ValueError(translate("Hardware in use, try alternative pins"));
-        } else {
-            mp_raise_ValueError_varg(translate("Invalid %q pin selection"), MP_QSTR_UART);
-        }
-    }
-}
-
-void uart_reset(void) {
-    uint16_t never_reset_mask = 0x00;
-    for (uint8_t i = 0; i < MAX_UART; i++) {
-        if (!never_reset_uart[i]) {
-            reserved_uart[i] = false;
-            MP_STATE_PORT(cpy_uart_obj_all)[i] = NULL;
-        } else {
-            never_reset_mask |= 1 << i;
-        }
-    }
-    uart_clock_disable(ALL_UARTS & ~(never_reset_mask));
+static void mark_deinit(busio_uart_obj_t *self) {
+    self->tx = NULL;
+    self->rx = NULL;
 }
 
 void common_hal_busio_uart_construct(busio_uart_obj_t *self,
@@ -84,17 +39,21 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
     mp_float_t timeout, uint16_t receiver_buffer_size, byte *receiver_buffer,
     bool sigint_enabled) {
 
-    // match pins to UART objects
-    USART_TypeDef *USARTx;
+    mark_deinit(self);
 
+    if ((rts != NULL) || (cts != NULL) || (rs485_dir != NULL) || (rs485_invert == true)) {
+        mp_raise_NotImplementedError(MP_ERROR_TEXT("RS485"));
+    }
+
+    mp_arg_validate_length_min(receiver_buffer_size, 1, MP_QSTR_receiver_buffer_size);
+    mp_arg_validate_int_range(bits, 8, 9, MP_QSTR_bits);
+
+    // match pins to UART objects
+    const mcu_periph_obj_t *tx_periph = NULL;
+    const mcu_periph_obj_t *rx_periph = NULL;
     uint8_t tx_len = MP_ARRAY_SIZE(mcu_uart_tx_list);
     uint8_t rx_len = MP_ARRAY_SIZE(mcu_uart_rx_list);
     bool uart_taken = false;
-    uint8_t periph_index = 0; // origin 0 corrected
-
-    if ((rts != NULL) || (cts != NULL) || (rs485_dir != NULL) || (rs485_invert == true)) {
-        mp_raise_ValueError(translate("RTS/CTS/RS485 Not yet supported on this device"));
-    }
 
     // Can have both pins, or either
     if ((tx != NULL) && (rx != NULL)) {
@@ -111,19 +70,16 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
                             continue;
                         }
                         // store pins if not
-                        self->tx = &mcu_uart_tx_list[i];
-                        self->rx = &mcu_uart_rx_list[j];
+                        tx_periph = &mcu_uart_tx_list[i];
+                        rx_periph = &mcu_uart_rx_list[j];
                         break;
                     }
                 }
-                if (self->tx != NULL) {
+                if (tx_periph != NULL) {
                     break;
                 }
             }
         }
-        periph_index = self->tx->periph_index - 1;
-        USARTx = assign_uart_or_throw(self, (self->tx != NULL && self->rx != NULL),
-            periph_index, uart_taken);
     } else if (tx == NULL) {
         // If there is no tx, run only rx
         for (uint i = 0; i < rx_len; i++) {
@@ -134,13 +90,10 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
                     continue;
                 }
                 // store pins if not
-                self->rx = &mcu_uart_rx_list[i];
+                rx_periph = &mcu_uart_rx_list[i];
                 break;
             }
         }
-        periph_index = self->rx->periph_index - 1;
-        USARTx = assign_uart_or_throw(self, (self->rx != NULL),
-            periph_index, uart_taken);
     } else if (rx == NULL) {
         // If there is no rx, run only tx
         for (uint i = 0; i < tx_len; i++) {
@@ -151,28 +104,45 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
                     continue;
                 }
                 // store pins if not
-                self->tx = &mcu_uart_tx_list[i];
+                tx_periph = &mcu_uart_tx_list[i];
                 break;
             }
         }
-        periph_index = self->tx->periph_index - 1;
-        USARTx = assign_uart_or_throw(self, (self->tx != NULL),
-            periph_index, uart_taken);
     } else {
-        // both pins cannot be empty
-        mp_raise_ValueError(translate("Supply at least one UART pin"));
+        // TX and RX are both None. But this is already handled in shared-bindings, so
+        // we won't get here.
     }
 
-    // Other errors
-    if (receiver_buffer_size == 0) {
-        mp_raise_ValueError(translate("Invalid buffer size"));
+    if ((tx != NULL && tx_periph == NULL) || (rx != NULL && rx_periph == NULL)) {
+        if (uart_taken) {
+            mp_raise_ValueError(MP_ERROR_TEXT("Hardware in use, try alternative pins"));
+        } else {
+            raise_ValueError_invalid_pin();
+        }
     }
-    if (bits != 8 && bits != 9) {
-        mp_raise_ValueError(translate("Invalid word/bit length"));
-    }
+
+    uint8_t periph_index = (tx_periph != NULL ? tx_periph : rx_periph)->periph_index - 1; // origin 0 corrected
+    USART_TypeDef *USARTx = mcu_uart_banks[periph_index];
     if (USARTx == NULL) {  // this can only be hit if the periph file is wrong
-        mp_raise_ValueError(translate("Internal define error"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Internal define error"));
     }
+
+    // Init buffer for rx
+    if (rx_periph != NULL) {
+        // Use the provided buffer when given.
+        if (receiver_buffer != NULL) {
+            ringbuf_init(&self->ringbuf, receiver_buffer, receiver_buffer_size);
+        } else {
+            if (!ringbuf_alloc(&self->ringbuf, receiver_buffer_size)) {
+                m_malloc_fail(receiver_buffer_size);
+            }
+        }
+    }
+
+    self->tx = tx_periph;
+    self->rx = rx_periph;
+    // assign a root pointer pointer for IRQ
+    MP_STATE_PORT(cpy_uart_obj_all)[periph_index] = self;
 
     // GPIO Init
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -211,19 +181,12 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
     self->handle.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     self->handle.Init.OverSampling = UART_OVERSAMPLING_16;
     if (HAL_UART_Init(&self->handle) != HAL_OK) {
-        mp_raise_ValueError(translate("UART Init Error"));
-
+        common_hal_busio_uart_deinit(self);
+        mp_raise_RuntimeError(MP_ERROR_TEXT("UART init"));
     }
 
-    // Init buffer for rx and claim pins
+    // claim pins
     if (self->rx != NULL) {
-        if (receiver_buffer != NULL) {
-            self->ringbuf = (ringbuf_t) { receiver_buffer, receiver_buffer_size };
-        } else {
-            if (!ringbuf_alloc(&self->ringbuf, receiver_buffer_size, true)) {
-                mp_raise_ValueError(translate("UART Buffer allocation error"));
-            }
-        }
         common_hal_mcu_pin_claim(rx);
     }
     if (self->tx != NULL) {
@@ -235,7 +198,8 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
 
     // start the interrupt series
     if ((HAL_UART_GetState(&self->handle) & HAL_UART_STATE_BUSY_RX) == HAL_UART_STATE_BUSY_RX) {
-        mp_raise_ValueError(translate("Could not start interrupt, RX busy"));
+        common_hal_busio_uart_deinit(self);
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Could not start interrupt, RX busy"));
     }
 
     // start the receive interrupt chain
@@ -247,19 +211,9 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
     errflag = HAL_OK;
 }
 
-void common_hal_busio_uart_never_reset(busio_uart_obj_t *self) {
-    for (size_t i = 0; i < MP_ARRAY_SIZE(mcu_uart_banks); i++) {
-        if (mcu_uart_banks[i] == self->handle.Instance) {
-            never_reset_uart[i] = true;
-            never_reset_pin_number(self->tx->pin->port, self->tx->pin->number);
-            never_reset_pin_number(self->rx->pin->port, self->rx->pin->number);
-            break;
-        }
-    }
-}
 
 bool common_hal_busio_uart_deinited(busio_uart_obj_t *self) {
-    return self->tx->pin == NULL && self->rx->pin == NULL;
+    return self->tx == NULL && self->rx == NULL;
 }
 
 void common_hal_busio_uart_deinit(busio_uart_obj_t *self) {
@@ -267,29 +221,32 @@ void common_hal_busio_uart_deinit(busio_uart_obj_t *self) {
         return;
     }
 
+    HAL_NVIC_DisableIRQ(self->irq);
     for (size_t i = 0; i < MP_ARRAY_SIZE(mcu_uart_banks); i++) {
         if (mcu_uart_banks[i] == self->handle.Instance) {
             reserved_uart[i] = false;
-            never_reset_uart[i] = false;
+            MP_STATE_PORT(cpy_uart_obj_all)[i] = NULL;
+            // Reset the peripheral and turn its clock back off, matching construct()'s
+            // uart_clock_enable() for this bank.
+            uart_clock_disable(1 << i);
             break;
         }
     }
 
     if (self->tx) {
-        reset_pin_number(self->tx->pin->port,self->tx->pin->number);
-        self->tx = NULL;
+        reset_pin_number(self->tx->pin->port, self->tx->pin->number);
     }
     if (self->rx) {
-        reset_pin_number(self->rx->pin->port,self->rx->pin->number);
-        self->rx = NULL;
+        reset_pin_number(self->rx->pin->port, self->rx->pin->number);
     }
 
-    ringbuf_free(&self->ringbuf);
+    ringbuf_deinit(&self->ringbuf);
+    mark_deinit(self);
 }
 
 size_t common_hal_busio_uart_read(busio_uart_obj_t *self, uint8_t *data, size_t len, int *errcode) {
     if (self->rx == NULL) {
-        mp_raise_ValueError(translate("No RX pin"));
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("No %q pin"), MP_QSTR_rx);
     }
 
     uint64_t start_ticks = supervisor_ticks_ms64();
@@ -323,21 +280,24 @@ size_t common_hal_busio_uart_read(busio_uart_obj_t *self, uint8_t *data, size_t 
 // Write characters.
 size_t common_hal_busio_uart_write(busio_uart_obj_t *self, const uint8_t *data, size_t len, int *errcode) {
     if (self->tx == NULL) {
-        mp_raise_ValueError(translate("No TX pin"));
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("No %q pin"), MP_QSTR_tx);
     }
-    bool write_err = false; // write error shouldn't disable interrupts
 
+    // Disable UART IRQ to avoid resource hazards in Rx IRQ handler
     HAL_NVIC_DisableIRQ(self->irq);
-    HAL_StatusTypeDef ret = HAL_UART_Transmit(&self->handle, (uint8_t *)data, len, HAL_MAX_DELAY);
-    if (ret != HAL_OK) {
-        write_err = true;
-    }
-    HAL_UART_Receive_IT(&self->handle, &self->rx_char, 1);
+    HAL_StatusTypeDef ret = HAL_UART_Transmit_IT(&self->handle, (uint8_t *)data, len);
     HAL_NVIC_EnableIRQ(self->irq);
 
-    if (write_err) {
-        mp_raise_ValueError(translate("UART write error"));
+    if (HAL_OK == ret) {
+        HAL_UART_StateTypeDef Status = HAL_UART_GetState(&self->handle);
+        while ((Status & HAL_UART_STATE_BUSY_TX) == HAL_UART_STATE_BUSY_TX) {
+            RUN_BACKGROUND_TASKS;
+            Status = HAL_UART_GetState(&self->handle);
+        }
+    } else {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("UART write"));
     }
+
     return len;
 }
 
@@ -358,6 +318,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *handle) {
                     mp_sched_keyboard_interrupt();
                 }
             }
+
+            #if (1)
+            // TODO: Implement error handling here
+            #else
+            while (HAL_BUSY == errflag) {
+                errflag = HAL_UART_Receive_IT(handle, &context->rx_char, 1);
+            }
+            #endif
 
             return;
         }
@@ -397,11 +365,11 @@ void common_hal_busio_uart_set_baudrate(busio_uart_obj_t *self, uint32_t baudrat
 
     // Otherwise de-init and set new rate
     if (HAL_UART_DeInit(&self->handle) != HAL_OK) {
-        mp_raise_ValueError(translate("UART De-init error"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("UART de-init"));
     }
     self->handle.Init.BaudRate = baudrate;
     if (HAL_UART_Init(&self->handle) != HAL_OK) {
-        mp_raise_ValueError(translate("UART Re-init error"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("UART re-init"));
     }
 
     self->baudrate = baudrate;
@@ -430,12 +398,16 @@ bool common_hal_busio_uart_ready_to_tx(busio_uart_obj_t *self) {
     return __HAL_UART_GET_FLAG(&self->handle, UART_FLAG_TXE);
 }
 
-STATIC void call_hal_irq(int uart_num) {
+static void call_hal_irq(int uart_num) {
     // Create casted context pointer
     busio_uart_obj_t *context = (busio_uart_obj_t *)MP_STATE_PORT(cpy_uart_obj_all)[uart_num - 1];
     if (context != NULL) {
         HAL_NVIC_ClearPendingIRQ(context->irq);
         HAL_UART_IRQHandler(&context->handle);
+
+        if (HAL_UART_ERROR_NONE != context->handle.ErrorCode) {
+            // TODO: Implement error handling here
+        }
     }
 }
 
@@ -464,7 +436,7 @@ void USART6_IRQHandler(void) {
     call_hal_irq(6);
 }
 
-STATIC void uart_clock_enable(uint16_t mask) {
+static void uart_clock_enable(uint16_t mask) {
     #ifdef USART1
     if (mask & (1 << 0)) {
         __HAL_RCC_USART1_FORCE_RESET();
@@ -537,7 +509,7 @@ STATIC void uart_clock_enable(uint16_t mask) {
     #endif
 }
 
-STATIC void uart_clock_disable(uint16_t mask) {
+static void uart_clock_disable(uint16_t mask) {
     #ifdef USART1
     if (mask & (1 << 0)) {
         __HAL_RCC_USART1_FORCE_RESET();
@@ -610,7 +582,8 @@ STATIC void uart_clock_disable(uint16_t mask) {
     #endif
 }
 
-STATIC void uart_assign_irq(busio_uart_obj_t *self, USART_TypeDef *USARTx) {
+
+static void uart_assign_irq(busio_uart_obj_t *self, USART_TypeDef *USARTx) {
     #ifdef USART1
     if (USARTx == USART1) {
         self->irq = USART1_IRQn;
@@ -662,3 +635,5 @@ STATIC void uart_assign_irq(busio_uart_obj_t *self, USART_TypeDef *USARTx) {
     }
     #endif
 }
+
+MP_REGISTER_ROOT_POINTER(void *cpy_uart_obj_all[MAX_UART]);

@@ -1,14 +1,18 @@
 # test handling of failed heap allocation with set
 
-import micropython
+try:
+    import micropython
+
+    micropython.heap_lock
+except (ImportError, AttributeError):
+    print("SKIP")
+    raise SystemExit
 
 # create set
 x = 1
 micropython.heap_lock()
 try:
-    {
-        x,
-    }
+    {x}
 except MemoryError:
     print("MemoryError: set create")
 micropython.heap_unlock()

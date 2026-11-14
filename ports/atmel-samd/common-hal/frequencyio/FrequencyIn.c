@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 Michael Schroeder
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 Michael Schroeder
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/frequencyio/FrequencyIn.h"
 
@@ -45,40 +25,26 @@
 #include "peripheral_clk_config.h"
 #include "hpl_gclk_config.h"
 
+#include "shared-bindings/microcontroller/Pin.h"
 #include "shared-bindings/time/__init__.h"
 #include "supervisor/shared/tick.h"
-#include "supervisor/shared/translate.h"
 
 #ifdef SAMD21
 #include "hpl/gclk/hpl_gclk_base.h"
 #endif
 
 static frequencyio_frequencyin_obj_t *active_frequencyins[TC_INST_NUM];
-volatile uint8_t reference_tc;
+// 0xff means none. frequencyin_reset() used to set these at every VM start;
+// now they start that way, and deinit() resets them when the last FrequencyIn is freed.
+volatile uint8_t reference_tc = 0xff;
 #ifdef SAM_D5X_E5X
-static uint8_t dpll_gclk;
+static uint8_t dpll_gclk = 0xff;
 
 #if !BOARD_HAS_CRYSTAL
-static uint8_t osculp32k_gclk;
+static uint8_t osculp32k_gclk = 0xff;
 #endif
 
 #endif
-
-void frequencyin_reset(void) {
-    for (uint8_t i = 0; i < TC_INST_NUM; i++) {
-        active_frequencyins[i] = NULL;
-    }
-
-    reference_tc = 0xff;
-    #ifdef SAM_D5X_E5X
-    dpll_gclk = 0xff;
-
-    #if !BOARD_HAS_CRYSTAL
-    osculp32k_gclk = 0xff;
-    #endif
-
-    #endif
-}
 
 static void frequencyin_emergency_cancel_capture(uint8_t index) {
     frequencyio_frequencyin_obj_t* self = active_frequencyins[index];
@@ -155,7 +121,7 @@ void frequencyin_interrupt_handler(uint8_t index) {
             }
 
             // Check if we've reached the upper limit of detection
-            if (!supervisor_background_tasks_ok() || self->errored_too_fast) {
+            if (!supervisor_background_ticks_ok() || self->errored_too_fast) {
                 self->errored_too_fast = true;
                 frequencyin_emergency_cancel_capture(i);
             }
@@ -185,13 +151,13 @@ static void frequencyin_reference_tc_init(void) {
 
     #ifdef SAMD21
     tc->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16 | TC_CTRLA_PRESCALER_DIV1;
-    tc->COUNT16.INTENSET.bit.OVF = 1;
+    tc->COUNT16.INTENSET.reg = TC_INTENSET_OVF;
     NVIC_EnableIRQ(TC3_IRQn + reference_tc);
     #endif
     #ifdef SAM_D5X_E5X
     tc->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16 |
                             TC_CTRLA_PRESCALER_DIV1;
-    tc->COUNT16.INTENSET.bit.OVF = 1;
+    tc->COUNT16.INTENSET.reg = TC_INTENSET_OVF;
     NVIC_EnableIRQ(TC0_IRQn + reference_tc);
     #endif
 }
@@ -279,14 +245,21 @@ static void frequencyin_samd51_stop_dpll(void) {
 }
 #endif
 
+// Mark the object deinited: deinited() is true and deinit() does nothing.
+static void mark_deinit(frequencyio_frequencyin_obj_t *self) {
+    self->pin = NO_PIN;
+}
+
 void common_hal_frequencyio_frequencyin_construct(frequencyio_frequencyin_obj_t* self, const mcu_pin_obj_t* pin, const uint16_t capture_period) {
+    // Ensure the object starts in its deinit state.
+    mark_deinit(self);
 
     if (!pin->has_extint) {
-        mp_raise_RuntimeError(translate("No hardware support on pin"));
+        raise_ValueError_invalid_pin();
     }
-    if ((capture_period == 0) || (capture_period > 500)) {
-        mp_raise_ValueError(translate("Invalid capture period. Valid range: 1 - 500"));
-    }
+
+    mp_arg_validate_int_range(capture_period, 0, 500, MP_QSTR_capture_period);
+
     uint32_t mask = 1 << pin->extint_channel;
     if (eic_get_enable() == 1 &&
     #ifdef SAMD21
@@ -295,14 +268,24 @@ void common_hal_frequencyio_frequencyin_construct(frequencyio_frequencyin_obj_t*
     #ifdef SAM_D5X_E5X
     ((EIC->INTENSET.bit.EXTINT & mask) != 0 || (EIC->EVCTRL.bit.EXTINTEO & mask) != 0)) {
     #endif
-        mp_raise_RuntimeError(translate("EXTINT channel already in use"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Internal resource(s) in use"));
     }
 
     uint8_t timer_index = find_free_timer();
     if (timer_index == 0xff) {
-        mp_raise_RuntimeError(translate("All timers in use"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Internal resource(s) in use"));
     }
     Tc *tc = tc_insts[timer_index];
+
+    #ifdef SAM_D5X_E5X
+    // Start the DPLL before setting any state, so this raise leaves the
+    // object deinited. deinit() can't undo a partial setup: it would disable
+    // event channel 0 and toggle this channel's EXTINTEO bit on.
+    frequencyin_samd51_start_dpll();
+    if (dpll_gclk == 0xff && !clock_get_enabled(0, GCLK_SOURCE_DPLL1)) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Internal resource(s) in use"));
+    }
+    #endif
 
     self->tc_index = timer_index;
     self->pin = pin->number;
@@ -322,16 +305,11 @@ void common_hal_frequencyio_frequencyin_construct(frequencyio_frequencyin_obj_t*
     // SAMD21: We use GCLK0 generated from DFLL running at 48mhz
     // SAMD51: We use a GCLK generated from DPLL1 running at <100mhz
     #ifdef SAMD21
-    set_timer_handler(timer_index, 0, TC_HANDLER_NO_INTERRUPT);
+    set_timer_handler(true, timer_index, TC_HANDLER_NO_INTERRUPT);
     turn_on_clocks(true, timer_index, 0);
     #endif
     #ifdef SAM_D5X_E5X
-    frequencyin_samd51_start_dpll();
-    if (dpll_gclk == 0xff && !clock_get_enabled(0, GCLK_SOURCE_DPLL1)) {
-        common_hal_frequencyio_frequencyin_deinit(self);
-        mp_raise_RuntimeError(translate("No available clocks"));
-    }
-    set_timer_handler(timer_index, dpll_gclk, TC_HANDLER_NO_INTERRUPT);
+    set_timer_handler(true, timer_index, TC_HANDLER_NO_INTERRUPT);
     turn_on_clocks(true, timer_index, dpll_gclk);
     #endif
 
@@ -391,6 +369,7 @@ void common_hal_frequencyio_frequencyin_construct(frequencyio_frequencyin_obj_t*
     NVIC_EnableIRQ(self->TC_IRQ);
 
     gpio_set_pin_function(pin->number, GPIO_PIN_FUNCTION_A);
+    claim_pin(pin);
 
     tc_set_enable(tc, true);
 
@@ -399,7 +378,7 @@ void common_hal_frequencyio_frequencyin_construct(frequencyio_frequencyin_obj_t*
         reference_tc = find_free_timer();
         if (reference_tc == 0xff) {
             common_hal_frequencyio_frequencyin_deinit(self);
-            mp_raise_RuntimeError(translate("All timers in use"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("Internal resource(s) in use"));
         }
         frequencyin_reference_tc_init();
     }
@@ -449,7 +428,7 @@ void common_hal_frequencyio_frequencyin_deinit(frequencyio_frequencyin_obj_t* se
 
     active_frequencyins[self->tc_index] = NULL;
     self->tc_index = 0xff;
-    self->pin = NO_PIN;
+    mark_deinit(self);
 
     bool check_active = false;
     for (uint8_t i = 0; i < TC_INST_NUM; i++) {
@@ -481,7 +460,7 @@ uint32_t common_hal_frequencyio_frequencyin_get_item(frequencyio_frequencyin_obj
         float time_each_event = self->factor / self->frequency; // get the time for each event during actual period
         float capture_diff = self->factor - self->capture_period; // get the difference of actual and base periods
         // we only need to adjust if the capture_diff can contain 1 or more events
-        // if so, we add how many events could have occured during the diff time
+        // if so, we add how many events could have occurred during the diff time
         if (time_each_event > capture_diff) {
             frequency_adjustment = capture_diff / time_each_event;
         }
@@ -569,9 +548,7 @@ uint16_t common_hal_frequencyio_frequencyin_get_capture_period(frequencyio_frequ
 }
 
 void common_hal_frequencyio_frequencyin_set_capture_period(frequencyio_frequencyin_obj_t *self, uint16_t capture_period) {
-    if ((capture_period == 0) || (capture_period > 500)) {
-        mp_raise_ValueError(translate("Invalid capture period. Valid range: 1 - 500"));
-    }
+    mp_arg_validate_int_range(capture_period, 1, 500, MP_QSTR_capture_period);
 
     self->capture_period = capture_period;
 

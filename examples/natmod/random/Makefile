@@ -1,0 +1,17 @@
+# Location of top-level MicroPython directory
+MPY_DIR = ../../..
+
+# Name of module (different to built-in random so it can coexist)
+MOD_BASE = random
+MOD = $(MOD_BASE)_$(ARCH)
+
+# Source files (.c or .py)
+SRC = random.c
+
+# Architecture to build for (x86, x64, armv7m, xtensa, xtensawin, rv32imc)
+ARCH = x64
+
+# Strip the architecture name from the internal filename.
+MPY_LD_FLAGS = "--source-name=$(MOD_BASE).mpy"
+
+include $(MPY_DIR)/py/dynruntime.mk

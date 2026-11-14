@@ -1,10 +1,9 @@
 # test that emergency exceptions work
 
-import micropython
 import sys
 
 try:
-    import uio
+    import io, micropython
 except ImportError:
     print("SKIP")
     raise SystemExit
@@ -24,6 +23,7 @@ def f():
         exc = er
     micropython.heap_unlock()
 
+    # CIRCUITPY-CHANGE
     print(repr(exc))
 
 

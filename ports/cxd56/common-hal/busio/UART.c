@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright 2019 Sony Semiconductor Solutions Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright 2019 Sony Semiconductor Solutions Corporation
+//
+// SPDX-License-Identifier: MIT
 
 #include <string.h>
 #include <unistd.h>
@@ -40,6 +20,7 @@
 #include "py/runtime.h"
 
 #include "shared-bindings/busio/UART.h"
+#include "shared-bindings/microcontroller/Pin.h"
 
 typedef struct {
     const char *devpath;
@@ -48,9 +29,13 @@ typedef struct {
     int fd;
 } busio_uart_dev_t;
 
-STATIC busio_uart_dev_t busio_uart_dev[] = {
+static busio_uart_dev_t busio_uart_dev[] = {
     {"/dev/ttyS2", &pin_UART2_TXD, &pin_UART2_RXD, -1},
 };
+
+static void mark_deinit(busio_uart_obj_t *self) {
+    self->tx_pin = NULL;
+}
 
 void common_hal_busio_uart_construct(busio_uart_obj_t *self,
     const mcu_pin_obj_t *tx, const mcu_pin_obj_t *rx,
@@ -64,20 +49,19 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
     char tmp;
     struct termios tio;
 
+    mark_deinit(self);
+
     if ((rts != NULL) || (cts != NULL) || (rs485_dir != NULL) || (rs485_invert)) {
-        mp_raise_ValueError(translate("RTS/CTS/RS485 Not yet supported on this device"));
+        mp_raise_NotImplementedError(MP_ERROR_TEXT("RS485"));
     }
 
-    if (bits != 8) {
-        mp_raise_ValueError(translate("Could not initialize UART"));
-    }
+    mp_arg_validate_int(bits, 8, MP_QSTR_bits);
+    mp_arg_validate_int(parity, BUSIO_UART_PARITY_NONE, MP_QSTR_parity);
+    mp_arg_validate_int(stop, 1, MP_QSTR_stop);
 
-    if (parity != BUSIO_UART_PARITY_NONE) {
-        mp_raise_ValueError(translate("Could not initialize UART"));
-    }
-
-    if (stop != 1) {
-        mp_raise_ValueError(translate("Could not initialize UART"));
+    // The one UART needs both TX and RX.
+    if (tx == NULL || rx == NULL) {
+        mp_raise_NotImplementedError(MP_ERROR_TEXT("UART needs TX & RX"));
     }
 
     self->number = -1;
@@ -91,13 +75,13 @@ void common_hal_busio_uart_construct(busio_uart_obj_t *self,
     }
 
     if (self->number < 0) {
-        mp_raise_ValueError(translate("Invalid pins"));
+        raise_ValueError_invalid_pins();
     }
 
     if (busio_uart_dev[self->number].fd < 0) {
         busio_uart_dev[self->number].fd = open(busio_uart_dev[self->number].devpath, O_RDWR);
         if (busio_uart_dev[self->number].fd < 0) {
-            mp_raise_ValueError(translate("Could not initialize UART"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("UART init"));
         }
 
         // Wait to make sure the UART is ready
@@ -133,10 +117,12 @@ void common_hal_busio_uart_deinit(busio_uart_obj_t *self) {
 
     reset_pin_number(self->tx_pin->number);
     reset_pin_number(self->rx_pin->number);
+    mark_deinit(self);
 }
 
+// Per object: the device's fd may now belong to a newer UART.
 bool common_hal_busio_uart_deinited(busio_uart_obj_t *self) {
-    return busio_uart_dev[self->number].fd < 0;
+    return self->tx_pin == NULL;
 }
 
 size_t common_hal_busio_uart_read(busio_uart_obj_t *self, uint8_t *data, size_t len, int *errcode) {
@@ -212,13 +198,4 @@ void common_hal_busio_uart_clear_rx_buffer(busio_uart_obj_t *self) {
 bool common_hal_busio_uart_ready_to_tx(busio_uart_obj_t *self) {
     ioctl(busio_uart_dev[self->number].fd, TCFLSH, (long unsigned int)NULL);
     return true;
-}
-
-void busio_uart_reset(void) {
-    for (int i = 0; i < MP_ARRAY_SIZE(busio_uart_dev); i++) {
-        if (busio_uart_dev[i].fd >= 0) {
-            close(busio_uart_dev[i].fd);
-            busio_uart_dev[i].fd = -1;
-        }
-    }
 }

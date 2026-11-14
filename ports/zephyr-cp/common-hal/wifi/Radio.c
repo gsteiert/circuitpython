@@ -1,0 +1,1134 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
+
+#include "shared-bindings/wifi/Radio.h"
+#include "shared-bindings/wifi/__init__.h"
+#include "ports/zephyr-cp/common-hal/wifi/ScannedNetworks.h"
+#include "shared-bindings/wifi/Network.h"
+
+#include <string.h>
+
+#include "common-hal/wifi/__init__.h"
+#include "shared/runtime/interrupt_char.h"
+#include "py/gc.h"
+#include "py/obj.h"
+#include "py/runtime.h"
+#include "shared-bindings/ipaddress/IPv4Address.h"
+#include "shared-bindings/wifi/ScannedNetworks.h"
+#include "shared-bindings/wifi/AuthMode.h"
+#include "shared-bindings/time/__init__.h"
+#include "shared-module/ipaddress/__init__.h"
+#include "common-hal/socketpool/__init__.h"
+
+#include "bindings/zephyr_kernel/__init__.h"
+
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/net/dhcpv4.h>
+// dns_resolve_get_default() for radio.ipv4_dns.
+#include <zephyr/net/dns_resolve.h>
+#include <zephyr/net/hostname.h>
+#if CIRCUITPY_WIFI_PING
+// net_icmp_* for radio.ping().
+#include <zephyr/net/icmp.h>
+#endif
+#include <zephyr/net/wifi.h>
+#include <zephyr/net/wifi_mgmt.h>
+#include <zephyr/random/random.h>
+
+#if CIRCUITPY_MDNS
+#include "common-hal/mdns/Server.h"
+#endif
+
+LOG_MODULE_DECLARE(cp_wifi);
+
+#define MAC_ADDRESS_LENGTH 6
+
+// static void set_mode_station(wifi_radio_obj_t *self, bool state) {
+// wifi_mode_t next_mode;
+// if (state) {
+//     if (self->ap_mode) {
+//         next_mode = WIFI_MODE_APSTA;
+//     } else {
+//         next_mode = WIFI_MODE_STA;
+//     }
+// } else {
+//     if (self->ap_mode) {
+//         next_mode = WIFI_MODE_AP;
+//     } else {
+//         next_mode = WIFI_MODE_NULL;
+//     }
+// }
+// esp_wifi_set_mode(next_mode);
+// self->sta_mode = state;
+// }
+
+// static void set_mode_ap(wifi_radio_obj_t *self, bool state) {
+// wifi_mode_t next_mode;
+// if (state) {
+//     if (self->sta_mode) {
+//         next_mode = WIFI_MODE_APSTA;
+//     } else {
+//         next_mode = WIFI_MODE_AP;
+//     }
+// } else {
+//     if (self->sta_mode) {
+//         next_mode = WIFI_MODE_STA;
+//     } else {
+//         next_mode = WIFI_MODE_NULL;
+//     }
+// }
+// esp_wifi_set_mode(next_mode);
+// self->ap_mode = state;
+// }
+
+bool common_hal_wifi_radio_get_enabled(wifi_radio_obj_t *self) {
+    return self->started;
+}
+
+void common_hal_wifi_radio_set_enabled(wifi_radio_obj_t *self, bool enabled) {
+    if (self->started && !enabled) {
+        if (self->current_scan != NULL) {
+            common_hal_wifi_radio_stop_scanning_networks(self);
+        }
+        //     #if CIRCUITPY_MDNS
+        //     mdns_server_deinit_singleton();
+        //     #endif
+        LOG_DBG("net_if_down");
+        int res = net_if_down(self->sta_netif);
+        if (res < 0 && res != -EALREADY) {
+            raise_zephyr_error(res);
+        }
+        self->started = false;
+        return;
+    }
+    if (!self->started && enabled) {
+        LOG_DBG("net_if_up");
+        int res = net_if_up(self->sta_netif);
+        if (res < 0 && res != -EALREADY) {
+            raise_zephyr_error(res);
+        }
+        self->started = true;
+        self->current_scan = NULL;
+        // common_hal_wifi_radio_set_tx_power(self, CIRCUITPY_WIFI_DEFAULT_TX_POWER);
+        return;
+    }
+}
+
+mp_obj_t common_hal_wifi_radio_get_version(wifi_radio_obj_t *self) {
+    // No WiFi co-processor version is reported on this port yet.
+    return mp_const_none;
+}
+
+mp_obj_t common_hal_wifi_radio_get_hostname(wifi_radio_obj_t *self) {
+    const char *hostname = net_hostname_get();
+    return mp_obj_new_str(hostname, strlen(hostname));
+}
+
+void common_hal_wifi_radio_set_hostname(wifi_radio_obj_t *self, const char *hostname) {
+    if (net_hostname_set((char *)hostname, strlen(hostname)) != 0) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Failed to set hostname"));
+    }
+}
+
+const char *wifi_get_hostname_raw(void) {
+    return net_hostname_get();
+}
+
+mp_obj_t common_hal_wifi_radio_get_mac_address(wifi_radio_obj_t *self) {
+    uint8_t mac[MAC_ADDRESS_LENGTH] = { 0 };
+    if (self->sta_netif != NULL) {
+        struct net_linkaddr *addr = net_if_get_link_addr(self->sta_netif);
+        if (addr != NULL && addr->len >= MAC_ADDRESS_LENGTH) {
+            memcpy(mac, addr->addr, MAC_ADDRESS_LENGTH);
+        }
+    }
+    return mp_obj_new_bytes(mac, MAC_ADDRESS_LENGTH);
+}
+
+void common_hal_wifi_radio_set_mac_address(wifi_radio_obj_t *self, const uint8_t *mac) {
+    if (!self->sta_mode) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Interface must be started"));
+    }
+    if ((mac[0] & 0b1) == 0b1) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Invalid multicast MAC address"));
+    }
+    // esp_wifi_set_mac(ESP_IF_WIFI_STA, mac);
+}
+
+mp_float_t common_hal_wifi_radio_get_tx_power(wifi_radio_obj_t *self) {
+    int8_t tx_power = 0;
+    // esp_wifi_get_max_tx_power(&tx_power);
+    return tx_power / 4.0f;
+}
+
+void common_hal_wifi_radio_set_tx_power(wifi_radio_obj_t *self, const mp_float_t tx_power) {
+    // esp_wifi_set_max_tx_power(tx_power * 4.0f);
+}
+
+wifi_power_management_t common_hal_wifi_radio_get_power_management(wifi_radio_obj_t *self) {
+    // wifi_ps_type_t ps;
+    // esp_err_t ret = esp_wifi_get_ps(&ps);
+    // if (ret == ESP_OK) {
+    //     switch (ps) {
+    //         case WIFI_PS_MIN_MODEM:
+    //             return POWER_MANAGEMENT_MIN;
+    //         case WIFI_PS_MAX_MODEM:
+    //             return POWER_MANAGEMENT_MAX;
+    //         case WIFI_PS_NONE:
+    //             return POWER_MANAGEMENT_NONE;
+    //     }
+    // }
+    return POWER_MANAGEMENT_UNKNOWN;
+}
+
+
+void common_hal_wifi_radio_set_power_management(wifi_radio_obj_t *self, wifi_power_management_t power_management) {
+    // switch (power_management) {
+    //     case POWER_MANAGEMENT_MIN:
+    //         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    //         break;
+    //     case POWER_MANAGEMENT_MAX: {
+    //         // listen_interval is only used in this case.
+    //         wifi_config_t *config = &self->sta_config;
+    //         // This is a typical value seen in various examples.
+    //         config->sta.listen_interval = 3;
+    //         esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    //         esp_wifi_set_config(ESP_IF_WIFI_STA, config);
+    //     }
+    //     break;
+    //     case POWER_MANAGEMENT_NONE:
+    //         esp_wifi_set_ps(WIFI_PS_NONE);
+    //         break;
+    //     case POWER_MANAGEMENT_UNKNOWN:
+    //         // This should be prevented in shared-bindings.
+    //         break;
+    // }
+}
+
+void common_hal_wifi_radio_set_listen_interval(wifi_radio_obj_t *self, const mp_int_t listen_interval) {
+    // wifi_config_t *config = &self->sta_config;
+    // config->sta.listen_interval = listen_interval;
+    // if (listen_interval == 1) {
+    //     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    // } else if (listen_interval > 1) {
+    //     esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+    // } else {
+    //     esp_wifi_set_ps(WIFI_PS_NONE);
+    // }
+
+    // esp_wifi_set_config(ESP_IF_WIFI_STA, config);
+}
+
+mp_obj_t common_hal_wifi_radio_get_mac_address_ap(wifi_radio_obj_t *self) {
+    uint8_t mac[MAC_ADDRESS_LENGTH];
+    // esp_wifi_get_mac(ESP_IF_WIFI_AP, mac);
+    return mp_obj_new_bytes(mac, MAC_ADDRESS_LENGTH);
+}
+
+void common_hal_wifi_radio_set_mac_address_ap(wifi_radio_obj_t *self, const uint8_t *mac) {
+    if (!self->ap_mode) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Interface must be started"));
+    }
+    if ((mac[0] & 0b1) == 0b1) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Invalid multicast MAC address"));
+    }
+    // esp_wifi_set_mac(ESP_IF_WIFI_AP, mac);
+}
+
+mp_obj_t common_hal_wifi_radio_start_scanning_networks(wifi_radio_obj_t *self, uint8_t start_channel, uint8_t stop_channel) {
+    LOG_DBG("common_hal_wifi_radio_start_scanning_networks");
+    if (self->current_scan != NULL) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Already scanning for wifi networks"));
+    }
+    if (!common_hal_wifi_radio_get_enabled(self)) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("WiFi is not enabled"));
+    }
+
+    wifi_scannednetworks_obj_t *scan = mp_obj_malloc(wifi_scannednetworks_obj_t, &wifi_scannednetworks_type);
+    self->current_scan = scan;
+    scan->current_channel_index = 0;
+    scan->start_channel = start_channel;
+    scan->end_channel = stop_channel;
+    scan->done = false;
+    scan->channel_scan_in_progress = false;
+    scan->netif = self->sta_netif;
+
+    k_msgq_init(&scan->msgq, scan->msgq_buffer, sizeof(struct wifi_scan_result), MAX_BUFFERED_SCAN_RESULTS);
+    k_fifo_init(&scan->fifo);
+
+    k_poll_event_init(&scan->events[0],
+        K_POLL_TYPE_SEM_AVAILABLE,
+        K_POLL_MODE_NOTIFY_ONLY,
+        &mp_interrupt_sem);
+
+    k_poll_event_init(&scan->events[1],
+        K_POLL_TYPE_MSGQ_DATA_AVAILABLE,
+        K_POLL_MODE_NOTIFY_ONLY,
+        &scan->msgq);
+    wifi_scannednetworks_scan_next_channel(scan);
+    LOG_DBG("common_hal_wifi_radio_start_scanning_networks done %p", scan);
+    return scan;
+}
+
+void common_hal_wifi_radio_stop_scanning_networks(wifi_radio_obj_t *self) {
+    LOG_DBG("common_hal_wifi_radio_stop_scanning_networks");
+    // Return early if self->current_scan is NULL to avoid hang
+    if (self->current_scan == NULL) {
+        return;
+    }
+    // Free the memory used to store the found aps.
+    wifi_scannednetworks_deinit(self->current_scan);
+    self->current_scan = NULL;
+}
+
+void common_hal_wifi_radio_start_station(wifi_radio_obj_t *self) {
+    // set_mode_station(self, true);
+}
+
+void common_hal_wifi_radio_stop_station(wifi_radio_obj_t *self) {
+    // set_mode_station(self, false);
+}
+
+void common_hal_wifi_radio_start_ap(wifi_radio_obj_t *self, uint8_t *ssid, size_t ssid_len, uint8_t *password, size_t password_len, uint8_t channel, uint32_t authmode, uint8_t max_connections) {
+    // set_mode_ap(self, true);
+
+    // uint8_t esp_authmode = 0;
+    // switch (authmode) {
+    //     case AUTHMODE_OPEN:
+    //         esp_authmode = WIFI_AUTH_OPEN;
+    //         break;
+    //     case AUTHMODE_WPA | AUTHMODE_PSK:
+    //         esp_authmode = WIFI_AUTH_WPA_PSK;
+    //         break;
+    //     case AUTHMODE_WPA2 | AUTHMODE_PSK:
+    //         esp_authmode = WIFI_AUTH_WPA2_PSK;
+    //         break;
+    //     case AUTHMODE_WPA | AUTHMODE_WPA2 | AUTHMODE_PSK:
+    //         esp_authmode = WIFI_AUTH_WPA_WPA2_PSK;
+    //         break;
+    //     default:
+    //         mp_arg_error_invalid(MP_QSTR_authmode);
+    //         break;
+    // }
+
+    // wifi_config_t *config = &self->ap_config;
+    // memcpy(&config->ap.ssid, ssid, ssid_len);
+    // config->ap.ssid[ssid_len] = 0;
+    // memcpy(&config->ap.password, password, password_len);
+    // config->ap.password[password_len] = 0;
+    // config->ap.channel = channel;
+    // config->ap.authmode = esp_authmode;
+
+    // mp_arg_validate_int_range(max_connections, 0, 10, MP_QSTR_max_connections);
+
+    // config->ap.max_connection = max_connections;
+
+    // esp_wifi_set_config(WIFI_IF_AP, config);
+}
+
+bool common_hal_wifi_radio_get_ap_active(wifi_radio_obj_t *self) {
+    // return self->ap_mode && esp_netif_is_netif_up(self->ap_netif);
+    return false;
+}
+
+void common_hal_wifi_radio_stop_ap(wifi_radio_obj_t *self) {
+    // set_mode_ap(self, false);
+}
+
+mp_obj_t common_hal_wifi_radio_get_stations_ap(wifi_radio_obj_t *self) {
+    // wifi_sta_list_t esp_sta_list;
+    // esp_err_t result;
+
+    // result = esp_wifi_ap_get_sta_list(&esp_sta_list);
+    // if (result != ESP_OK) {
+    //     return mp_const_none;
+    // }
+
+    // esp_netif_pair_mac_ip_t mac_ip_pair[esp_sta_list.num];
+    // for (int i = 0; i < esp_sta_list.num; i++) {
+    //     memcpy(mac_ip_pair[i].mac, esp_sta_list.sta[i].mac, MAC_ADDRESS_LENGTH);
+    //     mac_ip_pair[i].ip.addr = 0;
+    // }
+
+    // result = esp_netif_dhcps_get_clients_by_mac(self->ap_netif, esp_sta_list.num, mac_ip_pair);
+    // if (result != ESP_OK) {
+    //     return mp_const_none;
+    // }
+
+    mp_obj_t mp_sta_list = mp_obj_new_list(0, NULL);
+    // for (int i = 0; i < esp_sta_list.num; i++) {
+    //     mp_obj_t elems[3] = {
+    //         mp_obj_new_bytes(esp_sta_list.sta[i].mac, MAC_ADDRESS_LENGTH),
+    //         MP_OBJ_NEW_SMALL_INT(esp_sta_list.sta[i].rssi),
+    //         mp_const_none
+    //     };
+
+    //     if (mac_ip_pair[i].ip.addr) {
+    //         elems[2] = common_hal_ipaddress_new_ipv4address(mac_ip_pair[i].ip.addr);
+    //     }
+
+    //     mp_obj_list_append(mp_sta_list, namedtuple_make_new((const mp_obj_type_t *)&wifi_radio_station_type, 3, 0, elems));
+    // }
+
+    return mp_sta_list;
+}
+
+wifi_radio_error_t common_hal_wifi_radio_connect(wifi_radio_obj_t *self, uint8_t *ssid, size_t ssid_len, uint8_t *password, size_t password_len, uint8_t channel, mp_float_t timeout, uint8_t *bssid, size_t bssid_len) {
+    if (!common_hal_wifi_radio_get_enabled(self)) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("WiFi is not enabled"));
+    }
+    // wifi_config_t *config = &self->sta_config;
+
+    // size_t timeout_ms = timeout * 1000;
+    // uint32_t start_time = common_hal_time_monotonic_ms();
+    // uint32_t end_time = start_time + timeout_ms;
+
+    // EventBits_t bits;
+    // // can't block since both bits are false after wifi_init
+    // // both bits are true after an existing connection stops
+    // bits = xEventGroupWaitBits(self->event_group_handle,
+    //     WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT,
+    //     pdTRUE,
+    //     pdTRUE,
+    //     0);
+    // bool connected = ((bits & WIFI_CONNECTED_BIT) != 0) &&
+    //     !((bits & WIFI_DISCONNECTED_BIT) != 0);
+    // if (connected) {
+    //     // SSIDs are up to 32 bytes. Assume it is null terminated if it is less.
+    //     if (memcmp(ssid, config->sta.ssid, ssid_len) == 0 &&
+    //         (ssid_len == 32 || strlen((const char *)config->sta.ssid) == ssid_len)) {
+    //         // Already connected to the desired network.
+    //         return WIFI_RADIO_ERROR_NONE;
+    //     } else {
+    //         xEventGroupClearBits(self->event_group_handle, WIFI_DISCONNECTED_BIT);
+    //         // Trying to switch networks so disconnect first.
+    //         esp_wifi_disconnect();
+    //         do {
+    //             RUN_BACKGROUND_TASKS;
+    //             bits = xEventGroupWaitBits(self->event_group_handle,
+    //                 WIFI_DISCONNECTED_BIT,
+    //                 pdTRUE,
+    //                 pdTRUE,
+    //                 0);
+    //         } while ((bits & WIFI_DISCONNECTED_BIT) == 0 && !mp_hal_is_interrupted());
+    //     }
+    // }
+    // // explicitly clear bits since xEventGroupWaitBits may have timed out
+    // xEventGroupClearBits(self->event_group_handle, WIFI_CONNECTED_BIT);
+    // xEventGroupClearBits(self->event_group_handle, WIFI_DISCONNECTED_BIT);
+    // set_mode_station(self, true);
+
+    // memcpy(&config->sta.ssid, ssid, ssid_len);
+    // if (ssid_len < 32) {
+    //     config->sta.ssid[ssid_len] = 0;
+    // }
+    // memcpy(&config->sta.password, password, password_len);
+    // config->sta.password[password_len] = 0;
+    // config->sta.channel = channel;
+    // // From esp_wifi_types.h:
+    // //   Generally, station_config.bssid_set needs to be 0; and it needs
+    // //   to be 1 only when users need to check the MAC address of the AP
+    // if (bssid_len > 0) {
+    //     memcpy(&config->sta.bssid, bssid, bssid_len);
+    //     config->sta.bssid[bssid_len] = 0;
+    //     config->sta.bssid_set = true;
+    // } else {
+    //     config->sta.bssid_set = false;
+    // }
+    // // If channel is 0 (default/unset) and BSSID is not given, do a full scan instead of fast scan
+    // // This will ensure that the best AP in range is chosen automatically
+    // if ((config->sta.bssid_set == 0) && (config->sta.channel == 0)) {
+    //     config->sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    // } else {
+    //     config->sta.scan_method = WIFI_FAST_SCAN;
+    // }
+    // esp_wifi_set_config(ESP_IF_WIFI_STA, config);
+    // self->starting_retries = 5;
+    // self->retries_left = 5;
+    // esp_wifi_connect();
+
+    // do {
+    //     RUN_BACKGROUND_TASKS;
+    //     bits = xEventGroupWaitBits(self->event_group_handle,
+    //         WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT,
+    //         pdTRUE,
+    //         pdTRUE,
+    //         0);
+    //     // Don't retry anymore if we're over our time budget.
+    //     if (self->retries_left > 0 && common_hal_time_monotonic_ms() > end_time) {
+    //         self->retries_left = 0;
+    //     }
+    // } while ((bits & (WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT)) == 0 && !mp_hal_is_interrupted());
+
+    // if ((bits & WIFI_DISCONNECTED_BIT) != 0) {
+    //     if (
+    //         (self->last_disconnect_reason == WIFI_REASON_AUTH_FAIL) ||
+    //         (self->last_disconnect_reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) ||
+    //         (self->last_disconnect_reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY) ||
+    //         (self->last_disconnect_reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD)
+    //         ) {
+    //         return WIFI_RADIO_ERROR_AUTH_FAIL;
+    //     } else if (self->last_disconnect_reason == WIFI_REASON_NO_AP_FOUND) {
+    //         return WIFI_RADIO_ERROR_NO_AP_FOUND;
+    //     }
+    //     return self->last_disconnect_reason;
+    // } else {
+    //     // We're connected, allow us to retry if we get disconnected.
+    //     self->retries_left = self->starting_retries;
+    // }
+
+    struct wifi_connect_req_params params = { 0 };
+
+    params.ssid = ssid;
+    params.ssid_length = ssid_len;
+    params.band = WIFI_FREQ_BAND_2_4_GHZ;
+    params.channel = channel == 0 ? WIFI_CHANNEL_ANY : channel;
+    params.mfp = WIFI_MFP_OPTIONAL;
+    params.timeout = SYS_FOREVER_MS;
+
+    if (password_len > 0) {
+        params.psk = password;
+        params.psk_length = password_len;
+        // WPA_AUTO_PERSONAL lets the driver settle on WPA2 or WPA3 with the AP
+        // rather than us guessing: it maps to WPA3-transition, which an AP in
+        // either mode accepts. WIFI_SECURITY_TYPE_UNKNOWN is not an option, the
+        // driver rejects it with -ENOTSUP.
+        params.security = WIFI_SECURITY_TYPE_WPA_AUTO_PERSONAL;
+    } else {
+        params.security = WIFI_SECURITY_TYPE_NONE;
+    }
+
+    if (bssid_len == WIFI_MAC_ADDR_LEN) {
+        memcpy(params.bssid, bssid, WIFI_MAC_ADDR_LEN);
+    }
+
+    // Already associated to the network being asked for: leave the link alone.
+    // supervisor_start_web_workflow() calls connect() on every invocation, so
+    // tearing the association down here would churn the link continuously.
+    if (self->connected &&
+        ssid_len == self->current_ssid_len &&
+        memcmp(ssid, self->current_ssid, ssid_len) == 0) {
+        return WIFI_RADIO_ERROR_NONE;
+    }
+
+    // Switching networks. Connecting while associated returns -EALREADY and the
+    // failure path takes the interface down, so disconnect first.
+    if (self->connected) {
+        // A failure here is tolerated on purpose: if the interface really is
+        // unusable, the connect below returns a proper error to the caller.
+        (void)net_mgmt(NET_REQUEST_WIFI_DISCONNECT, self->sta_netif, NULL, 0);
+        // Give the controller a moment to tear the association down.
+        for (int i = 0; i < 40 && self->connected; i++) {
+            RUN_BACKGROUND_TASKS;
+            k_msleep(50);
+        }
+        self->connected = false;
+    }
+
+    self->connected = false;
+    self->last_connect_status = -1;
+    self->last_disconnect_reason = 0;
+    k_sem_reset(&self->connect_sem);
+
+    int res = net_mgmt(NET_REQUEST_WIFI_CONNECT, self->sta_netif, &params, sizeof(params));
+    if (res == -EALREADY) {
+        // Record the SSID as the success path does, so the early return above
+        // matches on a later connect() to the same network.
+        self->connected = true;
+        self->current_ssid_len = MIN(ssid_len, sizeof(self->current_ssid));
+        memcpy(self->current_ssid, ssid, self->current_ssid_len);
+        return WIFI_RADIO_ERROR_NONE;
+    }
+    if (res < 0) {
+        return WIFI_RADIO_ERROR_UNSPECIFIED;
+    }
+
+    // Wait for NET_EVENT_WIFI_CONNECT_RESULT (or a DISCONNECT_RESULT standing
+    // in for a failed attempt), staying responsive to ctrl-C.
+    mp_float_t timeout_s = timeout <= 0 ? (mp_float_t)10 : timeout;
+    int64_t deadline = k_uptime_get() + (int64_t)(timeout_s * 1000);
+    bool signalled = false;
+    while (k_uptime_get() < deadline) {
+        RUN_BACKGROUND_TASKS;
+        if (k_sem_take(&self->connect_sem, K_MSEC(50)) == 0) {
+            signalled = true;
+            break;
+        }
+        if (mp_hal_is_interrupted()) {
+            return WIFI_RADIO_ERROR_UNSPECIFIED;
+        }
+    }
+
+    if (!signalled) {
+        return WIFI_RADIO_ERROR_HANDSHAKE_TIMEOUT;
+    }
+    if (!self->connected) {
+        switch (self->last_connect_status) {
+            case WIFI_STATUS_CONN_WRONG_PASSWORD:
+                return WIFI_RADIO_ERROR_AUTH_FAIL;
+            case WIFI_STATUS_CONN_AP_NOT_FOUND:
+                return WIFI_RADIO_ERROR_NO_AP_FOUND;
+            case WIFI_STATUS_CONN_TIMEOUT:
+                return WIFI_RADIO_ERROR_HANDSHAKE_TIMEOUT;
+            default:
+                return WIFI_RADIO_ERROR_CONNECTION_FAIL;
+        }
+    }
+
+    // Remember which network this association is for, so a later connect() for
+    // the same SSID can return without disturbing it.
+    self->current_ssid_len = MIN(ssid_len, sizeof(self->current_ssid));
+    memcpy(self->current_ssid, ssid, self->current_ssid_len);
+
+    // Associated. Ask for an address; the AP side of DHCP can take a moment.
+    #if defined(CONFIG_NET_DHCPV4)
+    net_dhcpv4_start(self->sta_netif);
+    int64_t ip_deadline = k_uptime_get() + 15000;
+    while (k_uptime_get() < ip_deadline) {
+        if (net_if_ipv4_get_global_addr(self->sta_netif, NET_ADDR_PREFERRED) != NULL) {
+            break;
+        }
+        if (mp_hal_is_interrupted()) {
+            break;
+        }
+        RUN_BACKGROUND_TASKS;
+        k_msleep(50);
+    }
+    #endif
+
+    return WIFI_RADIO_ERROR_NONE;
+}
+
+bool common_hal_wifi_radio_get_connected(wifi_radio_obj_t *self) {
+    return self->connected && self->sta_netif != NULL &&
+           net_if_is_up(self->sta_netif);
+}
+
+mp_obj_t common_hal_wifi_radio_get_ap_info(wifi_radio_obj_t *self) {
+    if (self->sta_netif == NULL || !self->connected) {
+        return mp_const_none;
+    }
+
+    // NET_REQUEST_WIFI_IFACE_STATUS carries everything a wifi.Network needs, so
+    // this reports the live association without spending a scan on it.
+    struct wifi_iface_status status = { 0 };
+    if (net_mgmt(NET_REQUEST_WIFI_IFACE_STATUS, self->sta_netif,
+        &status, sizeof(status)) != 0) {
+        return mp_const_none;
+    }
+
+    // Associated is the weakest state that has a meaningful BSSID and RSSI.
+    if (status.state < WIFI_STATE_ASSOCIATED) {
+        return mp_const_none;
+    }
+
+    // wifi.Network wraps a scan result, so translate the status into one.
+    wifi_network_obj_t *ap_info = mp_obj_malloc(wifi_network_obj_t, &wifi_network_type);
+    size_t ssid_len = MIN(status.ssid_len, sizeof(ap_info->scan_result.ssid) - 1);
+    memcpy(ap_info->scan_result.ssid, status.ssid, ssid_len);
+    ap_info->scan_result.ssid[ssid_len] = '\0';
+    ap_info->scan_result.ssid_length = ssid_len;
+    memcpy(ap_info->scan_result.mac, status.bssid, WIFI_MAC_ADDR_LEN);
+    ap_info->scan_result.mac_length = WIFI_MAC_ADDR_LEN;
+    ap_info->scan_result.band = status.band;
+    ap_info->scan_result.channel = status.channel;
+    ap_info->scan_result.security = status.security;
+    ap_info->scan_result.wpa3_ent_type = status.wpa3_ent_type;
+    ap_info->scan_result.mfp = status.mfp;
+    // status.rssi is int, scan_result.rssi is int8_t. Clamp, since a truncated
+    // value would wrap to a positive dBm.
+    ap_info->scan_result.rssi = (int8_t)MIN(MAX(status.rssi, INT8_MIN), INT8_MAX);
+    return MP_OBJ_FROM_PTR(ap_info);
+
+    // }
+
+    // // Make sure the interface is in STA mode
+    // if (!self->sta_mode) {
+    //     return mp_const_none;
+    // }
+
+    // wifi_network_obj_t *ap_info = mp_obj_malloc(wifi_network_obj_t, &wifi_network_type);
+    // // From esp_wifi.h, the possible return values (typos theirs):
+    // //    ESP_OK: succeed
+    // //    ESP_ERR_WIFI_CONN: The station interface don't initialized
+    // //    ESP_ERR_WIFI_NOT_CONNECT: The station is in disconnect status
+    // if (esp_wifi_sta_get_ap_info(&self->ap_info.record) != ESP_OK) {
+    //     return mp_const_none;
+    // } else {
+    //     if (strlen(self->ap_info.record.country.cc) == 0) {
+    //         // Workaround to fill country related information in ap_info until ESP-IDF carries a fix
+    //         // esp_wifi_sta_get_ap_info does not appear to fill wifi_country_t (e.g. country.cc) details
+    //         // (IDFGH-4437) #6267
+    //         // Note: It is possible that Wi-Fi APs don't have a CC set, then even after this workaround
+    //         //       the element would remain empty.
+    //         memset(&self->ap_info.record.country, 0, sizeof(wifi_country_t));
+    //         if (esp_wifi_get_country(&self->ap_info.record.country) != ESP_OK) {
+    //             return mp_const_none;
+    //         }
+    //     }
+    //     memcpy(&ap_info->record, &self->ap_info.record, sizeof(wifi_ap_record_t));
+    //     return MP_OBJ_FROM_PTR(ap_info);
+    // }
+}
+
+mp_obj_t common_hal_wifi_radio_get_ipv4_gateway(wifi_radio_obj_t *self) {
+    if (self->sta_netif == NULL || !net_if_is_up(self->sta_netif)) {
+        return mp_const_none;
+    }
+    // net_if_ip.ipv4 only exists with CONFIG_NET_IPV4, and this file builds for
+    // every Wi-Fi board in the port, not just ones that enable it.
+    #if defined(CONFIG_NET_IPV4)
+    const struct net_if_config *cfg = net_if_get_config(self->sta_netif);
+    if (cfg == NULL || cfg->ip.ipv4 == NULL) {
+        return mp_const_none;
+    }
+    if (cfg->ip.ipv4->gw.s_addr == 0) {
+        return mp_const_none;
+    }
+    return common_hal_ipaddress_new_ipv4address(cfg->ip.ipv4->gw.s_addr);
+    #else
+    return mp_const_none;
+    #endif
+}
+
+mp_obj_t common_hal_wifi_radio_get_ipv4_gateway_ap(wifi_radio_obj_t *self) {
+    // if (!esp_netif_is_netif_up(self->ap_netif)) {
+    return mp_const_none;
+    // }
+    // esp_netif_get_ip_info(self->ap_netif, &self->ap_ip_info);
+    // return common_hal_ipaddress_new_ipv4address(self->ap_ip_info.gw.addr);
+}
+
+mp_obj_t common_hal_wifi_radio_get_ipv4_subnet(wifi_radio_obj_t *self) {
+    if (self->sta_netif == NULL || !net_if_is_up(self->sta_netif)) {
+        return mp_const_none;
+    }
+    // See get_ipv4_gateway: net_if_ip.ipv4 needs CONFIG_NET_IPV4.
+    #if defined(CONFIG_NET_IPV4)
+    struct net_if_ipv4 *ipv4 = self->sta_netif->config.ip.ipv4;
+    if (ipv4 == NULL) {
+        return mp_const_none;
+    }
+    for (int i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
+        if (ipv4->unicast[i].ipv4.is_used &&
+            ipv4->unicast[i].ipv4.addr_state == NET_ADDR_PREFERRED) {
+            return common_hal_ipaddress_new_ipv4address(
+                ipv4->unicast[i].netmask.s_addr);
+        }
+    }
+    #endif
+    return mp_const_none;
+}
+
+mp_obj_t common_hal_wifi_radio_get_ipv4_subnet_ap(wifi_radio_obj_t *self) {
+    // if (!esp_netif_is_netif_up(self->ap_netif)) {
+    return mp_const_none;
+    // }
+    // esp_netif_get_ip_info(self->ap_netif, &self->ap_ip_info);
+    // return common_hal_ipaddress_new_ipv4address(self->ap_ip_info.netmask.addr);
+}
+
+// static mp_obj_t common_hal_wifi_radio_get_addresses_netif(wifi_radio_obj_t *self, esp_netif_t *netif) {
+// if (!esp_netif_is_netif_up(netif)) {
+//     return mp_const_empty_tuple;
+// }
+// esp_netif_ip_info_t ip_info;
+// esp_netif_get_ip_info(netif, &ip_info);
+// int n_addresses4 = ip_info.ip.addr != INADDR_NONE;
+
+// #if CIRCUITPY_SOCKETPOOL_IPV6
+// esp_ip6_addr_t addresses[LWIP_IPV6_NUM_ADDRESSES];
+// int n_addresses6 = esp_netif_get_all_ip6(netif, &addresses[0]);
+// #else
+// int n_addresses6 = 0;
+// #endif
+// int n_addresses = n_addresses4 + n_addresses6;
+// mp_obj_tuple_t *result = MP_OBJ_TO_PTR(mp_obj_new_tuple(n_addresses, NULL));
+
+// #if CIRCUITPY_SOCKETPOOL_IPV6
+// for (int i = 0; i < n_addresses6; i++) {
+//     result->items[i] = espaddr6_to_str(&addresses[i]);
+// }
+// #endif
+
+// if (n_addresses4) {
+//     result->items[n_addresses6] = espaddr4_to_str(&ip_info.ip);
+// }
+
+// return MP_OBJ_FROM_PTR(result);
+// return mp_const_empty_tuple;
+// }
+
+mp_obj_t common_hal_wifi_radio_get_addresses(wifi_radio_obj_t *self) {
+    // shared-bindings documents this as Sequence[str], empty when not
+    // connected, so format as a dotted-quad string rather than returning an
+    // IPv4Address object. Same address as wifi_radio_get_ipv4_address().
+    uint32_t ipv4_address = wifi_radio_get_ipv4_address(self);
+    if (ipv4_address == 0) {
+        return mp_const_empty_tuple;
+    }
+    uint8_t *octets = (uint8_t *)&ipv4_address;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d.%d.%d.%d", octets[0], octets[1], octets[2], octets[3]);
+    mp_obj_t args[] = { mp_obj_new_str(buf, strlen(buf)) };
+    return mp_obj_new_tuple(MP_ARRAY_SIZE(args), args);
+}
+
+mp_obj_t common_hal_wifi_radio_get_addresses_ap(wifi_radio_obj_t *self) {
+    // AP mode is unimplemented here, but mp_const_none is still the wrong type
+    // for the Sequence[str] contract.
+    return mp_const_empty_tuple;
+}
+
+uint32_t wifi_radio_get_ipv4_address(wifi_radio_obj_t *self) {
+    // Raw uint32_t sibling of common_hal_wifi_radio_get_ipv4_address(),
+    // used internally by supervisor/shared/web_workflow/web_workflow.c.
+    if (self->sta_netif == NULL || !net_if_is_up(self->sta_netif)) {
+        return 0;
+    }
+    struct in_addr *addr = net_if_ipv4_get_global_addr(self->sta_netif, NET_ADDR_PREFERRED);
+    if (addr == NULL) {
+        return 0;
+    }
+    return addr->s_addr;
+}
+
+mp_obj_t common_hal_wifi_radio_get_ipv4_address(wifi_radio_obj_t *self) {
+    if (self->sta_netif == NULL || !net_if_is_up(self->sta_netif)) {
+        return mp_const_none;
+    }
+    struct in_addr *addr = net_if_ipv4_get_global_addr(self->sta_netif, NET_ADDR_PREFERRED);
+    if (addr == NULL) {
+        return mp_const_none;
+    }
+    return common_hal_ipaddress_new_ipv4address(addr->s_addr);
+}
+
+mp_obj_t common_hal_wifi_radio_get_ipv4_address_ap(wifi_radio_obj_t *self) {
+    // if (!esp_netif_is_netif_up(self->ap_netif)) {
+    //     return mp_const_none;
+    // }
+    // esp_netif_get_ip_info(self->ap_netif, &self->ap_ip_info);
+    // return common_hal_ipaddress_new_ipv4address(self->ap_ip_info.ip.addr);
+    return mp_const_none;
+}
+
+mp_obj_t common_hal_wifi_radio_get_ipv4_dns(wifi_radio_obj_t *self) {
+    // Zephyr keeps resolver state in the DNS resolve context rather than on
+    // the interface, so read it there.
+    #if defined(CONFIG_DNS_RESOLVER)
+    if (self->sta_netif == NULL || !net_if_is_up(self->sta_netif)) {
+        return mp_const_none;
+    }
+    struct dns_resolve_context *ctx = dns_resolve_get_default();
+    if (ctx == NULL) {
+        return mp_const_none;
+    }
+    for (int i = 0; i < CONFIG_DNS_RESOLVER_MAX_SERVERS; i++) {
+        if (ctx->servers[i].dns_server.sa_family == AF_INET) {
+            struct sockaddr_in *addr =
+                (struct sockaddr_in *)&ctx->servers[i].dns_server;
+            if (addr->sin_addr.s_addr != 0) {
+                return common_hal_ipaddress_new_ipv4address(addr->sin_addr.s_addr);
+            }
+        }
+    }
+    #endif
+    return mp_const_none;
+}
+
+void common_hal_wifi_radio_set_ipv4_dns(wifi_radio_obj_t *self, mp_obj_t ipv4_dns_addr) {
+    // esp_netif_dns_info_t dns_addr;
+    // ipaddress_ipaddress_to_esp_idf_ip4(ipv4_dns_addr, &dns_addr.ip.u_addr.ip4);
+    // esp_netif_set_dns_info(self->netif, ESP_NETIF_DNS_MAIN, &dns_addr);
+}
+
+void common_hal_wifi_radio_start_dhcp_client(wifi_radio_obj_t *self, bool ipv4, bool ipv6) {
+    // if (ipv4) {
+    //     esp_netif_dhcpc_start(self->netif);
+    // } else {
+    //     esp_netif_dhcpc_stop(self->netif);
+    // }
+    // #if LWIP_IPV6_DHCP6
+    // if (ipv6) {
+    //     esp_netif_create_ip6_linklocal(self->netif);
+    //     dhcp6_enable_stateless(esp_netif_get_netif_impl(self->netif));
+    // } else {
+    //     dhcp6_disable(esp_netif_get_netif_impl(self->netif));
+    // }
+    // #else
+    // if (ipv6) {
+    //     mp_raise_NotImplementedError_varg(MP_ERROR_TEXT("%q"), MP_QSTR_ipv6);
+    // }
+    // #endif
+}
+
+void common_hal_wifi_radio_stop_dhcp_client(wifi_radio_obj_t *self) {
+    // esp_netif_dhcpc_stop(self->netif);
+    // #if LWIP_IPV6_DHCP6
+    // dhcp6_disable(esp_netif_get_netif_impl(self->netif));
+    // #endif
+}
+
+void common_hal_wifi_radio_start_dhcp_server(wifi_radio_obj_t *self) {
+    // esp_netif_dhcps_start(self->ap_netif);
+}
+
+void common_hal_wifi_radio_stop_dhcp_server(wifi_radio_obj_t *self) {
+    // esp_netif_dhcps_stop(self->ap_netif);
+}
+
+void common_hal_wifi_radio_set_ipv4_address(wifi_radio_obj_t *self, mp_obj_t ipv4, mp_obj_t netmask, mp_obj_t gateway, mp_obj_t ipv4_dns) {
+    // common_hal_wifi_radio_stop_dhcp_client(self); // Must stop station DHCP to set a manual address
+
+    // esp_netif_ip_info_t ip_info;
+    // ipaddress_ipaddress_to_esp_idf_ip4(ipv4, &ip_info.ip);
+    // ipaddress_ipaddress_to_esp_idf_ip4(netmask, &ip_info.netmask);
+    // ipaddress_ipaddress_to_esp_idf_ip4(gateway, &ip_info.gw);
+
+    // esp_netif_set_ip_info(self->netif, &ip_info);
+
+    // if (ipv4_dns != MP_OBJ_NULL) {
+    //     common_hal_wifi_radio_set_ipv4_dns(self, ipv4_dns);
+    // }
+}
+
+void common_hal_wifi_radio_set_ipv4_address_ap(wifi_radio_obj_t *self, mp_obj_t ipv4, mp_obj_t netmask, mp_obj_t gateway) {
+    // common_hal_wifi_radio_stop_dhcp_server(self); // Must stop access point DHCP to set a manual address
+
+    // esp_netif_ip_info_t ip_info;
+    // ipaddress_ipaddress_to_esp_idf_ip4(ipv4, &ip_info.ip);
+    // ipaddress_ipaddress_to_esp_idf_ip4(netmask, &ip_info.netmask);
+    // ipaddress_ipaddress_to_esp_idf_ip4(gateway, &ip_info.gw);
+
+    // esp_netif_set_ip_info(self->ap_netif, &ip_info);
+
+    // common_hal_wifi_radio_start_dhcp_server(self); // restart access point DHCP
+}
+
+#if CIRCUITPY_WIFI_PING
+// Zephyr delivers the echo reply on the network RX thread, not the caller's, so
+// the two halves share this state through the ICMP context's user_data. It lives
+// on the calling thread's stack, hence the cleanup discipline in ping() below.
+typedef struct {
+    struct k_sem reply_sem;
+    int64_t sent_ms;
+    int64_t elapsed_ms;
+    uint16_t identifier;
+    uint16_t sequence;
+} ping_session_t;
+
+// Zephyr keeps struct net_icmpv4_echo_req in subsys/net/ip/icmpv4.h, a private
+// header that code outside the net stack cannot include, so mirror the four
+// bytes that follow the ICMP header here.
+struct ping_echo_hdr {
+    uint16_t identifier;
+    uint16_t sequence;
+} __packed;
+
+// An echo carries no port number, so the sequence is the only thing telling two
+// back-to-back requests apart; without it a late reply would be reported as the
+// next call's round trip. The identifier is randomized once per boot.
+static uint16_t ping_identifier;
+static uint16_t ping_sequence;
+
+static enum net_verdict ping_reply_handler(struct net_icmp_ctx *ctx,
+    struct net_pkt *pkt,
+    struct net_icmp_ip_hdr *ip_hdr,
+    struct net_icmp_hdr *icmp_hdr,
+    void *user_data) {
+    NET_PKT_DATA_ACCESS_CONTIGUOUS_DEFINE(echo_access, struct ping_echo_hdr);
+    ping_session_t *session = user_data;
+    struct ping_echo_hdr *echo;
+
+    (void)ctx;
+    (void)ip_hdr;
+    (void)icmp_hdr;
+
+    if (session == NULL) {
+        return NET_CONTINUE;
+    }
+
+    // net_pkt_get_data() leaves the cursor where it found it, which the
+    // NET_CONTINUE below relies on: the next handler starts at the echo header.
+    echo = (struct ping_echo_hdr *)net_pkt_get_data(pkt, &echo_access);
+    if (echo == NULL) {
+        return NET_CONTINUE;
+    }
+
+    if (net_ntohs(echo->identifier) != session->identifier ||
+        net_ntohs(echo->sequence) != session->sequence) {
+        // A reply to an earlier ping of ours, or to somebody else's. Leave it
+        // alone rather than waking the caller with a round trip time that
+        // belongs to a different request.
+        return NET_CONTINUE;
+    }
+
+    // Stamp arrival here rather than after k_sem_take() returns, so the
+    // measurement does not absorb the woken thread's scheduling delay.
+    session->elapsed_ms = k_uptime_get() - session->sent_ms;
+    k_sem_give(&session->reply_sem);
+
+    return NET_OK;
+}
+
+mp_int_t common_hal_wifi_radio_ping(wifi_radio_obj_t *self, mp_obj_t ip_address, mp_float_t timeout) {
+    // radio.ping() is documented to take an ipaddress.IPv4Address.
+    if (!mp_obj_is_type(ip_address, &ipaddress_ipv4address_type)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Only IPv4 addresses supported"));
+    }
+
+    // get_packed() takes a concrete ipaddress_ipv4address_obj_t *, so the
+    // MP_OBJ_TO_PTR is needed under object representations C and D.
+    ipaddress_ipv4address_obj_t *addr_obj = MP_OBJ_TO_PTR(ip_address);
+    size_t packed_len;
+    const char *packed = mp_obj_str_get_data(
+        common_hal_ipaddress_ipv4address_get_packed(addr_obj), &packed_len);
+    if (packed_len != sizeof(struct net_in_addr)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Only IPv4 addresses supported"));
+    }
+
+    // This Zephyr renamed the socket address types, so the destination is a
+    // struct net_sockaddr_in carrying NET_AF_INET, not a sockaddr_in/AF_INET.
+    struct net_sockaddr_in dst = {
+        .sin_family = NET_AF_INET,
+    };
+    memcpy(&dst.sin_addr, packed, sizeof(dst.sin_addr));
+
+    if (ping_identifier == 0) {
+        // Seeded lazily. sys_rand16_get() may legitimately return 0, in which
+        // case we simply reseed on the next call.
+        ping_identifier = sys_rand16_get();
+    }
+
+    ping_session_t session = {
+        .identifier = ping_identifier,
+        .sequence = ++ping_sequence,
+        .elapsed_ms = -1,
+    };
+    k_sem_init(&session.reply_sem, 0, 1);
+
+    struct net_icmp_ctx icmp_ctx;
+    int res = net_icmp_init_ctx(&icmp_ctx, NET_AF_INET, NET_ICMPV4_ECHO_REPLY, 0,
+        ping_reply_handler);
+    if (res < 0) {
+        LOG_DBG("ping: net_icmp_init_ctx failed (%d)", res);
+        return -1;
+    }
+
+    struct net_icmp_ping_params params = {
+        .identifier = session.identifier,
+        .sequence = session.sequence,
+        .tc_tos = 0,
+        // A negative priority leaves the packet at the stack default and lets
+        // tc_tos drive the DSCP/ECN bits instead.
+        .priority = -1,
+        .data = NULL,
+        .data_size = 0,
+    };
+
+    session.sent_ms = k_uptime_get();
+
+    // A NULL sta_netif is fine; the stack picks an interface from the
+    // destination. This is the blocking send, as Zephyr's net shell uses: it
+    // waits up to a second for a buffer, so a ping can take timeout + 1s.
+    res = net_icmp_send_echo_request(&icmp_ctx, self->sta_netif,
+        (struct net_sockaddr *)&dst, &params, &session);
+    if (res < 0) {
+        LOG_DBG("ping: send failed (%d)", res);
+        (void)net_icmp_cleanup_ctx(&icmp_ctx);
+        return -1;
+    }
+
+    // Wait for ping_reply_handler() to signal, staying responsive to ctrl-C at
+    // the same 50 ms granularity as the association wait in
+    // common_hal_wifi_radio_connect().
+    mp_float_t timeout_s = timeout <= 0 ? (mp_float_t)0.5 : timeout;
+    int64_t deadline = k_uptime_get() + (int64_t)(timeout_s * 1000);
+    bool replied = false;
+    while (true) {
+        int64_t remaining_ms = deadline - k_uptime_get();
+        if (remaining_ms <= 0) {
+            break;
+        }
+
+        // Poll in 50 ms slices so ctrl-C stays responsive, clamped to the
+        // caller's deadline so a reply arriving after the timeout is not
+        // reported as a success. MIN() is avoided here because py/misc.h and
+        // zephyr/sys/util.h both define it and this file includes both.
+        int64_t wait_ms = remaining_ms < 50 ? remaining_ms : 50;
+
+        if (k_sem_take(&session.reply_sem, K_MSEC(wait_ms)) == 0) {
+            replied = true;
+            break;
+        }
+        if (mp_hal_is_interrupted()) {
+            break;
+        }
+    }
+
+    // Unregister before returning. net_icmp_cleanup_ctx() takes the same mutex
+    // the stack holds while dispatching handlers, so once it returns no handler
+    // can still be looking at session, which lives on this stack frame. This
+    // has to happen on every exit path, including the error paths above.
+    (void)net_icmp_cleanup_ctx(&icmp_ctx);
+
+    if (!replied || session.elapsed_ms < 0) {
+        return -1;
+    }
+
+    // shared-bindings turns exactly -1 into None and divides anything else by
+    // 1000, so every failure path must return -1, not 0.
+    return (mp_int_t)session.elapsed_ms;
+}
+#else
+mp_int_t common_hal_wifi_radio_ping(wifi_radio_obj_t *self, mp_obj_t ip_address, mp_float_t timeout) {
+    // Boards that turn ping off to save flash report no reply.
+    return -1;
+}
+#endif
+
+void common_hal_wifi_radio_gc_collect(wifi_radio_obj_t *self) {
+    // Only bother to scan the actual object references.
+    gc_collect_ptr(self->current_scan);
+}
+
+mp_obj_t common_hal_wifi_radio_get_dns(wifi_radio_obj_t *self) {
+    // if (!esp_netif_is_netif_up(self->netif)) {
+    //     return mp_const_empty_tuple;
+    // }
+
+    // esp_netif_get_dns_info(self->netif, ESP_NETIF_DNS_MAIN, &self->dns_info);
+
+    // if (self->dns_info.ip.type == ESP_IPADDR_TYPE_V4 && self->dns_info.ip.u_addr.ip4.addr == INADDR_NONE) {
+    //     return mp_const_empty_tuple;
+    // }
+
+    // mp_obj_t args[] = {
+    //     espaddr_to_str(&self->dns_info.ip),
+    // };
+
+    // return mp_obj_new_tuple(1, args);
+    return mp_const_empty_tuple;
+}
+
+void common_hal_wifi_radio_set_dns(wifi_radio_obj_t *self, mp_obj_t dns_addrs_obj) {
+    // mp_int_t len = mp_obj_get_int(mp_obj_len(dns_addrs_obj));
+    // mp_arg_validate_length_max(len, 1, MP_QSTR_dns);
+    // esp_netif_dns_info_t dns_info;
+    // if (len == 0) {
+    //     // clear DNS server
+    //     dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+    //     dns_info.ip.u_addr.ip4.addr = INADDR_NONE;
+    // } else {
+    //     mp_obj_t dns_addr_obj = mp_obj_subscr(dns_addrs_obj, MP_OBJ_NEW_SMALL_INT(0), MP_OBJ_SENTINEL);
+    //     struct sockaddr_storage addr_storage;
+    //     socketpool_resolve_host_or_throw(AF_UNSPEC, SOCK_STREAM, mp_obj_str_get_str(dns_addr_obj), &addr_storage, 1);
+    //     sockaddr_to_espaddr(&addr_storage, &dns_info.ip);
+    // }
+    // esp_netif_set_dns_info(self->netif, ESP_NETIF_DNS_MAIN, &dns_info);
+}

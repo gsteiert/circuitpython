@@ -1,3 +1,12 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+
+// SPDX-FileCopyrightText: Copyright (c) 2020 Dan Halbert for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2018 Arduino SA. All rights reserved.
+//
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+//  This file is derived from the ArduinoBLE library. Its header is below.
+
 /*
   This file is part of the ArduinoBLE library.
   Copyright (c) 2018 Arduino SA. All rights reserved.
@@ -17,8 +26,7 @@
   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
-#ifndef MICROPY_INCLUDED_DEVICES_BLE_HCI_COMMON_HAL_BLEIO_HCI_H
-#define MICROPY_INCLUDED_DEVICES_BLE_HCI_COMMON_HAL_BLEIO_HCI_H
+#pragma once
 
 #include <stdint.h>
 
@@ -60,6 +68,9 @@ hci_result_t hci_le_set_advertising_parameters(uint16_t min_interval, uint16_t m
 hci_result_t hci_le_set_extended_advertising_data(uint8_t handle, uint8_t op, uint8_t frag_pref, uint8_t len, uint8_t data[]);
 hci_result_t hci_le_set_extended_advertising_enable(uint8_t enable, uint8_t set_num, uint8_t handle[], uint16_t duration[], uint8_t max_ext_adv_evts[]);
 hci_result_t hci_le_set_extended_advertising_parameters(uint8_t handle, uint16_t props, uint32_t prim_min_interval, uint32_t prim_max_interval, uint8_t prim_channel_map, uint8_t own_addr_type, bt_addr_le_t *peer_addr, uint8_t filter_policy, int8_t tx_power, uint8_t prim_adv_phy, uint8_t sec_adv_max_skip, uint8_t sec_adv_phy, uint8_t sid, uint8_t scan_req_notify_enable);
+// Sends at most one fragment (251 bytes); longer data is truncated.
+// Returns HCI_OK or the HCI error status; no output values.
+hci_result_t hci_le_set_extended_scan_response_data(uint8_t handle, uint8_t op, uint8_t frag_pref, uint8_t len, uint8_t data[]);
 
 hci_result_t hci_le_set_random_address(uint8_t addr[6]);
 hci_result_t hci_le_set_scan_enable(uint8_t enable, uint8_t filter_dup);
@@ -77,5 +88,3 @@ hci_result_t hci_reset(void);
 
 hci_result_t hci_send_acl_pkt(uint16_t handle, uint8_t cid, uint16_t data_len, uint8_t *data);
 hci_result_t hci_set_event_mask(uint64_t event_mask);
-
-#endif // MICROPY_INCLUDED_DEVICES_BLE_HCI_COMMON_HAL_BLEIO_HCI_H

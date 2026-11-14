@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright 2020 Sony Semiconductor Solutions Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright 2020 Sony Semiconductor Solutions Corporation
+//
+// SPDX-License-Identifier: MIT
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -38,7 +18,9 @@ typedef struct {
     int fd;
 } gnss_dev_t;
 
-STATIC gnss_dev_t gnss_dev = {"/dev/gps", -1};
+static gnss_dev_t gnss_dev = {"/dev/gps", -1};
+// GNSS objects share the device. Close it when the last one is deinited.
+static uint8_t gnss_users = 0;
 
 static gnss_positionfix_t fix_to_positionfix_type(uint8_t fix) {
     switch (fix) {
@@ -52,11 +34,17 @@ static gnss_positionfix_t fix_to_positionfix_type(uint8_t fix) {
     }
 }
 
+static void mark_deinit(gnss_obj_t *self) {
+    self->active = false;
+}
+
 void common_hal_gnss_construct(gnss_obj_t *self, unsigned long selection) {
+    mark_deinit(self);
+
     if (gnss_dev.fd < 0) {
         gnss_dev.fd = open(gnss_dev.devpath, O_RDONLY);
         if (gnss_dev.fd < 0) {
-            mp_raise_ValueError(translate("Could not initialize GNSS"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("GNSS init"));
         }
     }
 
@@ -79,19 +67,28 @@ void common_hal_gnss_construct(gnss_obj_t *self, unsigned long selection) {
 
     ioctl(gnss_dev.fd, CXD56_GNSS_IOCTL_SELECT_SATELLITE_SYSTEM, sel);
     ioctl(gnss_dev.fd, CXD56_GNSS_IOCTL_START, CXD56_GNSS_STMOD_COLD);
+
+    gnss_users++;
+    self->active = true;
 }
 
 void common_hal_gnss_deinit(gnss_obj_t *self) {
     if (common_hal_gnss_deinited(self)) {
         return;
     }
+    mark_deinit(self);
+    gnss_users--;
+    if (gnss_users > 0) {
+        return;
+    }
 
+    ioctl(gnss_dev.fd, CXD56_GNSS_IOCTL_STOP, 0);
     close(gnss_dev.fd);
     gnss_dev.fd = -1;
 }
 
 bool common_hal_gnss_deinited(gnss_obj_t *self) {
-    return gnss_dev.fd < 0;
+    return !self->active;
 }
 
 void common_hal_gnss_update(gnss_obj_t *self) {

@@ -1,0 +1,26 @@
+name: Fetch port deps
+
+inputs:
+  board:
+    required: true
+    type: string
+  port:
+    required: true
+    type: string
+
+runs:
+  using: composite
+  steps:
+    - name: Set up espressif
+      if: inputs.port == 'espressif'
+      uses: ./.github/actions/deps/ports/espressif
+
+    - name: Set up nordic
+      if: inputs.port == 'nordic'
+      uses: ./.github/actions/deps/ports/nordic
+
+    - name: Set up Zephyr
+      if: inputs.port == 'zephyr-cp'
+      uses: ./.github/actions/deps/ports/zephyr-cp
+      with:
+        sdl: ${{ startsWith(inputs.board, 'native_') }}

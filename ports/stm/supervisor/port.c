@@ -1,53 +1,21 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
- * Copyright (c) 2019 Lucian Copeland for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2019 Lucian Copeland for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include <stdint.h>
 #include "supervisor/background_callback.h"
 #include "supervisor/board.h"
 #include "supervisor/port.h"
-#include "shared/timeutils/timeutils.h"
 
 #include "common-hal/microcontroller/Pin.h"
 #include "shared-bindings/microcontroller/__init__.h"
 
-#ifdef CIRCUITPY_AUDIOPWMIO
-#include "common-hal/audiopwmio/PWMAudioOut.h"
-#endif
 #if CIRCUITPY_BUSIO
-#include "common-hal/busio/I2C.h"
 #include "common-hal/busio/SPI.h"
 #include "common-hal/busio/UART.h"
-#endif
-#if CIRCUITPY_PULSEIO
-#include "common-hal/pulseio/PulseOut.h"
-#include "common-hal/pulseio/PulseIn.h"
-#endif
-#if CIRCUITPY_PWMIO
-#include "common-hal/pwmio/PWMOut.h"
 #endif
 #if CIRCUITPY_PULSEIO || CIRCUITPY_PWMIO
 #include "peripherals/timers.h"
@@ -61,6 +29,12 @@
 #if CIRCUITPY_ALARM
 #include "common-hal/alarm/__init__.h"
 #endif
+#if CIRCUITPY_RTC
+#include "shared-bindings/rtc/__init__.h"
+#endif
+#if CIRCUITPY_AUDIOIO
+#include "common-hal/audioio/AudioOut.h"
+#endif
 
 #include "peripherals/clocks.h"
 #include "peripherals/gpio.h"
@@ -68,9 +42,18 @@
 
 #include STM32_HAL_H
 
-void NVIC_SystemReset(void) NORETURN;
+void NVIC_SystemReset(void) MP_NORETURN;
 
 #if (CPY_STM32H7) || (CPY_STM32F7)
+#if defined(CIRCUITPY_HW_SDRAM_SIZE)
+#include "stm.h"
+#include "sdram.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include "lib/tlsf/tlsf.h"
+// internal SRAM + external SDRAM
+#define CIRCUITPY_RAM_DEVICE_COUNT (2)
+#endif
 
 // Device memories must be accessed in order.
 #define DEVICE 2
@@ -163,8 +146,31 @@ __attribute__((used, naked)) void Reset_Handler(void) {
     for (uint32_t i = 0; i < ((size_t)&_ld_d1_ram_bss_size) / 4; i++) {
         (&_ld_d1_ram_bss_start)[i] = 0;
     }
+    #ifdef STM32H750xx
+    __DMB(); /* ARM says to use a DMB instruction before relocating VTOR */
+    SCB->VTOR = 0x90000000u; /* We relocate vector table to the QSPI sector 1 */
+    __DSB(); /* ARM says to use a DSB instruction just after relocating VTOR */
+    /*
+       Since the STM32H750 microcontroller has only 128kB internal flash,
+       CircuitPython has to run from an external flash (QSPI or FMC).
+       This means a custom bootloader, like tinyUF2, is needed on the internal
+       flash to initialize the clocks, PLLs and (QSPI) controller, and to
+       start execution of the firmware from the external flash.
+       It also makes the SystemInit() call not necessary for this chip.
+    */
+    #if defined(__ICACHE_PRESENT) && (__ICACHE_PRESENT == 1U)
+    /* Enable I cache. */
+    SCB_EnableICache();
+    #endif /* __ICACHE_PRESENT */
 
+    #if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+    /* Enable D cache. */
+    SCB_EnableDCache();
+    #endif /* __DCACHE_PRESENT */
+
+    #else
     SystemInit();
+    #endif
     __enable_irq();
     main();
 }
@@ -173,7 +179,151 @@ __attribute__((used, naked)) void Reset_Handler(void) {
 // Low power clock variables
 static volatile uint32_t systick_ms;
 
+#if  defined(CIRCUITPY_HW_SDRAM_SIZE)
+static tlsf_t _heap = NULL;
+static pool_t pools[CIRCUITPY_RAM_DEVICE_COUNT] = {NULL};
+
+
+void port_heap_init(void) {
+    // heap init in _port_heap_init called from port_init
+}
+
+void stm_add_sdram_to_heap(void) {
+    size_t sdram_memory_size = sdram_size();
+    pools[1] = tlsf_add_pool(_heap, sdram_start(), sdram_memory_size);
+}
+
+static void _port_heap_init(void) {
+    uint32_t *heap_bottom = port_heap_get_bottom();
+    uint32_t *heap_top = port_heap_get_top();
+    size_t size = (heap_top - heap_bottom) * sizeof(uint32_t);
+    size_t sdram_memory_size = sdram_size();
+
+    _heap = tlsf_create_with_pool(heap_bottom, size, size + sdram_memory_size);
+    pools[0] = tlsf_get_pool(_heap);
+}
+
+static bool max_size_walker(void *ptr, size_t size, int used, void *user) {
+    size_t *max_size = (size_t *)user;
+    if (!used && *max_size < size) {
+        *max_size = size;
+    }
+    return true;
+}
+
+size_t port_heap_get_largest_free_size(void) {
+    size_t max_size = 0;
+    for (size_t i = 0; i < CIRCUITPY_RAM_DEVICE_COUNT; i++) {
+        if (pools[i]) {
+            tlsf_walk_pool(pools[i], max_size_walker, &max_size);
+        }
+    }
+    return tlsf_fit_size(_heap, max_size);
+}
+
+void *port_malloc(size_t size, bool dma_capable) {
+    void *block = tlsf_malloc(_heap, size);
+    return block;
+}
+
+void port_free(void *ptr) {
+    tlsf_free(_heap, ptr);
+}
+
+void *port_realloc(void *ptr, size_t size, bool dma_capable) {
+    return tlsf_realloc(_heap, ptr, size);
+}
+#endif
+
+// Pending request for the ST system bootloader. This lives in the saved word,
+// RAM that startup does not clear, which is where the other ports keep theirs:
+// _bootloader_dbl_tap on atmel-samd, NRF_POWER->GPREGRET on nordic,
+// SNVS->LPGPR[3] on mimxrt10xx. The low byte is the attempt count.
+#define BOOTLOADER_MAGIC 0xf05a0000
+#define BOOTLOADER_MAGIC_MASK 0xffff0000
+// Magic in the top half, RTC seconds of the last attempt in bits 15:8, attempt
+// count in bits 7:0.
+#define BOOTLOADER_SECONDS_SHIFT 8
+#define BOOTLOADER_FIELD_MASK 0xff
+
+// A retry only counts if it follows the previous attempt closely. The ROM fails
+// and resets within a second, so anything slower is the part being reset by
+// something else while the bootloader was running, and the request is stale.
+// Without this, exiting DFU with a software reset lands straight back in DFU.
+#define BOOTLOADER_RETRY_WINDOW_S 5
+
+// The ROM clocks USB from the HSE but does not know which crystal is fitted, so
+// it measures one against the HSI and resets the part when that misses: AN2606
+// Figure 32/33, "HSE detected" -> no -> "Generate System reset". On the 12 MHz
+// Feather STM32F405 Express one attempt reached DFU 5 times in 12.
+#define BOOTLOADER_MAX_ATTEMPTS 16
+
+#if CPY_STM32F4
+// Seconds field of the RTC clock, read straight from the register because the
+// HAL handle is not initialised this early. rtc_init() leaves shadow bypass on
+// and that setting survives a reset, so the register reads live. Only a read is
+// needed, so the backup domain does not have to be unlocked for write.
+static uint32_t bootloader_rtc_seconds(void) {
+    uint32_t tr = RTC->TR;
+    return ((tr >> 4) & 0x7) * 10 + (tr & 0xF);
+}
+
+// Naked so nothing touches the stack between setting MSP and the branch.
+MP_NORETURN static __attribute__((naked)) void branch_to_bootloader(uint32_t bl_addr) {
+    __asm volatile (
+        "ldr r2, [r0, #0]\n"
+        "msr msp, r2\n"
+        "ldr r2, [r0, #4]\n"
+        "bx r2\n"
+        );
+}
+
+// Runs before HAL_Init() starts SysTick, so the ROM gets the part close to reset
+// state. The ROM sets its own VTOR and runs from 0x1FFF0000, so no SYSCFG remap
+// is needed here.
+static void check_enter_bootloader(void) {
+    uint32_t request = port_get_saved_word();
+    if ((request & BOOTLOADER_MAGIC_MASK) != BOOTLOADER_MAGIC) {
+        // Not our word. Safe mode shares it, so leave it alone.
+        return;
+    }
+
+    // The ROM signals its HSE-detect failure with a software reset, so SFTRSTF is
+    // what tells a retry apart from a cold boot, and a power cycle always leaves
+    // the bootloader.
+    if (!(RCC->CSR & RCC_CSR_SFTRSTF)) {
+        port_set_saved_word(0);
+        return;
+    }
+
+    uint32_t now = bootloader_rtc_seconds();
+    uint32_t then = (request >> BOOTLOADER_SECONDS_SHIFT) & BOOTLOADER_FIELD_MASK;
+    if ((now + 60 - then) % 60 > BOOTLOADER_RETRY_WINDOW_S) {
+        port_set_saved_word(0);
+        return;
+    }
+
+    uint32_t attempts = request & BOOTLOADER_FIELD_MASK;
+    if (attempts >= BOOTLOADER_MAX_ATTEMPTS) {
+        port_set_saved_word(0);
+        return;
+    }
+    port_set_saved_word(BOOTLOADER_MAGIC |
+        (now << BOOTLOADER_SECONDS_SHIFT) | (attempts + 1));
+    // Clearing the flags cancels the request once the ROM succeeds: leaving DFU
+    // is a jump, not a reset, so SFTRSTF stays clear and the branch above zeroes
+    // the flag on the way back into the application.
+    RCC->CSR |= RCC_CSR_RMVF;
+
+    branch_to_bootloader(0x1FFF0000);
+}
+#endif
+
 safe_mode_t port_init(void) {
+    #if CPY_STM32F4
+    check_enter_bootloader();
+    #endif
+
     HAL_Init(); // Turns on SysTick
     __HAL_RCC_SYSCFG_CLK_ENABLE();
 
@@ -206,10 +356,13 @@ safe_mode_t port_init(void) {
     __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
     stm32_peripherals_rtc_reset_alarms();
 
+    #if  defined(CIRCUITPY_HW_SDRAM_SIZE)
+    _port_heap_init();
+    #endif
     // Turn off SysTick
     SysTick->CTRL = 0;
 
-    return NO_SAFE_MODE;
+    return SAFE_MODE_NONE;
 }
 
 void HAL_Delay(uint32_t delay_ms) {
@@ -223,7 +376,7 @@ void HAL_Delay(uint32_t delay_ms) {
     }
 }
 
-uint32_t HAL_GetTick() {
+uint32_t HAL_GetTick(void) {
     if (SysTick->CTRL != 0) {
         return systick_ms;
     } else {
@@ -240,35 +393,23 @@ void SysTick_Handler(void) {
 }
 
 void reset_port(void) {
-    reset_all_pins();
-    #if CIRCUITPY_AUDIOPWMIO
-    audiopwmout_reset();
-    #endif
-    #if CIRCUITPY_BUSIO
-    i2c_reset();
-    spi_reset();
-    uart_reset();
-    #endif
-    #if CIRCUITPY_SDIOIO
-    sdioio_reset();
-    #endif
-    #if CIRCUITPY_PULSEIO || CIRCUITPY_PWMIO
-    timers_reset();
-    #endif
-    #if CIRCUITPY_PULSEIO
-    pulseout_reset();
-    pulsein_reset();
-    #endif
-    #if CIRCUITPY_PWMIO
-    pwmout_reset();
-    #endif
-    #if CIRCUITPY_PULSEIO || CIRCUITPY_ALARM
-    exti_reset();
+    #if CIRCUITPY_RTC
+    rtc_reset();
     #endif
 }
 
 void reset_to_bootloader(void) {
+    #if CPY_STM32F4
+    // Record the request and reset, rather than jumping from a running
+    // application. check_enter_bootloader() jumps on the way back up.
+    port_set_saved_word(BOOTLOADER_MAGIC |
+        (bootloader_rtc_seconds() << BOOTLOADER_SECONDS_SHIFT));
+    #endif
     NVIC_SystemReset();
+
+    while (true) {
+        asm ("nop;");
+    }
 }
 
 void reset_cpu(void) {
@@ -281,16 +422,17 @@ uint32_t *port_heap_get_bottom(void) {
     return &_ld_heap_start;
 }
 
+// heap memory can be set in SRAM and stack can be set in DTCM
 uint32_t *port_heap_get_top(void) {
     return &_ld_heap_end;
 }
 
-bool port_has_fixed_stack(void) {
-    return false;
-}
-
 uint32_t *port_stack_get_limit(void) {
-    return &_ld_stack_bottom;
+    #pragma GCC diagnostic push
+
+    #pragma GCC diagnostic ignored "-Warray-bounds"
+    return port_stack_get_top() - (CIRCUITPY_DEFAULT_STACK_SIZE + CIRCUITPY_EXCEPTION_STACK_SIZE) / sizeof(uint32_t);
+    #pragma GCC diagnostic pop
 }
 
 uint32_t *port_stack_get_top(void) {
@@ -309,35 +451,35 @@ uint32_t port_get_saved_word(void) {
 }
 
 __attribute__((used)) void MemManage_Handler(void) {
-    reset_into_safe_mode(MEM_MANAGE);
+    reset_into_safe_mode(SAFE_MODE_HARD_FAULT);
     while (true) {
         asm ("nop;");
     }
 }
 
 __attribute__((used)) void BusFault_Handler(void) {
-    reset_into_safe_mode(MEM_MANAGE);
+    reset_into_safe_mode(SAFE_MODE_HARD_FAULT);
     while (true) {
         asm ("nop;");
     }
 }
 
 __attribute__((used)) void UsageFault_Handler(void) {
-    reset_into_safe_mode(MEM_MANAGE);
+    reset_into_safe_mode(SAFE_MODE_HARD_FAULT);
     while (true) {
         asm ("nop;");
     }
 }
 
 __attribute__((used)) void HardFault_Handler(void) {
-    reset_into_safe_mode(HARD_CRASH);
+    reset_into_safe_mode(SAFE_MODE_HARD_FAULT);
     while (true) {
         asm ("nop;");
     }
 }
 
 uint64_t port_get_raw_ticks(uint8_t *subticks) {
-    return stm32_peripherals_rtc_raw_ticks(subticks);
+    return stm32_peripherals_rtc_monotonic_ticks(subticks);
 }
 
 // Enable 1/1024 second tick.
@@ -346,8 +488,6 @@ void port_enable_tick(void) {
     stm32_peripherals_rtc_assign_wkup_callback(supervisor_tick);
     stm32_peripherals_rtc_enable_wakeup_timer();
 }
-// TODO: what is this? can I get rid of it?
-extern volatile uint32_t autoreload_delay_ms;
 
 // Disable 1/1024 second tick.
 void port_disable_tick(void) {
@@ -369,6 +509,8 @@ void port_idle_until_interrupt(void) {
         return;
     }
     common_hal_mcu_disable_interrupts();
+    // Don't sleep on a tick that has stopped.
+    stm32_peripherals_rtc_recover_wakeup();
     if (!background_callback_pending()) {
         __WFI();
     }

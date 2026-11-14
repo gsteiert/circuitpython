@@ -1,43 +1,25 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Lucian Copeland for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Lucian Copeland for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "py/runtime.h"
 
+#include "shared-bindings/alarm/__init__.h"
 #include "shared-bindings/alarm/time/TimeAlarm.h"
 #include "shared-bindings/time/__init__.h"
 
-#include "shared/timeutils/timeutils.h"
-
 #include "hardware/gpio.h"
-#include "hardware/rtc.h"
+#include "pico/aon_timer.h"
 
-STATIC bool woke_up = false;
-STATIC bool _timealarm_set = false;
+static bool woke_up = false;
+static bool _timealarm_set = false;
+#if PICO_RP2350
+static uint64_t _wakeup_ms;
+#endif
 
-STATIC void timer_callback(void) {
+static void timer_callback(void) {
     woke_up = true;
 }
 
@@ -58,12 +40,13 @@ mp_obj_t alarm_time_timealarm_find_triggered_alarm(size_t n_alarms, const mp_obj
     return mp_const_none;
 }
 
-mp_obj_t alarm_time_timealarm_create_wakeup_alarm(void) {
-    alarm_time_timealarm_obj_t *timer = m_new_obj(alarm_time_timealarm_obj_t);
-    timer->base.type = &alarm_time_timealarm_type;
+mp_obj_t alarm_time_timealarm_record_wake_alarm(void) {
+    alarm_time_timealarm_obj_t *const alarm = &alarm_wake_alarm.time_alarm;
+
+    alarm->base.type = &alarm_time_timealarm_type;
     // TODO: Set monotonic_time based on the RTC state.
-    timer->monotonic_time = 0.0f;
-    return timer;
+    alarm->monotonic_time = 0.0f;
+    return alarm;
 }
 
 bool alarm_time_timealarm_woke_this_cycle(void) {
@@ -71,7 +54,7 @@ bool alarm_time_timealarm_woke_this_cycle(void) {
 }
 
 void alarm_time_timealarm_reset(void) {
-    rtc_disable_alarm();
+    aon_timer_disable_alarm();
     woke_up = false;
 }
 
@@ -84,7 +67,7 @@ void alarm_time_timealarm_set_alarms(bool deep_sleep, size_t n_alarms, const mp_
             continue;
         }
         if (timealarm_set) {
-            mp_raise_ValueError(translate("Only one alarm.time alarm can be set."));
+            mp_raise_ValueError(MP_ERROR_TEXT("Only one alarm.time alarm can be set."));
         }
         timealarm = MP_OBJ_TO_PTR(alarms[i]);
         timealarm_set = true;
@@ -99,28 +82,19 @@ void alarm_time_timealarm_set_alarms(bool deep_sleep, size_t n_alarms, const mp_
     // Compute how long to actually sleep, considering the time now.
     mp_float_t mono_seconds_to_date = uint64_to_float(common_hal_time_monotonic_ms()) / 1000.0f;
     mp_float_t wakeup_in_secs = MAX(0.0f, timealarm->monotonic_time - mono_seconds_to_date);
-    datetime_t t;
+    struct timespec t;
 
-    rtc_get_datetime(&t);
-
-    uint32_t rtc_seconds_to_date = timeutils_seconds_since_2000(t.year, t.month,
-        t.day, t.hour, t.min, t.sec);
+    aon_timer_get_time(&t);
 
     // The float value is always slightly under, so add 1 to compensate
-    uint32_t alarm_seconds = rtc_seconds_to_date + (uint32_t)wakeup_in_secs + 1;
-    timeutils_struct_time_t tm;
-    timeutils_seconds_since_2000_to_struct_time(alarm_seconds, &tm);
+    t.tv_sec += (uint32_t)wakeup_in_secs + 1;
+    t.tv_nsec = 0;
 
-    // reuse t
-    t.hour = tm.tm_hour;
-    t.min = tm.tm_min;
-    t.sec = tm.tm_sec;
-    t.day = tm.tm_mday;
-    t.month = tm.tm_mon;
-    t.year = tm.tm_year;
-    t.dotw = (tm.tm_wday + 1) % 7;
-
-    rtc_set_alarm(&t, &timer_callback);
+    // On RP2350 the last argument makes the alarm a powman wakeup source.
+    aon_timer_enable_alarm(&t, &timer_callback, deep_sleep);
+    #if PICO_RP2350
+    _wakeup_ms = (uint64_t)t.tv_sec * 1000;
+    #endif
 
     woke_up = false;
 }
@@ -128,3 +102,9 @@ void alarm_time_timealarm_set_alarms(bool deep_sleep, size_t n_alarms, const mp_
 bool alarm_time_timealarm_is_set(void) {
     return _timealarm_set;
 }
+
+#if PICO_RP2350
+uint64_t alarm_time_timealarm_get_wakeup_ms(void) {
+    return _wakeup_ms;
+}
+#endif

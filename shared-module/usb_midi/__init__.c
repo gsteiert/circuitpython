@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 hathach for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 hathach for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/usb_midi/__init__.h"
 
@@ -33,7 +13,6 @@
 #include "py/objtuple.h"
 #include "shared-bindings/usb_midi/PortIn.h"
 #include "shared-bindings/usb_midi/PortOut.h"
-#include "supervisor/memory.h"
 #include "supervisor/usb.h"
 #include "tusb.h"
 
@@ -127,7 +106,7 @@ static const uint8_t usb_midi_descriptor_template[] = {
     0xFF,        // 66 bEndpointAddress (OUT/H2D) [SET AT RUNTIME]
 #define MIDI_STREAMING_OUT_ENDPOINT_INDEX (66)
     0x02,        // 67 bmAttributes (Bulk)
-    #if USB_HIGHSPEED
+    #if CIRCUITPY_USB_DEVICE_HIGH_SPEED == 1
     0x00, 0x02,  // 68,69 wMaxPacketSize (512)
     #else
     0x40, 0x00,  // 68,69 wMaxPacketSize (64)
@@ -147,7 +126,7 @@ static const uint8_t usb_midi_descriptor_template[] = {
     0xFF,        // 78 bEndpointAddress (IN/D2H) [SET AT RUNTIME: 0x80 | number]
 #define MIDI_STREAMING_IN_ENDPOINT_INDEX (78)
     0x02,        // 79 bmAttributes (Bulk)
-    #if USB_HIGHSPEED
+    #if CIRCUITPY_USB_DEVICE_HIGH_SPEED == 1
     0x00, 0x02,  // 80, 81 wMaxPacketSize (512)
     #else
     0x40, 0x00,  // 80, 81 wMaxPacketSize (64)
@@ -178,10 +157,10 @@ size_t usb_midi_descriptor_length(void) {
     return sizeof(usb_midi_descriptor_template);
 }
 
-static const char midi_streaming_interface_name[] = USB_INTERFACE_NAME " MIDI";
-static const char midi_audio_control_interface_name[] = USB_INTERFACE_NAME " Audio";
-static const char midi_in_jack_name[] = USB_INTERFACE_NAME " usb_midi.ports[0]";
-static const char midi_out_jack_name[] = USB_INTERFACE_NAME " usb_midi.ports[0]";
+char *custom_usb_midi_streaming_interface_name = NULL;
+char *custom_usb_midi_audio_control_interface_name = NULL;
+char *custom_usb_midi_in_jack_name = NULL;
+char *custom_usb_midi_out_jack_name = NULL;
 
 size_t usb_midi_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *descriptor_counts, uint8_t *current_interface_string) {
     memcpy(descriptor_buf, usb_midi_descriptor_template, sizeof(usb_midi_descriptor_template));
@@ -192,6 +171,12 @@ size_t usb_midi_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *des
     descriptor_buf[MIDI_STREAMING_IN_ENDPOINT_INDEX] =
         0x80 | (USB_MIDI_EP_NUM_IN ? USB_MIDI_EP_NUM_IN : descriptor_counts->current_endpoint);
     descriptor_counts->num_in_endpoints++;
+
+    // Some TinyUSB devices have issues with bi-directional endpoints
+    #ifdef TUD_ENDPOINT_ONE_DIRECTION_ONLY
+    descriptor_counts->current_endpoint++;
+    #endif
+
     descriptor_buf[MIDI_STREAMING_OUT_ENDPOINT_INDEX] =
         USB_MIDI_EP_NUM_OUT ? USB_MIDI_EP_NUM_OUT : descriptor_counts->current_endpoint;
     descriptor_counts->num_out_endpoints++;
@@ -201,19 +186,19 @@ size_t usb_midi_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *des
     descriptor_buf[MIDI_STREAMING_INTERFACE_NUMBER_INDEX_2] = descriptor_counts->current_interface;
     descriptor_counts->current_interface++;
 
-    usb_add_interface_string(*current_interface_string, midi_streaming_interface_name);
+    usb_add_interface_name(*current_interface_string, custom_usb_midi_streaming_interface_name, "MIDI");
     descriptor_buf[MIDI_STREAMING_INTERFACE_STRING_INDEX] = *current_interface_string;
     (*current_interface_string)++;
 
-    usb_add_interface_string(*current_interface_string, midi_audio_control_interface_name);
+    usb_add_interface_name(*current_interface_string, custom_usb_midi_audio_control_interface_name, "Audio");
     descriptor_buf[MIDI_AUDIO_CONTROL_INTERFACE_STRING_INDEX] = *current_interface_string;
     (*current_interface_string)++;
 
-    usb_add_interface_string(*current_interface_string, midi_in_jack_name);
+    usb_add_interface_name(*current_interface_string, custom_usb_midi_in_jack_name, "usb_midi.ports[0]");
     descriptor_buf[MIDI_IN_JACK_STRING_INDEX] = *current_interface_string;
     (*current_interface_string)++;
 
-    usb_add_interface_string(*current_interface_string, midi_out_jack_name);
+    usb_add_interface_name(*current_interface_string, custom_usb_midi_out_jack_name, "usb_midi.ports[0]");
     descriptor_buf[MIDI_OUT_JACK_STRING_INDEX] = *current_interface_string;
     (*current_interface_string)++;
 

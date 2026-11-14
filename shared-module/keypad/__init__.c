@@ -1,36 +1,23 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Dan Halbert for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Dan Halbert for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
+#include <string.h>
+#include "shared-bindings/keypad/__init__.h"
+#include "shared-bindings/keypad/EventQueue.h"
 #include "shared-bindings/keypad/Keys.h"
 #include "shared-bindings/keypad/KeyMatrix.h"
 #include "shared-bindings/keypad/ShiftRegisterKeys.h"
+#include "shared-bindings/supervisor/__init__.h"
+#include "supervisor/port.h"
 #include "supervisor/shared/lock.h"
 #include "supervisor/shared/tick.h"
 
 supervisor_lock_t keypad_scanners_linked_list_lock;
+static void keypad_scan_now(keypad_scanner_obj_t *self, uint64_t now);
+static void keypad_scan_maybe(keypad_scanner_obj_t *self, uint64_t now);
 
 void keypad_tick(void) {
     // Fast path. Return immediately there are no scanners.
@@ -40,25 +27,13 @@ void keypad_tick(void) {
 
     // Skip scanning if someone else has the lock. Don't wait for the lock.
     if (supervisor_try_lock(&keypad_scanners_linked_list_lock)) {
+        uint64_t now = port_get_raw_ticks(NULL);
         mp_obj_t scanner = MP_STATE_VM(keypad_scanners_linked_list);
         while (scanner) {
-            if (mp_obj_is_type(scanner, &keypad_keys_type)) {
-                keypad_keys_scan((keypad_keys_obj_t *)scanner);
-            } else if (mp_obj_is_type(scanner, &keypad_keymatrix_type)) {
-                keypad_keymatrix_scan((keypad_keymatrix_obj_t *)scanner);
-            } else if (mp_obj_is_type(scanner, &keypad_shiftregisterkeys_type)) {
-                keypad_shiftregisterkeys_scan((keypad_shiftregisterkeys_obj_t *)scanner);
-            }
-
+            keypad_scan_maybe(scanner, now);
             scanner = ((keypad_scanner_obj_t *)scanner)->next;
         }
         supervisor_release_lock(&keypad_scanners_linked_list_lock);
-    }
-}
-
-void keypad_reset(void) {
-    while (MP_STATE_VM(keypad_scanners_linked_list)) {
-        keypad_deregister_scanner(MP_STATE_VM(keypad_scanners_linked_list));
     }
 }
 
@@ -97,3 +72,89 @@ void keypad_deregister_scanner(keypad_scanner_obj_t *scanner) {
     }
     supervisor_release_lock(&keypad_scanners_linked_list_lock);
 }
+
+keypad_eventqueue_obj_t *keypad_allocate_common(keypad_scanner_obj_t *self, mp_float_t interval, size_t max_events, uint8_t debounce_threshold, bool use_gc_allocator) {
+    size_t key_count = common_hal_keypad_generic_get_key_count(self);
+    self->debounce_counter =
+        use_gc_allocator
+        ? (int8_t *)m_malloc_without_collect(sizeof(int8_t) * key_count)
+        : (int8_t *)port_malloc_zero(sizeof(int8_t) * key_count, false);
+
+    self->interval_ticks = (mp_uint_t)(interval * 1024);   // interval * 1000 * (1024/1000)
+
+    keypad_eventqueue_obj_t *events =
+        use_gc_allocator
+        ? mp_obj_malloc(keypad_eventqueue_obj_t, &keypad_eventqueue_type)
+        : mp_obj_port_malloc(keypad_eventqueue_obj_t, &keypad_eventqueue_type);
+    common_hal_keypad_eventqueue_construct(events, max_events, use_gc_allocator);
+
+    self->debounce_threshold = debounce_threshold;
+
+    return events;
+}
+
+void keypad_start_common(keypad_scanner_obj_t *self, keypad_eventqueue_obj_t *events) {
+    self->events = events;
+
+    // Add self to the list of active keypad scanners.
+    keypad_register_scanner(self);
+    keypad_scan_now(self, port_get_raw_ticks(NULL));
+}
+
+static void keypad_scan_now(keypad_scanner_obj_t *self, uint64_t now) {
+    self->next_scan_ticks = now + self->interval_ticks;
+    self->funcs->scan_now(self, supervisor_ticks_ms());
+}
+
+static void keypad_scan_maybe(keypad_scanner_obj_t *self, uint64_t now) {
+    if (now < self->next_scan_ticks) {
+        return;
+    }
+    keypad_scan_now(self, now);
+}
+
+bool keypad_debounce(keypad_scanner_obj_t *self, mp_uint_t key_number, bool current) {
+    if (current) {
+        if ((self->debounce_counter[key_number] < self->debounce_threshold) &&
+            (++self->debounce_counter[key_number] == 0)) {
+            self->debounce_counter[key_number] = self->debounce_threshold;
+            return true;
+        }
+    } else {
+        if ((self->debounce_counter[key_number] > -self->debounce_threshold) &&
+            (--self->debounce_counter[key_number] == 0)) {
+            self->debounce_counter[key_number] = -self->debounce_threshold;
+            return true;
+        }
+    }
+    return false;
+}
+
+void common_hal_keypad_generic_reset(void *self_in) {
+    keypad_scanner_obj_t *self = self_in;
+    size_t key_count = common_hal_keypad_generic_get_key_count(self);
+    memset(self->debounce_counter, -self->debounce_threshold, key_count);
+    keypad_scan_now(self, port_get_raw_ticks(NULL));
+}
+
+void common_hal_keypad_deinit_core(void *self_in) {
+    keypad_scanner_obj_t *self = self_in;
+    self->events = NULL;
+}
+
+bool common_hal_keypad_deinited(void *self_in) {
+    keypad_scanner_obj_t *self = self_in;
+    return !self->events;
+}
+
+size_t common_hal_keypad_generic_get_key_count(void *self_in) {
+    keypad_scanner_obj_t *self = self_in;
+    return self->funcs->get_key_count(self);
+}
+
+mp_obj_t common_hal_keypad_generic_get_events(void *self_in) {
+    keypad_scanner_obj_t *self = self_in;
+    return self->events;
+}
+
+MP_REGISTER_ROOT_POINTER(mp_obj_t keypad_scanners_linked_list);

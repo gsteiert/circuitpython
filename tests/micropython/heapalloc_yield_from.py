@@ -1,6 +1,13 @@
 # Check that yield-from can work without heap allocation
 
-import micropython
+try:
+    import micropython
+
+    micropython.heap_lock
+except (ImportError, AttributeError):
+    print("SKIP")
+    raise SystemExit
+
 
 # Yielding from a function generator
 def sub_gen(a):
@@ -17,6 +24,7 @@ micropython.heap_lock()
 print(next(g))
 print(next(g))
 micropython.heap_unlock()
+
 
 # Yielding from a user iterator
 class G:

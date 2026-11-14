@@ -1,0 +1,63 @@
+manifest:
+  group-filter:
+    - +babblesim
+    # TF-M and friends, no CircuitPython board builds with them.
+    - -tee
+  projects:
+    - name: nrf_hw_models
+      url: https://github.com/tannewt/ext_nRF_hw_models
+      revision: 41cb69cd08848cc31e91ed62d01d397511981919
+      path: modules/bsim_hw_models/nrf_hw_models
+    - name: mcuboot
+      url: https://github.com/adafruit/adaboot
+      revision: 25a68bc32f019976b7c1d0c30ac46c0ea035011e
+      path: bootloader/mcuboot
+    - name: zephyr
+      url: https://github.com/adafruit/zephyr
+      revision: 90cba5dc632d9b4691739e3de304d259dc77eb3f
+      clone-depth: 100
+      import:
+        # Skip what no CircuitPython board can use, so west update fetches 37
+        # projects instead of 80. Boards come from adafruit, nordic, nxp,
+        # raspberrypi, renesas, silabs and st; the Pico W's CYW43 is in hal_infineon.
+        name-blocklist:
+          # HALs of vendors without a board here
+          - hal_adi
+          - hal_afbr
+          - hal_ambiq
+          - hal_atmel
+          - hal_bouffalolab
+          - hal_espressif
+          - hal_ethos_u
+          - hal_gigadevice
+          - hal_intel
+          - hal_microchip
+          - hal_nuvoton
+          - hal_openisa
+          - hal_quicklogic
+          - hal_realtek
+          - hal_sifli
+          - hal_tdk
+          - hal_telink
+          - hal_ti
+          - hal_wch
+          - hal_wurthelektronik
+          - hal_xtensa
+          # libraries the port never enables
+          - acpica
+          - cmsis-dsp
+          - cmsis-nn
+          - dhara
+          - liblc3
+          - libmctp
+          - libsbc
+          - lora-basics-modem
+          - loramac-node
+          - lvgl
+          - mipi-sys-t
+          - mldsa-native
+          - net-tools
+          - openthread
+          - percepio
+          - uoscore-uedhoc
+          - zephyr-xenlib

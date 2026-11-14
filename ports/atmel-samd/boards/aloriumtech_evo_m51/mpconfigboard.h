@@ -1,3 +1,11 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
 #define MICROPY_HW_BOARD_NAME "AloriumTech Evo M51"
 #define MICROPY_HW_MCU_NAME "samd51p19"
 
@@ -9,7 +17,6 @@
 #define MICROPY_HW_NEOPIXEL (&pin_PB03)
 
 // BC needed?
-// #define AUTORESET_DELAY_MS 500
 
 // If you change this, then make sure to update the linker scripts as well to
 // make sure you don't overwrite code

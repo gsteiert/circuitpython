@@ -1,0 +1,37 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2016 Scott Shawcroft
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
+#include "py/mphal.h"
+
+#include "peripherals/nrf/pins.h"
+
+// If a board needs a different reset state for one or more pins, implement
+// board_reset_pin_number so that it sets this state and returns `true` for those
+// pin numbers, `false` for others.
+bool board_reset_pin_number(uint8_t pin_number);
+
+void common_hal_reset_pin(const mcu_pin_obj_t *pin);
+// reset_pin_number takes the pin number instead of the pointer so that objects don't
+// need to store a full pointer.
+void reset_pin_number(uint8_t pin);
+void claim_pin_number(uint8_t pin);
+void claim_pin(const mcu_pin_obj_t *pin);
+bool pin_number_is_free(uint8_t pin_number);
+
+uint8_t common_hal_mcu_pin_number(const mcu_pin_obj_t *pin);
+
+// Lower 5 bits of a pin number are the pin number in a port.
+// upper bits (just one bit for current chips) is port number.
+
+static inline uint8_t nrf_pin_port(uint8_t absolute_pin) {
+    return absolute_pin >> 5;
+}
+
+static inline uint8_t nrf_relative_pin_number(uint8_t absolute_pin) {
+    return absolute_pin & 0x1f;
+}

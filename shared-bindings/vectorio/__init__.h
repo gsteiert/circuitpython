@@ -1,5 +1,10 @@
-#ifndef SHARED_MODULE_VECTORIO__INIT__H
-#define SHARED_MODULE_VECTORIO__INIT__H
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 by kvc0/WarriorOfWire
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,6 +22,11 @@ typedef bool (*draw_fill_area_fun)(mp_obj_t draw_protocol_self, const _displayio
 typedef bool (*draw_get_dirty_area_fun)(mp_obj_t draw_protocol_self, displayio_area_t *current_dirty_area);
 typedef void (*draw_update_transform_fun)(mp_obj_t draw_protocol_self, displayio_buffer_transform_t *group_transform);
 typedef void (*draw_finish_refresh_fun)(mp_obj_t draw_protocol_self);
+typedef void (*draw_set_dirty_fun)(mp_obj_t draw_protocol_self);
+// Optional: propagate a group's hidden state to the layer. May be NULL; the
+// group then falls back to draw_set_dirty.
+typedef void (*draw_set_hidden_fun)(mp_obj_t draw_protocol_self, bool hidden);
+typedef bool (*draw_set_in_group_fun)(mp_obj_t draw_protocol_self, bool in_group);
 typedef displayio_area_t *(*draw_get_refresh_areas_fun)(mp_obj_t draw_protocol_self, displayio_area_t *tail);
 
 typedef struct _vectorio_draw_protocol_impl_t {
@@ -25,6 +35,10 @@ typedef struct _vectorio_draw_protocol_impl_t {
     draw_update_transform_fun draw_update_transform;
     draw_finish_refresh_fun draw_finish_refresh;
     draw_get_refresh_areas_fun draw_get_refresh_areas;
+    draw_set_dirty_fun draw_set_dirty;
+    // May be NULL.
+    draw_set_hidden_fun draw_set_hidden;
+    draw_set_in_group_fun draw_set_in_group;
 } vectorio_draw_protocol_impl_t;
 
 // Draw protocol
@@ -37,5 +51,3 @@ typedef struct _vectorio_draw_protocol_t {
     // Implementation functions for the draw protocol
     vectorio_draw_protocol_impl_t *draw_protocol_impl;
 } vectorio_draw_protocol_t;
-
-#endif

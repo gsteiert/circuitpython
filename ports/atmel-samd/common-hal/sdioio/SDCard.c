@@ -1,38 +1,18 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 Jeff Epler for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Jeff Epler for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 #include <stdbool.h>
 
 #include "py/mperrno.h"
 #include "py/runtime.h"
 
 #include "common-hal/microcontroller/Pin.h"
+#include "extmod/vfs.h"
 #include "shared-bindings/sdioio/SDCard.h"
 #include "shared-bindings/microcontroller/Pin.h"
 #include "shared-bindings/microcontroller/__init__.h"
-#include "supervisor/shared/translate.h"
 
 #include "genhdr/sdiodata.h"
 
@@ -57,9 +37,22 @@
 
 static Sdhc *sdhc_insts[] = SDHC_INSTS;
 
+// Mark the object deinited: deinited() is true and deinit() does nothing.
+static void mark_deinit(sdioio_sdcard_obj_t *self) {
+    self->command_pin = COMMON_HAL_MCU_NO_PIN;
+    self->clock_pin = COMMON_HAL_MCU_NO_PIN;
+    self->data_pins[0] = COMMON_HAL_MCU_NO_PIN;
+    self->data_pins[1] = COMMON_HAL_MCU_NO_PIN;
+    self->data_pins[2] = COMMON_HAL_MCU_NO_PIN;
+    self->data_pins[3] = COMMON_HAL_MCU_NO_PIN;
+}
+
 void common_hal_sdioio_sdcard_construct(sdioio_sdcard_obj_t *self,
     const mcu_pin_obj_t *clock, const mcu_pin_obj_t *command,
     uint8_t num_data, const mcu_pin_obj_t **data, uint32_t frequency) {
+    // Ensure the object starts in its deinit state.
+    mark_deinit(self);
+
     /*
 SD breakout as assembled  ("*" = minimum viable set)
 
@@ -82,6 +75,7 @@ CLK PA21 PCC_D? (D32)  BROWN
     mcu_pin_function_t *functions[6] = {};
     functions[0] = mcu_find_pin_function(sdio_cmd, command, -1, MP_QSTR_command);
     int instance = functions[0]->instance;
+    self->instance = instance;
     functions[1] = mcu_find_pin_function(sdio_ck, clock, instance, MP_QSTR_clock);
     functions[2] = mcu_find_pin_function(sdio_dat0, data[0], instance, MP_QSTR_data0);
     if (num_data == 4) {
@@ -104,7 +98,8 @@ CLK PA21 PCC_D? (D32)  BROWN
     }
 
     for (size_t i = 0; i < MP_ARRAY_SIZE(functions); i++) {
-        if (!functions[i]->obj) {
+        // With one data pin, functions[3] to functions[5] are NULL.
+        if (!functions[i]) {
             break;
         }
 
@@ -114,8 +109,7 @@ CLK PA21 PCC_D? (D32)  BROWN
         gpio_set_pin_pull_mode(functions[i]->pin,
             (i == 1 || i == 5) ? GPIO_PULL_OFF : GPIO_PULL_UP);
         gpio_set_pin_function(functions[i]->pin, GPIO_PIN_FUNCTION_SDIO);
-
-        common_hal_never_reset_pin(functions[i]->obj);
+        claim_pin(functions[i]->obj);
     }
 
     self->num_data = num_data;
@@ -145,7 +139,10 @@ CLK PA21 PCC_D? (D32)  BROWN
     }
 
     if (result != SD_MMC_OK) {
-        mp_raise_OSError_msg_varg(translate("%q failure: %d"), MP_QSTR_sd_mmc_check, (int)result);
+        // Everything deinit() undoes is set up by now: it powers the SDHC down,
+        // releases the pins and marks the object deinited.
+        common_hal_sdioio_sdcard_deinit(self);
+        mp_raise_OSError_msg_varg(MP_ERROR_TEXT("%q failure: %d"), MP_QSTR_sd_mmc_check, (int)result);
     }
     // sd_mmc_get_capacity() is in KiB, but our "capacity" is in 512-byte blocks
     self->capacity = sd_mmc_get_capacity(0) * 2;
@@ -165,63 +162,105 @@ uint8_t common_hal_sdioio_sdcard_get_width(sdioio_sdcard_obj_t *self) {
     return self->num_data; // self->width;
 }
 
-STATIC void check_for_deinit(sdioio_sdcard_obj_t *self) {
+static void check_for_deinit(sdioio_sdcard_obj_t *self) {
 }
 
-STATIC void check_whole_block(mp_buffer_info_t *bufinfo) {
+static void check_whole_block(mp_buffer_info_t *bufinfo) {
     if (bufinfo->len % 512) {
-        mp_raise_ValueError(translate("Buffer length must be a multiple of 512"));
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("Buffer must be a multiple of %d bytes"), 512);
     }
 }
 
-STATIC void wait_write_complete(sdioio_sdcard_obj_t *self) {
+static void wait_write_complete(sdioio_sdcard_obj_t *self) {
     if (self->state_programming) {
         sd_mmc_wait_end_of_write_blocks(0);
         self->state_programming = 0;
     }
 }
 
-STATIC void debug_print_state(sdioio_sdcard_obj_t *self, const char *what, sd_mmc_err_t r) {
+static void debug_print_state(sdioio_sdcard_obj_t *self, const char *what, sd_mmc_err_t r) {
     #if DEBUG_SDIO
     DEBUG_PRINT("%s: %d\n", what, r);
     #endif
 }
 
-int common_hal_sdioio_sdcard_writeblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
-    check_for_deinit(self);
-    check_whole_block(bufinfo);
+mp_negative_errno_t sdioio_sdcard_writeblocks(mp_obj_t self_in, uint8_t *buf,
+    uint32_t start_block, uint32_t num_blocks) {
+    sdioio_sdcard_obj_t *self = MP_OBJ_TO_PTR(self_in);
     wait_write_complete(self);
     self->state_programming = true;
-    sd_mmc_err_t r = sd_mmc_init_write_blocks(0, start_block, bufinfo->len / 512);
+    sd_mmc_err_t r = sd_mmc_init_write_blocks(0, start_block, num_blocks);
     if (r != SD_MMC_OK) {
         debug_print_state(self, "sd_mmc_init_write_blocks", r);
-        return -EIO;
+        return -MP_EIO;
     }
-    r = sd_mmc_start_write_blocks(bufinfo->buf, bufinfo->len / 512);
+    r = sd_mmc_start_write_blocks(buf, num_blocks);
     if (r != SD_MMC_OK) {
         debug_print_state(self, "sd_mmc_start_write_blocks", r);
-        return -EIO;
+        return -MP_EIO;
     }
-    // debug_print_state(self, "after writeblocks OK");
     return 0;
 }
 
-int common_hal_sdioio_sdcard_readblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
+mp_negative_errno_t common_hal_sdioio_sdcard_writeblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
     check_for_deinit(self);
     check_whole_block(bufinfo);
+
+    uint32_t num_blocks = bufinfo->len / 512;
+    return sdioio_sdcard_writeblocks(MP_OBJ_FROM_PTR(self), bufinfo->buf,
+        start_block, num_blocks);
+}
+
+mp_negative_errno_t sdioio_sdcard_readblocks(mp_obj_t self_in, uint8_t *buf,
+    uint32_t start_block, uint32_t num_blocks) {
+    sdioio_sdcard_obj_t *self = MP_OBJ_TO_PTR(self_in);
     wait_write_complete(self);
-    sd_mmc_err_t r = sd_mmc_init_read_blocks(0, start_block, bufinfo->len / 512);
+    sd_mmc_err_t r = sd_mmc_init_read_blocks(0, start_block, num_blocks);
     if (r != SD_MMC_OK) {
         debug_print_state(self, "sd_mmc_init_read_blocks", r);
-        return -EIO;
+        return -MP_EIO;
     }
-    r = sd_mmc_start_read_blocks(bufinfo->buf, bufinfo->len / 512);
+    r = sd_mmc_start_read_blocks(buf, num_blocks);
     if (r != SD_MMC_OK) {
         debug_print_state(self, "sd_mmc_start_read_blocks", r);
-        return -EIO;
+        return -MP_EIO;
     }
     sd_mmc_wait_end_of_write_blocks(0);
     return 0;
+}
+
+mp_negative_errno_t common_hal_sdioio_sdcard_readblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
+    check_for_deinit(self);
+    check_whole_block(bufinfo);
+
+    uint32_t num_blocks = bufinfo->len / 512;
+    return sdioio_sdcard_readblocks(MP_OBJ_FROM_PTR(self), bufinfo->buf,
+        start_block, num_blocks);
+}
+
+// Native function for VFS blockdev layer
+bool sdioio_sdcard_ioctl(mp_obj_t self_in, size_t cmd, size_t arg,
+    mp_int_t *out_value) {
+    sdioio_sdcard_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    *out_value = 0;
+
+    switch (cmd) {
+        case MP_BLOCKDEV_IOCTL_DEINIT:
+        case MP_BLOCKDEV_IOCTL_SYNC:
+            // SDIO operations are synchronous, no action needed
+            return true;
+
+        case MP_BLOCKDEV_IOCTL_BLOCK_COUNT:
+            *out_value = common_hal_sdioio_sdcard_get_count(self);
+            return true;
+
+        case MP_BLOCKDEV_IOCTL_BLOCK_SIZE:
+            *out_value = 512;  // SD cards use 512-byte sectors
+            return true;
+
+        default:
+            return false;  // Unsupported command
+    }
 }
 
 bool common_hal_sdioio_sdcard_configure(sdioio_sdcard_obj_t *self, uint32_t frequency, uint8_t bits) {
@@ -234,6 +273,13 @@ bool common_hal_sdioio_sdcard_deinited(sdioio_sdcard_obj_t *self) {
 }
 
 void common_hal_sdioio_sdcard_deinit(sdioio_sdcard_obj_t *self) {
+    if (common_hal_sdioio_sdcard_deinited(self)) {
+        return;
+    }
+
+    wait_write_complete(self);
+    mci_sync_deinit(&self->IO_BUS);
+
     reset_pin_number(self->command_pin);
     reset_pin_number(self->clock_pin);
     reset_pin_number(self->data_pins[0]);
@@ -241,13 +287,18 @@ void common_hal_sdioio_sdcard_deinit(sdioio_sdcard_obj_t *self) {
     reset_pin_number(self->data_pins[2]);
     reset_pin_number(self->data_pins[3]);
 
-    self->command_pin = COMMON_HAL_MCU_NO_PIN;
-    self->clock_pin = COMMON_HAL_MCU_NO_PIN;
-    self->data_pins[0] = COMMON_HAL_MCU_NO_PIN;
-    self->data_pins[1] = COMMON_HAL_MCU_NO_PIN;
-    self->data_pins[2] = COMMON_HAL_MCU_NO_PIN;
-    self->data_pins[3] = COMMON_HAL_MCU_NO_PIN;
-}
+    // Power down the SDHC peripheral.
+    if (self->instance == 0) {
+        hri_gclk_write_PCHCTRL_reg(GCLK, SDHC0_GCLK_ID, 0);
+        hri_gclk_write_PCHCTRL_reg(GCLK, SDHC0_GCLK_ID_SLOW, 0);
+        hri_mclk_clear_AHBMASK_SDHC0_bit(MCLK);
+    #ifdef SDHC1_GCLK_ID
+    } else {
+        hri_gclk_write_PCHCTRL_reg(GCLK, SDHC1_GCLK_ID, 0);
+        hri_gclk_write_PCHCTRL_reg(GCLK, SDHC1_GCLK_ID_SLOW, 0);
+        hri_mclk_clear_AHBMASK_SDHC1_bit(MCLK);
+    #endif
+    }
 
-void common_hal_sdioio_sdcard_never_reset(sdioio_sdcard_obj_t *self) {
+    mark_deinit(self);
 }

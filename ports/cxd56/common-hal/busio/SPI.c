@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright 2019 Sony Semiconductor Solutions Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright 2019 Sony Semiconductor Solutions Corporation
+//
+// SPDX-License-Identifier: MIT
 
 #include <string.h>
 
@@ -33,10 +13,17 @@
 #include "py/runtime.h"
 
 #include "shared-bindings/busio/SPI.h"
+#include "shared-bindings/microcontroller/Pin.h"
 
 void common_hal_busio_spi_construct(busio_spi_obj_t *self, const mcu_pin_obj_t *clock,
-    const mcu_pin_obj_t *mosi, const mcu_pin_obj_t *miso) {
+    const mcu_pin_obj_t *mosi, const mcu_pin_obj_t *miso, bool half_duplex) {
     int port = -1;
+
+    common_hal_busio_spi_mark_deinit(self);
+
+    if (half_duplex) {
+        mp_raise_NotImplementedError_varg(MP_ERROR_TEXT("%q"), MP_QSTR_half_duplex);
+    }
 
     if (clock->number == PIN_SPI4_SCK &&
         (mosi == NULL || mosi->number == PIN_SPI4_MOSI) &&
@@ -51,17 +38,27 @@ void common_hal_busio_spi_construct(busio_spi_obj_t *self, const mcu_pin_obj_t *
     }
 
     if (port < 0) {
-        mp_raise_ValueError(translate("Invalid pins"));
+        raise_ValueError_invalid_pins();
     }
 
+    struct spi_dev_s *spi_dev = cxd56_spibus_initialize(port);
+    if (spi_dev == NULL) {
+        mp_raise_RuntimeError_varg(MP_ERROR_TEXT("%q init failed"), MP_QSTR_SPI);
+    }
+
+    // MOSI or MISO may be None.
     claim_pin(clock);
-    claim_pin(mosi);
-    claim_pin(miso);
+    if (mosi != NULL) {
+        claim_pin(mosi);
+    }
+    if (miso != NULL) {
+        claim_pin(miso);
+    }
 
     self->clock_pin = clock;
     self->mosi_pin = mosi;
     self->miso_pin = miso;
-    self->spi_dev = cxd56_spibus_initialize(port);
+    self->spi_dev = spi_dev;
 }
 
 void common_hal_busio_spi_deinit(busio_spi_obj_t *self) {
@@ -69,22 +66,49 @@ void common_hal_busio_spi_deinit(busio_spi_obj_t *self) {
         return;
     }
 
-    self->spi_dev = NULL;
+    common_hal_busio_spi_mark_deinit(self);
 
     reset_pin_number(self->clock_pin->number);
-    reset_pin_number(self->mosi_pin->number);
-    reset_pin_number(self->miso_pin->number);
+    if (self->mosi_pin != NULL) {
+        reset_pin_number(self->mosi_pin->number);
+    }
+    if (self->miso_pin != NULL) {
+        reset_pin_number(self->miso_pin->number);
+    }
 }
 
 bool common_hal_busio_spi_deinited(busio_spi_obj_t *self) {
     return self->spi_dev == NULL;
 }
 
+void common_hal_busio_spi_mark_deinit(busio_spi_obj_t *self) {
+    self->spi_dev = NULL;
+}
+
 bool common_hal_busio_spi_configure(busio_spi_obj_t *self, uint32_t baudrate, uint8_t polarity, uint8_t phase, uint8_t bits) {
     uint8_t mode;
 
-    self->frequency = baudrate;
-    SPI_SETFREQUENCY(self->spi_dev, baudrate);
+    // SPI_SETFREQUENCY() picks the nearest available frequency and returns it,
+    // which can be HIGHER than requested (it overshoots at low frequencies).
+    // Treat baudrate as a ceiling: if the driver overshoots, bisect downward on
+    // the requested target for the highest available frequency that does not
+    // exceed baudrate. The driver returns the actual frequency each call, so we
+    // don't depend on its divisor internals.
+    uint32_t actual = SPI_SETFREQUENCY(self->spi_dev, baudrate);
+    if (actual > baudrate) {
+        uint32_t lo = 1;         // f(lo) <= baudrate
+        uint32_t hi = baudrate;  // f(hi) > baudrate (just measured)
+        while (hi - lo > 1) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (SPI_SETFREQUENCY(self->spi_dev, mid) <= baudrate) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        actual = SPI_SETFREQUENCY(self->spi_dev, lo);
+    }
+    self->frequency = actual;
 
     if (polarity == 0) {
         if (phase == 0) {
@@ -111,6 +135,9 @@ bool common_hal_busio_spi_configure(busio_spi_obj_t *self, uint32_t baudrate, ui
 }
 
 bool common_hal_busio_spi_try_lock(busio_spi_obj_t *self) {
+    if (common_hal_busio_spi_deinited(self)) {
+        return false;
+    }
     bool grabbed_lock = false;
     if (!self->has_lock) {
         grabbed_lock = true;
@@ -156,10 +183,4 @@ uint8_t common_hal_busio_spi_get_phase(busio_spi_obj_t *self) {
 
 uint8_t common_hal_busio_spi_get_polarity(busio_spi_obj_t *self) {
     return self->polarity;
-}
-
-void common_hal_busio_spi_never_reset(busio_spi_obj_t *self) {
-    never_reset_pin_number(self->clock_pin->number);
-    never_reset_pin_number(self->mosi_pin->number);
-    never_reset_pin_number(self->miso_pin->number);
 }

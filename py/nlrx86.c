@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013-2017 Damien P. George
+ * Copyright (c) 2013-2017 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,37 +26,49 @@
 
 #include "py/mpstate.h"
 
-#if defined(MICROPY_NLR_X86) && MICROPY_NLR_X86
+#if MICROPY_NLR_X86
 
 #undef nlr_push
 
 // For reference, x86 callee save regs are:
 //  ebx, esi, edi, ebp, esp, eip
 
-#if defined(MICROPY_NLR_OS_WINDOWS) && MICROPY_NLR_OS_WINDOWS
+#if MICROPY_NLR_OS_WINDOWS
 unsigned int nlr_push_tail(nlr_buf_t *nlr) asm ("nlr_push_tail");
 #else
 __attribute__((used)) unsigned int nlr_push_tail(nlr_buf_t *nlr);
 #endif
 
 #if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 8
-// Since gcc 8.0 the naked attribute is supported
-#define USE_NAKED (1)
-#define UNDO_PRELUDE (0)
+// Since gcc 8.0 the naked and no-sanitize attributes are supported
+    #define NLR_PUSH_ATTRIBUTE __attribute__((naked, no_sanitize("unreachable")))
+    #define UNDO_PRELUDE (0)
+    #define ARG_USED(x) (void)x;
+    #define NLR_UNREACHABLE __builtin_unreachable();
 #elif defined(__ZEPHYR__) || defined(__ANDROID__)
 // Zephyr and Android use a different calling convention by default
-#define USE_NAKED (0)
-#define UNDO_PRELUDE (0)
+    #define NLR_PUSH_ATTRIBUTE /* NOTHING */
+    #define UNDO_PRELUDE (0)
+    #define ARG_USED(x) (void)x;
+    #define NLR_UNREACHABLE return 0;
+#elif defined(__clang__)
+// clang on Ubuntu 24.04 enables -fsanitize=unreachable by default, but this
+// destroys the content of the ebx register.
+    #define NLR_PUSH_ATTRIBUTE __attribute__((naked, no_sanitize("unreachable")))
+    #define UNDO_PRELUDE (0)
+    #define ARG_USED(x) /* NOTHING */
+    #define NLR_UNREACHABLE /* NOTHING */
 #else
-#define USE_NAKED (0)
-#define UNDO_PRELUDE (1)
+// gcc before 8 unavoidably emits a 'push %ebp' prologue instruction
+    #define NLR_PUSH_ATTRIBUTE /* NOTHING */
+    #define UNDO_PRELUDE (1)
+    #define ARG_USED(x) (void)x;
+    #define NLR_UNREACHABLE return 0;
 #endif
 
-#if USE_NAKED
-__attribute__((naked))
-#endif
+NLR_PUSH_ATTRIBUTE
 unsigned int nlr_push(nlr_buf_t *nlr) {
-    (void)nlr;
+    ARG_USED(nlr)
 
     __asm volatile (
         #if UNDO_PRELUDE
@@ -73,12 +85,10 @@ unsigned int nlr_push(nlr_buf_t *nlr) {
         "jmp    nlr_push_tail       \n" // do the rest in C
         );
 
-    #if !USE_NAKED
-    return 0; // needed to silence compiler warning
-    #endif
+    NLR_UNREACHABLE
 }
 
-NORETURN void nlr_jump(void *val) {
+MP_NORETURN void nlr_jump(void *val) {
     MP_NLR_JUMP_HEAD(val, top)
 
     __asm volatile (
@@ -95,7 +105,7 @@ NORETURN void nlr_jump(void *val) {
         "ret                        \n" // return
         :                           // output operands
         : "r" (top)                 // input operands
-        :                           // clobbered registers
+        : "memory"                  // clobbered registers
         );
 
     MP_UNREACHABLE

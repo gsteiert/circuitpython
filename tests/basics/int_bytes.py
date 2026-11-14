@@ -1,10 +1,15 @@
+import sys
+
 print((10).to_bytes(1, "little"))
 print((-10).to_bytes(1, "little", signed=True))
 # Test fitting in length that's not a power of two.
-print((0x10000).to_bytes(3, 'little'))
+print((0x10000).to_bytes(3, "little"))
 print((111111).to_bytes(4, "little"))
 print((-111111).to_bytes(4, "little", signed=True))
 print((100).to_bytes(10, "little"))
+print(int.from_bytes(b"\x00\x01\0\0\0\0\0\0", "little"))
+print(int.from_bytes(b"\x01\0\0\0\0\0\0\0", "little"))
+print(int.from_bytes(b"\x00\x01\0\0\0\0\0\0", "little"))
 print((-100).to_bytes(10, "little", signed=True))
 
 # check that extra zero bytes don't change the internal int value
@@ -25,19 +30,73 @@ try:
 except ValueError:
     print("ValueError")
 
-# too small buffer should raise an error
+# zero byte destination should also raise an error
 try:
-    (256).to_bytes(1, "little")
+    (1).to_bytes(0, "little")
 except OverflowError:
     print("OverflowError")
 
-# negative numbers should raise an error if signed=False
+# except for converting 0 to a zero-length byte array
+print((0).to_bytes(0, "big"))
+
+# byte length can fit the integer directly
+print((0xFF).to_bytes(1, "little"))
+print((0xFF).to_bytes(1, "big"))
+print((0xEFF).to_bytes(2, "little"))
+print((0xEFF).to_bytes(2, "big"))
+print((0xCDEFF).to_bytes(3, "little"))
+print((0xCDEFF).to_bytes(3, "big"))
+
+# OverFlowError if not big enough
+
 try:
-    (-256).to_bytes(2, "little")
+    (0x123).to_bytes(1, "big")
 except OverflowError:
     print("OverflowError")
 
+try:
+    (0x12345).to_bytes(2, "big")
+except OverflowError:
+    print("OverflowError")
+
+try:
+    (0x1234567).to_bytes(3, "big")
+except OverflowError:
+    print("OverflowError")
+
+
+# negative representations
+
+print((-1).to_bytes(1, "little", signed=True))
+print((-1).to_bytes(3, "little", signed=True))
+print((-1).to_bytes(1, "big", signed=True))
+print((-1).to_bytes(3, "big", signed=True))
+print((-128).to_bytes(1, "big", signed=True))
+print((-32768).to_bytes(2, "big", signed=True))
+print((-(1 << 23)).to_bytes(3, "big", signed=True))
+
+# negative numbers should raise an error if signed=False, regardless of fitting or not
 try:
     (-256).to_bytes(2, "little", signed=False)
+except OverflowError:
+    print("OverflowError")
+
+try:
+    (-1).to_bytes(1, "little")
+except OverflowError:
+    print("OverflowError")
+
+try:
+    print((-129).to_bytes(1, "big"))
+except OverflowError:
+    print("OverflowError")
+
+try:
+    print((-32769).to_bytes(2, "big"))
+except OverflowError:
+    print("OverflowError")
+
+try:
+    print((-(1 << 23) - 1).to_bytes(2, "big"))
 except OverflowError:
     print("OverflowError")

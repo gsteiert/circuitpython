@@ -1,30 +1,11 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2016 Scott Shawcroft
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2016 Scott Shawcroft
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/busio/SPI.h"
+#include "shared-bindings/microcontroller/Pin.h"
 #include "py/mperrno.h"
 #include "py/runtime.h"
 
@@ -33,18 +14,20 @@
 
 #include "supervisor/board.h"
 #include "common-hal/busio/__init__.h"
-#include "common-hal/microcontroller/Pin.h"
 
 #include "hal/include/hal_gpio.h"
 #include "hal/include/hal_spi_m_sync.h"
-#include "hal/include/hpl_spi_m_sync.h"
 
 #include "samd/dma.h"
 #include "samd/sercom.h"
 
+
 void common_hal_busio_spi_construct(busio_spi_obj_t *self,
     const mcu_pin_obj_t *clock, const mcu_pin_obj_t *mosi,
-    const mcu_pin_obj_t *miso) {
+    const mcu_pin_obj_t *miso, bool half_duplex) {
+    // Ensure the object starts in its deinit state.
+    common_hal_busio_spi_mark_deinit(self);
+
     Sercom *sercom = NULL;
     uint8_t sercom_index;
     uint32_t clock_pinmux = 0;
@@ -57,8 +40,9 @@ void common_hal_busio_spi_construct(busio_spi_obj_t *self,
     uint8_t miso_pad = 0;
     uint8_t dopo = 255;
 
-    // Ensure the object starts in its deinit state.
-    self->clock_pin = NO_PIN;
+    if (half_duplex) {
+        mp_raise_NotImplementedError_varg(MP_ERROR_TEXT("%q"), MP_QSTR_half_duplex);
+    }
 
     // Special case for SAMR21 boards. (feather_radiofruit_zigbee)
     #if defined(PIN_PC19F_SERCOM4_PAD0)
@@ -92,6 +76,7 @@ void common_hal_busio_spi_construct(busio_spi_obj_t *self,
             if (!samd_peripherals_valid_spi_clock_pad(clock_pad)) {
                 continue;
             }
+            // find mosi_pad first, since it corresponds to dopo which takes limited values
             for (int j = 0; j < NUM_SERCOMS_PER_PIN; j++) {
                 if (!mosi_none) {
                     if (sercom_index == mosi->sercom[j].index) {
@@ -129,7 +114,7 @@ void common_hal_busio_spi_construct(busio_spi_obj_t *self,
         }
     }
     if (sercom == NULL) {
-        mp_raise_ValueError(translate("Invalid pins"));
+        raise_ValueError_invalid_pins();
     }
 
     // Set up SPI clocks on SERCOM.
@@ -141,8 +126,18 @@ void common_hal_busio_spi_construct(busio_spi_obj_t *self,
 
     // Pads must be set after spi_m_sync_init(), which uses default values from
     // the prototypical SERCOM.
-    hri_sercomspi_write_CTRLA_DOPO_bf(sercom, dopo);
-    hri_sercomspi_write_CTRLA_DIPO_bf(sercom, miso_pad);
+
+    // Set to SPI host mode and choose pads.
+    // Set all the fields at once to save code space.
+    hri_sercomspi_wait_for_sync(sercom, SERCOM_SPI_SYNCBUSY_MASK);
+    sercom->SPI.CTRLA.reg =
+        (sercom->SPI.CTRLA.reg &
+            ~(SERCOM_SPI_CTRLA_MODE_Msk |
+                SERCOM_SPI_CTRLA_DOPO_Msk |
+                SERCOM_SPI_CTRLA_DIPO_Msk)) |
+        (SERCOM_SPI_CTRLA_MODE(3) |
+            SERCOM_SPI_CTRLA_DOPO(dopo) |
+            SERCOM_SPI_CTRLA_DIPO(miso_pad));
 
     // Always start at 250khz which is what SD cards need. They are sensitive to
     // SPI bus noise before they are put into SPI mode.
@@ -153,59 +148,52 @@ void common_hal_busio_spi_construct(busio_spi_obj_t *self,
         mp_raise_OSError(MP_EIO);
     }
 
-    gpio_set_pin_direction(clock->number, GPIO_DIRECTION_OUT);
-    gpio_set_pin_pull_mode(clock->number, GPIO_PULL_OFF);
-    gpio_set_pin_function(clock->number, clock_pinmux);
-    claim_pin(clock);
-    self->clock_pin = clock->number;
+    // Use strong drive strength for SPI outputs.
+    self->clock_pin = sercom_setup_pin(clock, clock_pinmux, GPIO_DIRECTION_OUT, true);
+    #if CIRCUITPY_BUSIO_SPI_ASYNC
+    self->async_active = false;
+    #endif
 
     if (mosi_none) {
         self->MOSI_pin = NO_PIN;
     } else {
-        gpio_set_pin_direction(mosi->number, GPIO_DIRECTION_OUT);
-        gpio_set_pin_pull_mode(mosi->number, GPIO_PULL_OFF);
-        gpio_set_pin_function(mosi->number, mosi_pinmux);
-        self->MOSI_pin = mosi->number;
-        claim_pin(mosi);
+        self->MOSI_pin = sercom_setup_pin(mosi, mosi_pinmux, GPIO_DIRECTION_OUT, true);
     }
 
     if (miso_none) {
         self->MISO_pin = NO_PIN;
     } else {
-        gpio_set_pin_direction(miso->number, GPIO_DIRECTION_IN);
-        gpio_set_pin_pull_mode(miso->number, GPIO_PULL_OFF);
-        gpio_set_pin_function(miso->number, miso_pinmux);
-        self->MISO_pin = miso->number;
-        claim_pin(miso);
+        self->MISO_pin = sercom_setup_pin(miso, miso_pinmux, GPIO_DIRECTION_IN, false);
     }
 
     spi_m_sync_enable(&self->spi_desc);
 }
 
-void common_hal_busio_spi_never_reset(busio_spi_obj_t *self) {
-    never_reset_sercom(self->spi_desc.dev.prvt);
-
-    never_reset_pin_number(self->clock_pin);
-    never_reset_pin_number(self->MOSI_pin);
-    never_reset_pin_number(self->MISO_pin);
-}
 
 bool common_hal_busio_spi_deinited(busio_spi_obj_t *self) {
     return self->clock_pin == NO_PIN;
+}
+
+void common_hal_busio_spi_mark_deinit(busio_spi_obj_t *self) {
+    self->clock_pin = NO_PIN;
 }
 
 void common_hal_busio_spi_deinit(busio_spi_obj_t *self) {
     if (common_hal_busio_spi_deinited(self)) {
         return;
     }
-    allow_reset_sercom(self->spi_desc.dev.prvt);
+    #if CIRCUITPY_BUSIO_SPI_ASYNC
+    common_hal_busio_spi_end(self);
+    #endif
 
     spi_m_sync_disable(&self->spi_desc);
     spi_m_sync_deinit(&self->spi_desc);
     reset_pin_number(self->clock_pin);
     reset_pin_number(self->MOSI_pin);
     reset_pin_number(self->MISO_pin);
-    self->clock_pin = NO_PIN;
+
+    // This smashes self->clock_pin, so don't do it before resetting the pin above.
+    common_hal_busio_spi_mark_deinit(self);
 }
 
 bool common_hal_busio_spi_configure(busio_spi_obj_t *self,
@@ -225,10 +213,18 @@ bool common_hal_busio_spi_configure(busio_spi_obj_t *self,
     spi_m_sync_disable(&self->spi_desc);
     hri_sercomspi_wait_for_sync(hw, SERCOM_SPI_SYNCBUSY_MASK);
 
-    hri_sercomspi_write_CTRLA_CPHA_bit(hw, phase);
-    hri_sercomspi_write_CTRLA_CPOL_bit(hw, polarity);
-    hri_sercomspi_write_CTRLB_CHSIZE_bf(hw, bits - 8);
-    hri_sercomspi_write_BAUD_BAUD_bf(hw, baud_reg_value);
+    // Set all the fields of each register at once to save code space.
+    SercomSpi *spi = &((Sercom *)hw)->SPI;
+    spi->CTRLA.reg =
+        (spi->CTRLA.reg &
+            ~(SERCOM_SPI_CTRLA_CPHA |
+                SERCOM_SPI_CTRLA_CPOL)) |
+        ((phase ? SERCOM_SPI_CTRLA_CPHA : 0) |
+            (polarity ? SERCOM_SPI_CTRLA_CPOL : 0));
+    spi->CTRLB.reg =
+        (spi->CTRLB.reg & ~SERCOM_SPI_CTRLB_CHSIZE_Msk) |
+        SERCOM_SPI_CTRLB_CHSIZE(bits - 8);
+    spi->BAUD.reg = baud_reg_value;
     hri_sercomspi_wait_for_sync(hw, SERCOM_SPI_SYNCBUSY_MASK);
 
     spi_m_sync_enable(&self->spi_desc);
@@ -238,6 +234,9 @@ bool common_hal_busio_spi_configure(busio_spi_obj_t *self,
 }
 
 bool common_hal_busio_spi_try_lock(busio_spi_obj_t *self) {
+    if (common_hal_busio_spi_deinited(self)) {
+        return false;
+    }
     bool grabbed_lock = false;
     CRITICAL_SECTION_ENTER()
     if (!self->has_lock) {
@@ -263,7 +262,21 @@ bool common_hal_busio_spi_write(busio_spi_obj_t *self,
     }
     int32_t status;
     if (len >= 16) {
-        status = sercom_dma_write(self->spi_desc.dev.prvt, data, len);
+        size_t bytes_remaining = len;
+
+        // Maximum DMA transfer is 65535
+        while (1) {
+            size_t to_send = (bytes_remaining > 65535) ? 65535 : bytes_remaining;
+            status = sercom_dma_write(self->spi_desc.dev.prvt, data + (len - bytes_remaining), to_send);
+            bytes_remaining -= to_send;
+            if (bytes_remaining > 0) {
+                // Multi-part transfer; let other things run before doing the next chunk.
+                RUN_BACKGROUND_TASKS;
+            } else {
+                // All done.
+                break;
+            }
+        }
     } else {
         struct io_descriptor *spi_io;
         spi_m_sync_get_io_descriptor(&self->spi_desc, &spi_io);
@@ -271,6 +284,40 @@ bool common_hal_busio_spi_write(busio_spi_obj_t *self,
     }
     return status >= 0; // Status is number of chars read or an error code < 0.
 }
+
+#if CIRCUITPY_BUSIO_SPI_ASYNC
+void common_hal_busio_spi_write_start(busio_spi_obj_t *self, const uint8_t *data, size_t len,
+    circuitpy_async_flag_t *done) {
+    common_hal_busio_spi_end(self);
+    CIRCUITPY_ASYNC_FLAG_INIT(done);
+    self->async_done = done;
+    // One descriptor holds at most 65535 beats; longer writes and short ones go the normal way.
+    if (len >= 32 && len <= 65535) {
+        Sercom *sercom = self->spi_desc.dev.prvt;
+        shared_dma_transfer_start(&self->async_xfer, sercom, data, &sercom->SPI.DATA.reg,
+            NULL, NULL, len, 0);
+        if (self->async_xfer.failure == 0) {
+            self->async_active = true;
+            return;
+        }
+    }
+    common_hal_busio_spi_write(self, data, len);
+    CIRCUITPY_ASYNC_FLAG_SET(done);
+}
+
+void common_hal_busio_spi_end(busio_spi_obj_t *self) {
+    if (!self->async_active) {
+        return;
+    }
+    // finished() also clears the RX overflow a TX-only transfer leaves on the SERCOM.
+    // No background tasks here: the caller holds the bus, and one of them may want it.
+    while (!shared_dma_transfer_finished(&self->async_xfer)) {
+    }
+    shared_dma_transfer_close(&self->async_xfer);
+    self->async_active = false;
+    CIRCUITPY_ASYNC_FLAG_SET(self->async_done);
+}
+#endif
 
 bool common_hal_busio_spi_read(busio_spi_obj_t *self,
     uint8_t *data, size_t len, uint8_t write_value) {

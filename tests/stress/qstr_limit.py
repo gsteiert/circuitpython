@@ -12,10 +12,11 @@ for l in range(254, 259):
     var = make_id(l)
     try:
         exec(var + "=1", g)
-    except RuntimeError:
-        print("RuntimeError", l)
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)
         continue
     print(var in g)
+
 
 # calling a function with kwarg
 def f(**k):
@@ -25,16 +26,17 @@ def f(**k):
 for l in range(254, 259):
     try:
         exec("f({}=1)".format(make_id(l)))
-    except RuntimeError:
-        print("RuntimeError", l)
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)
 
 # type construction
 for l in range(254, 259):
     id = make_id(l)
     try:
-        print(type(id, (), {}).__name__)
-    except RuntimeError:
-        print("RuntimeError", l)
+        print(type(id, (), {}))
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)
+
 
 # hasattr, setattr, getattr
 class A:
@@ -46,28 +48,20 @@ for l in range(254, 259):
     a = A()
     try:
         setattr(a, id, 123)
-    except RuntimeError:
-        print("RuntimeError", l)
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)
     try:
         print(hasattr(a, id), getattr(a, id))
-    except RuntimeError:
-        print("RuntimeError", l)
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)
 
 # format with keys
 for l in range(254, 259):
     id = make_id(l)
     try:
         print(("{" + id + "}").format(**{id: l}))
-    except RuntimeError:
-        print("RuntimeError", l)
-
-# modulo format with keys
-for l in range(254, 259):
-    id = make_id(l)
-    try:
-        print(("%(" + id + ")d") % {id: l})
-    except RuntimeError:
-        print("RuntimeError", l)
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)
 
 # import module
 # (different OS's have different results so only run those that are consistent)
@@ -76,8 +70,8 @@ for l in (100, 101, 256, 257, 258):
         __import__(make_id(l))
     except ImportError:
         print("ok", l)
-    except RuntimeError:
-        print("RuntimeError", l)
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)
 
 # import package
 for l in (100, 101, 102, 128, 129):
@@ -85,5 +79,5 @@ for l in (100, 101, 102, 128, 129):
         exec("import " + make_id(l) + "." + make_id(l, "A"))
     except ImportError:
         print("ok", l)
-    except RuntimeError:
-        print("RuntimeError", l)
+    except RuntimeError as er:
+        print(str(er) or "name too long", l)

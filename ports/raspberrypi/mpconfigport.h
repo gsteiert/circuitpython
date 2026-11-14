@@ -1,51 +1,87 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
-#ifndef __INCLUDED_MPCONFIGPORT_H
-#define __INCLUDED_MPCONFIGPORT_H
+#pragma once
 
-#include "src/rp2040/hardware_regs/include/hardware/platform_defs.h"
+#include "hardware/platform_defs.h"
 
+// CIRCUITPY-CHANGE: CircuitPython supports raw sockets through its own lwip
+// integration, independently of MICROPY_PY_LWIP.
+#define MICROPY_PY_LWIP_SOCK_RAW (1)
+
+#if PICO_RP2040
 #define MICROPY_PY_SYS_PLATFORM             "RP2040"
+#endif
+
+#if PICO_RP2350
+#define MICROPY_PY_SYS_PLATFORM             "RP2350"
+
+// PSRAM can require more stack space for GC.
+#define MICROPY_ALLOC_GC_STACK_SIZE         (128)
+#endif
+
+// Setting a non-default value also requires a non-default link.ld
+#ifndef CIRCUITPY_FIRMWARE_SIZE
+#define CIRCUITPY_FIRMWARE_SIZE (1020 * 1024)
+#endif
+// The nvm sector and CIRCUITPY follow the firmware, so it must end on a flash erase sector.
+#if CIRCUITPY_FIRMWARE_SIZE % 4096 != 0
+#error "CIRCUITPY_FIRMWARE_SIZE must be a multiple of 4 KB"
+#endif
 
 #define CIRCUITPY_INTERNAL_NVM_SIZE         (4 * 1024)
-#define CIRCUITPY_INTERNAL_NVM_START_ADDR   (0x100FF000)
+// This is the XIP address
+#define CIRCUITPY_INTERNAL_NVM_START_ADDR   (0x10000000 + CIRCUITPY_FIRMWARE_SIZE)
 
+// This is the flash linear address
+#define CIRCUITPY_CIRCUITPY_DRIVE_START_ADDR (CIRCUITPY_FIRMWARE_SIZE + CIRCUITPY_INTERNAL_NVM_SIZE)
 #define CIRCUITPY_DEFAULT_STACK_SIZE        (24 * 1024)
 
 #define MICROPY_USE_INTERNAL_PRINTF         (1)
 
 #define CIRCUITPY_PROCESSOR_COUNT           (2)
 
+// For RP2 boards we use a custom way to read BOOTSEL
+#define CIRCUITPY_BOOT_BUTTON_NO_GPIO       (1)
+
+#if CIRCUITPY_USB_HOST
+#define CIRCUITPY_USB_HOST_INSTANCE 1
+// Pico-PIO-USB
+#define CIRCUITPY_USB_HOST_ISO_RECORDS (1)
+#endif
+
 // This also includes mpconfigboard.h.
 #include "py/circuitpy_mpconfig.h"
 
-#define MICROPY_PORT_ROOT_POINTERS \
-    mp_obj_t counting[NUM_PWM_SLICES]; \
-    mp_obj_t playing_audio[NUM_DMA_CHANNELS]; \
-    CIRCUITPY_COMMON_ROOT_POINTERS;
+// Turn on this option to allow the use of the internal pull-up resistors on
+// the I2C pins, for boards whose on-board I2C peripherals lack external pull
+// up resistors. The internal pull-ups are weak, and using them is only to
+// compensate for design decisions that are out of the control of the authors
+// of CircuitPython. It is not an endorsement of running without appropriate
+// external pull up resistors.
+#ifndef CIRCUITPY_I2C_ALLOW_INTERNAL_PULL_UP
+#define CIRCUITPY_I2C_ALLOW_INTERNAL_PULL_UP (0)
+#endif
 
-#endif  // __INCLUDED_MPCONFIGPORT_H
+#if CIRCUITPY_CYW43
+#define MICROPY_PY_LWIP_ENTER   cyw43_arch_lwip_begin();
+#define MICROPY_PY_LWIP_REENTER MICROPY_PY_LWIP_ENTER
+#define MICROPY_PY_LWIP_EXIT    cyw43_arch_lwip_end();
+#endif
+
+// Protect the background queue with a lock because both cores may modify it.
+#include "pico/critical_section.h"
+extern critical_section_t background_queue_lock;
+#define CALLBACK_CRITICAL_BEGIN (critical_section_enter_blocking(&background_queue_lock))
+#define CALLBACK_CRITICAL_END (critical_section_exit(&background_queue_lock))
+
+// Turn some macros into compile-time constants, using enum.
+// Some nested macros expand across multiple lines, which is not
+// handled by the MP_REGISTER_ROOT_POINTER processing in makeqstrdefs.py.
+enum {
+    enum_NUM_DMA_CHANNELS = NUM_DMA_CHANNELS,
+    enum_NUM_PWM_SLICES = NUM_PWM_SLICES,
+};

@@ -1,4 +1,12 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+
+// SPDX-FileCopyrightText: Copyright (c) 2020 Dan Halbert for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2018 Arduino SA. All rights reserved.
+//
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
 //  This file is derived from the ArduinoBLE library. Its header is below.
+
 /*
   This file is part of the ArduinoBLE library.
   Copyright (c) 2018 Arduino SA. All rights reserved.
@@ -93,23 +101,23 @@ typedef struct __attribute__ ((packed)) {
 #define RX_BUFFER_SIZE (3 + 255)
 #define ACL_DATA_BUFFER_SIZE (255)
 
-STATIC uint8_t rx_buffer[RX_BUFFER_SIZE];
-STATIC size_t rx_idx;
+static uint8_t rx_buffer[RX_BUFFER_SIZE];
+static size_t rx_idx;
 
-STATIC uint8_t acl_data_buffer[ACL_DATA_BUFFER_SIZE];
-STATIC size_t acl_data_len;
+static uint8_t acl_data_buffer[ACL_DATA_BUFFER_SIZE];
+static size_t acl_data_len;
 
-STATIC size_t num_command_packets_allowed;
-STATIC volatile size_t pending_pkt;
+static size_t num_command_packets_allowed;
+static volatile size_t pending_pkt;
 
 // Results from parsing a command response packet.
-STATIC bool cmd_response_received;
-STATIC uint16_t cmd_response_opcode;
-STATIC uint8_t cmd_response_status;
-STATIC size_t cmd_response_len;
-STATIC uint8_t *cmd_response_data;
+static bool cmd_response_received;
+static uint16_t cmd_response_opcode;
+static uint8_t cmd_response_status;
+static size_t cmd_response_len;
+static uint8_t *cmd_response_data;
 
-STATIC volatile bool hci_poll_in_progress = false;
+static volatile bool hci_poll_in_progress = false;
 
 
 //////////////////////////////////////////////////////////////////////
@@ -118,7 +126,7 @@ STATIC volatile bool hci_poll_in_progress = false;
 #include "hci_debug.c"
 #endif // HCI_DEBUG
 
-STATIC void process_acl_data_pkt(uint8_t pkt_len, uint8_t pkt_data[]) {
+static void process_acl_data_pkt(uint8_t pkt_len, uint8_t pkt_data[]) {
     h4_hci_acl_pkt_t *pkt = (h4_hci_acl_pkt_t *)pkt_data;
 
     if (pkt->pb != ACL_DATA_PB_MIDDLE) {
@@ -159,7 +167,7 @@ STATIC void process_acl_data_pkt(uint8_t pkt_len, uint8_t pkt_data[]) {
 
 // Process number of completed packets. Reduce number of pending packets by reported
 // number of completed.
-STATIC void process_num_comp_pkts(uint16_t handle, uint16_t num_pkts) {
+static void process_num_comp_pkts(uint16_t handle, uint16_t num_pkts) {
     if (num_pkts && pending_pkt > num_pkts) {
         pending_pkt -= num_pkts;
     } else {
@@ -167,7 +175,7 @@ STATIC void process_num_comp_pkts(uint16_t handle, uint16_t num_pkts) {
     }
 }
 
-STATIC void process_evt_pkt(size_t pkt_len, uint8_t pkt_data[]) {
+static void process_evt_pkt(size_t pkt_len, uint8_t pkt_data[]) {
     h4_hci_evt_pkt_t *pkt = (h4_hci_evt_pkt_t *)pkt_data;
 
     switch (pkt->evt) {
@@ -404,7 +412,7 @@ hci_result_t hci_poll_for_incoming_pkt(void) {
 }
 
 
-STATIC hci_result_t write_pkt(uint8_t *buffer, size_t len) {
+static hci_result_t write_pkt(uint8_t *buffer, size_t len) {
     // Wait for CTS to go low before writing to HCI adapter.
     uint64_t start = supervisor_ticks_ms64();
 
@@ -424,7 +432,7 @@ STATIC hci_result_t write_pkt(uint8_t *buffer, size_t len) {
     return HCI_OK;
 }
 
-STATIC hci_result_t send_command(uint16_t opcode, uint8_t params_len, void *params) {
+static hci_result_t send_command(uint16_t opcode, uint8_t params_len, void *params) {
     uint8_t cmd_pkt_len = sizeof(h4_hci_cmd_pkt_t) + params_len;
     uint8_t tx_buffer[cmd_pkt_len];
 
@@ -481,7 +489,9 @@ hci_result_t hci_send_acl_pkt(uint16_t handle, uint8_t cid, uint16_t data_len, u
     acl_data_t *acl_data = (acl_data_t *)acl_pkt->data;
     acl_pkt->pkt_type = H4_ACL;
     acl_pkt->handle = handle;
-    acl_pkt->pb = ACL_DATA_PB_FIRST_FLUSH;
+    // Host-to-controller LE data must use the non-flushable start flag; NimBLE
+    // controllers (ESP32-C6) silently discard packets with ACL_DATA_PB_FIRST_FLUSH.
+    acl_pkt->pb = ACL_DATA_PB_FIRST_NON_FLUSH;
     acl_pkt->bc = 0;
     acl_pkt->data_len = (uint16_t)(sizeof(acl_data_t) + data_len);
     acl_data->acl_data_len = data_len;
@@ -600,7 +610,9 @@ hci_result_t hci_le_set_extended_advertising_parameters(uint8_t handle, uint16_t
         .prim_channel_map = prim_channel_map,
         .own_addr_type = own_addr_type,
         // .peer_addr set below.
+        .filter_policy = filter_policy,
         .tx_power = tx_power,
+        .prim_adv_phy = prim_adv_phy,
         .sec_adv_max_skip = sec_adv_max_skip,
         .sec_adv_phy = sec_adv_phy,
         .sid = sid,
@@ -611,6 +623,7 @@ hci_result_t hci_le_set_extended_advertising_parameters(uint8_t handle, uint16_t
         sizeof_field(struct bt_hci_cp_le_set_ext_adv_param, prim_min_interval));
     memcpy(params.prim_max_interval, (void *)&prim_max_interval,
         sizeof_field(struct bt_hci_cp_le_set_ext_adv_param, prim_max_interval));
+    params.peer_addr.type = peer_addr->type;
     memcpy(params.peer_addr.a.val, peer_addr->a.val, sizeof_field(bt_addr_le_t, a.val));
     return send_command(BT_HCI_OP_LE_SET_EXT_ADV_PARAM, sizeof(params), &params);
 }
@@ -664,6 +677,18 @@ hci_result_t hci_le_set_extended_advertising_data(uint8_t handle, uint8_t op, ui
     return send_command(BT_HCI_OP_LE_SET_EXT_ADV_DATA, sizeof(params) - (max_len - valid_len), &params);
 }
 
+hci_result_t hci_le_set_extended_scan_response_data(uint8_t handle, uint8_t op, uint8_t frag_pref, uint8_t len, uint8_t data[]) {
+    const uint8_t max_len = sizeof_field(struct bt_hci_cp_le_set_ext_scan_rsp_data, data);
+    uint8_t valid_len = MIN(len, max_len);
+    struct bt_hci_cp_le_set_ext_scan_rsp_data params = {
+        .handle = handle,
+        .op = op,
+        .frag_pref = frag_pref,
+        .len = valid_len,
+    };
+    memcpy(params.data, data, valid_len);
+    return send_command(BT_HCI_OP_LE_SET_EXT_SCAN_RSP_DATA, sizeof(params) - (max_len - valid_len), &params);
+}
 
 hci_result_t hci_le_set_scan_response_data(uint8_t len, uint8_t data[]) {
     struct bt_hci_cp_le_set_scan_rsp_data params = {
@@ -770,35 +795,35 @@ void hci_check_error(hci_result_t result) {
             return;
 
         case HCI_RESPONSE_TIMEOUT:
-            mp_raise_bleio_BluetoothError(translate("Timeout waiting for HCI response"));
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Timeout waiting for HCI response"));
             return;
 
         case HCI_WRITE_TIMEOUT:
-            mp_raise_bleio_BluetoothError(translate("Timeout waiting to write HCI request"));
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Timeout waiting to write HCI request"));
             return;
 
         case HCI_READ_ERROR:
-            mp_raise_bleio_BluetoothError(translate("Error reading from HCI adapter"));
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Error reading from HCI adapter"));
             return;
 
         case HCI_WRITE_ERROR:
-            mp_raise_bleio_BluetoothError(translate("Error writing to HCI adapter"));
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Error writing to HCI adapter"));
             return;
 
         case HCI_PACKET_SIZE_ERROR:
-            mp_raise_RuntimeError(translate("HCI packet size mismatch"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("HCI packet size mismatch"));
             return;
 
         case HCI_ATT_ERROR:
-            mp_raise_RuntimeError(translate("Error in ATT protocol code"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("Error in ATT protocol code"));
             return;
 
         default:
             // Should be an HCI status error, > 0.
             if (result > 0) {
-                mp_raise_bleio_BluetoothError(translate("HCI status error: %02x"), result);
+                mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("HCI status error: %02x"), result);
             } else {
-                mp_raise_bleio_BluetoothError(translate("Unknown hci_result_t: %d"), result);
+                mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Unknown hci_result_t: %d"), result);
             }
             return;
     }

@@ -1,0 +1,7 @@
+/* Same as the Feather nRF52840 Express, whose upstream board is the same
+ * apart from the LED pin and the SHT3XD node below. */
+#include "../feather_nrf52840_zephyr/board.overlay"
+
+// CircuitPython drives the SHT31 from Python, so drop the Zephyr sensor node
+// on the now dynamic I2C0.
+/delete-node/ &SHT3XD;

@@ -26,7 +26,7 @@ SECTIONS
         . = ALIGN(4);
         KEEP(*(.isr_vector)) /* Startup code */
 
-        /* This first flash block is 16K annd the isr vectors only take up
+        /* This first flash block is 16K and the isr vectors only take up
            about 400 bytes. Micropython pads this with files, but this didn't
            work with the size of Circuitpython's ff object. */
 
@@ -37,6 +37,12 @@ SECTIONS
     .text :
     {
         . = ALIGN(4);
+        __property_getter_start = .;
+        *(.property_getter)
+        __property_getter_end = .;
+        __property_getset_start = .;
+        *(.property_getset)
+        __property_getset_end = .;
         *(.text*)          /* .text* sections (code) */
         *(.rodata*)        /* .rodata* sections (constants, strings, etc.) */
     /*  *(.glue_7)   */    /* glue arm to thumb code */
@@ -134,6 +140,21 @@ SECTIONS
     } > DTCM
     _ld_stack_top = ORIGIN(DTCM) + LENGTH(DTCM);
 
+    .ARM.extab :
+    {
+        *(.ARM.extab* .gnu.linkonce.armextab.*)
+    } >FLASH_FIRMWARE
+    .ARM :
+    {
+        __exidx_start = .;
+        *(.ARM.exidx*)
+        __exidx_end = .;
+    } >FLASH_FIRMWARE
 
     .ARM.attributes 0 : { *(.ARM.attributes) }
+
+    ASSERT((__property_getter_end - __property_getter_start) % 8 == 0,
+        "the .property_getter section must hold whole 8-byte objects")
+    ASSERT((__property_getset_end - __property_getset_start) % 12 == 0,
+        "the .property_getset section must hold whole 12-byte objects")
 }

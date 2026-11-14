@@ -1,0 +1,2 @@
+CIRCUITPY_BUILD_EXTENSIONS = ["hex", "uf2"]
+SHIELDS = ["rtkmipilcdb00000be"]

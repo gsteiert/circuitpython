@@ -1,10 +1,9 @@
 # test capability for threads to access a shared mutable data structure
 # (without contention because they access different parts of the structure)
 #
-# SPDX-FileCopyrightText: Copyright (c) 2016 Damien P. George on behalf of Pycom Ltd
-#
-# SPDX-License-Identifier: MIT
+# MIT license; Copyright (c) 2016 Damien P. George on behalf of Pycom Ltd
 
+import time
 import _thread
 
 
@@ -33,5 +32,5 @@ for i in range(n_thread):
 
 # busy wait for threads to finish
 while n_finished < n_thread:
-    pass
+    time.sleep(0)
 print(lst)

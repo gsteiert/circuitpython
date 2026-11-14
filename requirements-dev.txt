@@ -1,14 +1,15 @@
-# For string compression
-huffman
-
 # For nvm.toml
 cascadetoml
 jinja2
 typer
 
+# for generating mbedtls's PSA driver wrappers (jinja2, above, is also required)
+jsonschema
+
 sh
-click
+click<8.2.0
 cpp-coveralls
+
 requests
 requests-cache
 
@@ -16,8 +17,37 @@ requests-cache
 polib
 
 # For pre-commit
+ruff==0.9.4 # ruff version must exactly match pre-commit-config.yaml
 pyyaml
-black
+pre-commit
+micropython-uncrustify
 
 # for combining the Nordic SoftDevice with CircuitPython
 intelhex
+
+# for building & testing natmods
+pyelftools
+ar
+
+cryptography
+
+# for web workflow minify
+minify_html
+jsmin
+
+# for Silicon Labs Configurator (SLC)
+websockets
+colorama
+
+# for silabs builds
+setuptools
+
+# For zephyr port
+tomlkit
+pytest
+pytest-rerunfailures
+pytest-xdist
+perfetto
+
+# For littlefs flash image tests on the zephyr port native_simulators
+littlefs-python

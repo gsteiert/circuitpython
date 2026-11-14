@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2017-2021 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017-2021 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "supervisor/shared/status_leds.h"
 
@@ -48,8 +28,11 @@ uint8_t rgb_status_brightness = 63;
 #define MICROPY_HW_NEOPIXEL_COUNT (1)
 #endif
 
+static uint64_t next_start_raw_ticks;
 static uint8_t status_neopixel_color[3 * MICROPY_HW_NEOPIXEL_COUNT];
 static digitalio_digitalinout_obj_t status_neopixel;
+// GRB sends G,R,B (most WS2812s). RGB sends R,G,B.
+static status_neopixel_order_t status_neopixel_order = MICROPY_HW_NEOPIXEL_ORDER;
 
 #elif defined(MICROPY_HW_APA102_MOSI) && defined(MICROPY_HW_APA102_SCK)
 uint8_t rgb_status_brightness = 50;
@@ -131,7 +114,7 @@ static uint32_t current_status_color = 0;
 #endif
 
 static bool status_led_init_in_progress = false;
-void status_led_init() {
+void status_led_init(void) {
     if (status_led_init_in_progress) {
         // Avoid recursion.
         return;
@@ -152,9 +135,9 @@ void status_led_init() {
     memset(status_apa102_color + 4, 0xff, APA102_BUFFER_LENGTH - 4);
     #if CIRCUITPY_BITBANG_APA102
     shared_module_bitbangio_spi_construct(&status_apa102,
-        MICROPY_HW_APA102_SCK,
-        MICROPY_HW_APA102_MOSI,
-        NULL);
+        MP_OBJ_FROM_PTR(MICROPY_HW_APA102_SCK),
+        MP_OBJ_FROM_PTR(MICROPY_HW_APA102_MOSI),
+        mp_const_none);
     #else
     if (!common_hal_busio_spi_deinited(&status_apa102)) {
         common_hal_busio_spi_deinit(&status_apa102);
@@ -162,7 +145,8 @@ void status_led_init() {
     common_hal_busio_spi_construct(&status_apa102,
         MICROPY_HW_APA102_SCK,
         MICROPY_HW_APA102_MOSI,
-        NULL);
+        NULL,
+        false);
     #endif
     #if CIRCUITPY_BITBANG_APA102
     shared_module_bitbangio_spi_try_lock(&status_apa102);
@@ -177,30 +161,18 @@ void status_led_init() {
 
     #elif CIRCUITPY_PWM_RGB_LED
     if (common_hal_mcu_pin_is_free(CIRCUITPY_RGB_STATUS_R)) {
-        pwmout_result_t red_result = common_hal_pwmio_pwmout_construct(&rgb_status_r, CIRCUITPY_RGB_STATUS_R, 0, 50000, false);
-
-        if (PWMOUT_OK == red_result) {
-            common_hal_pwmio_pwmout_never_reset(&rgb_status_r);
-        }
+        common_hal_pwmio_pwmout_construct(&rgb_status_r, CIRCUITPY_RGB_STATUS_R, 0, 50000, false);
     }
 
     if (common_hal_mcu_pin_is_free(CIRCUITPY_RGB_STATUS_G)) {
-        pwmout_result_t green_result = common_hal_pwmio_pwmout_construct(&rgb_status_g, CIRCUITPY_RGB_STATUS_G, 0, 50000, false);
-
-        if (PWMOUT_OK == green_result) {
-            common_hal_pwmio_pwmout_never_reset(&rgb_status_g);
-        }
+        common_hal_pwmio_pwmout_construct(&rgb_status_g, CIRCUITPY_RGB_STATUS_G, 0, 50000, false);
     }
 
     if (common_hal_mcu_pin_is_free(CIRCUITPY_RGB_STATUS_B)) {
-        pwmout_result_t blue_result = common_hal_pwmio_pwmout_construct(&rgb_status_b, CIRCUITPY_RGB_STATUS_B, 0, 50000, false);
-
-        if (PWMOUT_OK == blue_result) {
-            common_hal_pwmio_pwmout_never_reset(&rgb_status_b);
-        }
+        common_hal_pwmio_pwmout_construct(&rgb_status_b, CIRCUITPY_RGB_STATUS_B, 0, 50000, false);
     }
 
-    #elif defined(MICROPY_HW_LED_STATUS)
+    #elif CIRCUITPY_DIGITALIO && defined(MICROPY_HW_LED_STATUS)
     common_hal_digitalio_digitalinout_construct(&single_color_led, MICROPY_HW_LED_STATUS);
     common_hal_digitalio_digitalinout_switch_to_output(
         &single_color_led, MICROPY_HW_LED_STATUS_INVERTED == 0, DRIVE_MODE_PUSH_PULL);
@@ -216,14 +188,20 @@ void status_led_init() {
     status_led_init_in_progress = false;
 }
 
-void status_led_deinit() {
+void status_led_deinit(void) {
     #ifdef MICROPY_HW_NEOPIXEL
-    common_hal_reset_pin(MICROPY_HW_NEOPIXEL);
+    // Make sure the pin stays low for the reset period. The pin reset may pull
+    // it up and stop the reset period.
+    while (port_get_raw_ticks(NULL) < next_start_raw_ticks) {
+    }
+    common_hal_digitalio_digitalinout_deinit(&status_neopixel);
 
     #elif defined(MICROPY_HW_APA102_MOSI) && defined(MICROPY_HW_APA102_SCK)
     #if CIRCUITPY_BITBANG_APA102
+    shared_module_bitbangio_spi_unlock(&status_apa102);
     shared_module_bitbangio_spi_deinit(&status_apa102);
     #else
+    common_hal_busio_spi_unlock(&status_apa102);
     common_hal_busio_spi_deinit(&status_apa102);
     #endif
 
@@ -240,7 +218,7 @@ void status_led_deinit() {
         common_hal_pwmio_pwmout_deinit(&rgb_status_b);
     }
 
-    #elif defined(MICROPY_HW_LED_STATUS)
+    #elif CIRCUITPY_DIGITALIO && defined(MICROPY_HW_LED_STATUS)
     common_hal_digitalio_digitalinout_deinit(&single_color_led);
     #endif
 
@@ -263,9 +241,16 @@ void new_status_color(uint32_t rgb) {
         status_neopixel_color[3 * i + 0] = (rgb_adjusted >> 8) & 0xff;
         status_neopixel_color[3 * i + 1] = (rgb_adjusted >> 16) & 0xff;
         status_neopixel_color[3 * i + 2] = rgb_adjusted & 0xff;
+
+        if (status_neopixel_order == STATUS_NEOPIXEL_ORDER_RGB) {
+            // Swap GR to RG
+            uint8_t temp = status_neopixel_color[3 * i + 0];
+            status_neopixel_color[3 * i + 0] = status_neopixel_color[3 * i + 1];
+            status_neopixel_color[3 * i + 1] = temp;
+        }
     }
     common_hal_neopixel_write(&status_neopixel, status_neopixel_color, 3 * MICROPY_HW_NEOPIXEL_COUNT);
-
+    next_start_raw_ticks = port_get_raw_ticks(NULL) + 2;
     #elif defined(MICROPY_HW_APA102_MOSI) && defined(MICROPY_HW_APA102_SCK)
     for (size_t i = 0; i < MICROPY_HW_APA102_COUNT; i++) {
         // Skip 4 + offset to skip the header bytes too.
@@ -304,6 +289,14 @@ void new_status_color(uint32_t rgb) {
     #endif
 }
 
+void status_led_set_neopixel_order(status_neopixel_order_t order) {
+    #ifdef MICROPY_HW_NEOPIXEL
+    status_neopixel_order = order;
+    #else
+    (void)order;
+    #endif
+}
+
 uint32_t color_brightness(uint32_t color, uint8_t brightness) {
     #if CIRCUITPY_STATUS_LED
     uint32_t result = ((color & 0xff0000) * brightness / 255) & 0xff0000;
@@ -318,12 +311,17 @@ uint32_t color_brightness(uint32_t color, uint8_t brightness) {
 void set_status_brightness(uint8_t level) {
     #if CIRCUITPY_STATUS_LED
     rgb_status_brightness = level;
-    uint32_t current_color = current_status_color;
-    // Temporarily change the current color global to force the new_status_color call to update the
-    // LED. Usually duplicate calls of the same color are ignored without regard to brightness
-    // changes.
-    current_status_color = 0;
-    new_status_color(current_color);
+    // This is only called by user code and we're never controlling the status
+    // LED when user code is running. So, we don't need to update the current
+    // state (there is none.)
+    #endif
+}
+
+uint8_t get_status_brightness(void) {
+    #if CIRCUITPY_STATUS_LED
+    return rgb_status_brightness;
+    #else
+    return 0;
     #endif
 }
 
@@ -331,12 +329,10 @@ void init_rxtx_leds(void) {
     #if CIRCUITPY_DIGITALIO && defined(MICROPY_HW_LED_RX)
     common_hal_digitalio_digitalinout_construct(&rx_led, MICROPY_HW_LED_RX);
     common_hal_digitalio_digitalinout_switch_to_output(&rx_led, true, DRIVE_MODE_PUSH_PULL);
-    common_hal_digitalio_digitalinout_never_reset(&rx_led);
     #endif
     #if CIRCUITPY_DIGITALIO && defined(MICROPY_HW_LED_TX)
     common_hal_digitalio_digitalinout_construct(&tx_led, MICROPY_HW_LED_TX);
     common_hal_digitalio_digitalinout_switch_to_output(&tx_led, true, DRIVE_MODE_PUSH_PULL);
-    common_hal_digitalio_digitalinout_never_reset(&tx_led);
     #endif
 }
 

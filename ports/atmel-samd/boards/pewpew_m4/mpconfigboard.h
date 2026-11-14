@@ -1,3 +1,11 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Scott Shawcroft for Adafruit Industries, 2020 Radomir
+//
+// SPDX-License-Identifier: MIT
+
+#pragma once
+
 #define MICROPY_HW_BOARD_NAME "PewPew M4"
 #define MICROPY_HW_MCU_NAME "samd51g19"
 
@@ -36,3 +44,4 @@
 #define IGNORE_PIN_PB11     1
 
 #define SAMD5x_E5x_BOD33_LEVEL (100)
+#define CIRCUITPY_REPL_LOGO 0

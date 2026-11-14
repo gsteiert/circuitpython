@@ -8,18 +8,27 @@ import os
 import subprocess
 import sys
 import argparse
+import re
 from glob import glob
 
-sys.path.append("../tools")
-import pyboard
+from test_utils import (
+    base_path,
+    pyboard,
+    set_injected_prologue,
+    get_test_instance,
+    prepare_script_for_target,
+    create_test_report,
+)
 
 # Paths for host executables
 if os.name == "nt":
     CPYTHON3 = os.getenv("MICROPY_CPYTHON3", "python3.exe")
-    MICROPYTHON = os.getenv("MICROPY_MICROPYTHON", "../ports/windows/micropython.exe")
+    MICROPYTHON = os.getenv(
+        "MICROPY_MICROPYTHON", "../ports/windows/build-standard/micropython.exe"
+    )
 else:
     CPYTHON3 = os.getenv("MICROPY_CPYTHON3", "python3")
-    MICROPYTHON = os.getenv("MICROPY_MICROPYTHON", "../ports/unix/micropython")
+    MICROPYTHON = os.getenv("MICROPY_MICROPYTHON", "../ports/unix/build-standard/micropython")
 
 PYTHON_TRUTH = CPYTHON3
 
@@ -33,15 +42,15 @@ def compute_stats(lst):
         avg += x
         var += x * x
     avg /= len(lst)
-    var = max(0, var / len(lst) - avg ** 2)
-    return avg, var ** 0.5
+    var = max(0, var / len(lst) - avg**2)
+    return avg, var**0.5
 
 
 def run_script_on_target(target, script):
     output = b""
     err = None
 
-    if isinstance(target, pyboard.Pyboard):
+    if hasattr(target, "enter_raw_repl"):
         # Run via pyboard interface
         try:
             target.enter_raw_repl()
@@ -74,6 +83,8 @@ def run_feature_test(target, test):
 def run_benchmark_on_target(target, script):
     output, err = run_script_on_target(target, script)
     if err is None:
+        if output == "SKIP":
+            return -1, -1, "SKIP"
         time, norm, result = output.split(None, 2)
         try:
             return int(time), int(norm), result
@@ -83,7 +94,8 @@ def run_benchmark_on_target(target, script):
         return -1, -1, "CRASH: %r" % err
 
 
-def run_benchmarks(target, param_n, param_m, n_average, test_list):
+def run_benchmarks(args, target, param_n, param_m, n_average, test_list):
+    test_results = []
     skip_complex = run_feature_test(target, "complex") != "complex"
     skip_native = run_feature_test(target, "native_check") != "native"
 
@@ -91,27 +103,51 @@ def run_benchmarks(target, param_n, param_m, n_average, test_list):
         print(test_file + ": ", end="")
 
         # Check if test should be skipped
-        skip = (
-            skip_complex
-            and test_file.find("bm_fft") != -1
-            or skip_native
-            and test_file.find("viper_") != -1
-        )
-        if skip:
-            print("skip")
+        skip_reason = None
+        if skip_complex and test_file.endswith(("bm_fft.py", "misc_mandel.py")):
+            skip_reason = "complex not supported"
+        elif skip_native and test_file.find("viper_") != -1:
+            skip_reason = "native not supported"
+        if skip_reason:
+            test_results.append((test_file, "skip", skip_reason))
+            print("SKIP:", skip_reason)
             continue
 
         # Create test script
+        test_script = b"import sys\nsys.path.remove('')\n\n"
         with open(test_file, "rb") as f:
-            test_script = f.read()
+            test_script += f.read()
         with open(BENCH_SCRIPT_DIR + "benchrun.py", "rb") as f:
             test_script += f.read()
         test_script += b"bm_run(%u, %u)\n" % (param_n, param_m)
+
+        # Search for the bm_params dict, to extract the minimum memory required.
+        m = re.search(rb"bm_params = {\s+\((\d+), (\d+)\):", test_script)
+        if not m:
+            print(f"Test file '{test_file}' doesn't contain valid 'bm_params'")
+            sys.exit(2)
+        min_m = int(m.group(2))
+
+        # Skip the test if the target doesn't have enough memory.
+        if param_m < min_m:
+            test_results.append((test_file, "skip", "too large"))
+            print("SKIP: too large")
+            continue
 
         # Write full test script if needed
         if 0:
             with open("%s.full" % test_file, "wb") as f:
                 f.write(test_script)
+
+        # Process script through mpy-cross if needed
+        if hasattr(target, "enter_raw_repl") or args.via_mpy:
+            crash, test_script_target = prepare_script_for_target(args, test_script, test_file)
+            if crash:
+                test_results.append((test_file, "fail", "preparation"))
+                print("CRASH:", test_script_target)
+                continue
+        else:
+            test_script_target = test_script
 
         # Run MicroPython a given number of times
         times = []
@@ -119,7 +155,7 @@ def run_benchmarks(target, param_n, param_m, n_average, test_list):
         error = None
         result_out = None
         for _ in range(n_average):
-            time, norm, result = run_benchmark_on_target(target, test_script)
+            time, norm, result = run_benchmark_on_target(target, test_script_target)
             if time < 0 or norm < 0:
                 error = result
                 break
@@ -133,13 +169,25 @@ def run_benchmarks(target, param_n, param_m, n_average, test_list):
 
         # Check result against truth if needed
         if error is None and result_out != "None":
-            _, _, result_exp = run_benchmark_on_target(PYTHON_TRUTH, test_script)
+            test_file_expected = test_file + ".exp"
+            if os.path.isfile(test_file_expected):
+                # Expected result is given by a file, so read that in
+                with open(test_file_expected) as f:
+                    result_exp = f.read().strip()
+            else:
+                # Run CPython to work out the expected result
+                _, _, result_exp = run_benchmark_on_target(PYTHON_TRUTH, test_script)
             if result_out != result_exp:
                 error = "FAIL truth"
 
         if error is not None:
+            if error.startswith("SKIP"):
+                test_results.append((test_file, "skip", error))
+            else:
+                test_results.append((test_file, "fail", error))
             print(error)
         else:
+            test_results.append((test_file, "pass", ""))
             t_avg, t_sd = compute_stats(times)
             s_avg, s_sd = compute_stats(scores)
             print(
@@ -153,6 +201,8 @@ def run_benchmarks(target, param_n, param_m, n_average, test_list):
 
         sys.stdout.flush()
 
+    return test_results
+
 
 def parse_output(filename):
     with open(filename) as f:
@@ -162,7 +212,13 @@ def parse_output(filename):
         m = int(m.split("=")[1])
         data = []
         for l in f:
-            if l.find(": ") != -1 and l.find(": skip") == -1 and l.find("CRASH: ") == -1:
+            if (
+                ": " in l
+                and ": SKIP" not in l
+                and "CRASH: " not in l
+                and "skipped: " not in l
+                and "failed: " not in l
+            ):
                 name, values = l.strip().split(": ")
                 values = tuple(float(v) for v in values.split())
                 data.append((name,) + values)
@@ -184,7 +240,7 @@ def compute_diff(file1, file2, diff_score):
     else:
         hdr = "N={} M={} vs N={} M={}".format(n1, m1, n2, m2)
     print(
-        "{:24} {:>10} -> {:>10}   {:>10}   {:>7}% (error%)".format(
+        "{:26} {:>10} -> {:>10}   {:>10}   {:>7}% (error%)".format(
             hdr, file1, file2, "diff", "diff"
         )
     )
@@ -201,11 +257,11 @@ def compute_diff(file1, file2, diff_score):
             sd1 *= av1 / 100  # convert from percent sd to absolute sd
             sd2 *= av2 / 100  # convert from percent sd to absolute sd
             av_diff = av2 - av1
-            sd_diff = (sd1 ** 2 + sd2 ** 2) ** 0.5
+            sd_diff = (sd1**2 + sd2**2) ** 0.5
             percent = 100 * av_diff / av1
             percent_sd = 100 * sd_diff / av1
             print(
-                "{:24} {:10.2f} -> {:10.2f} : {:+10.2f} = {:+7.3f}% (+/-{:.2f}%)".format(
+                "{:26} {:10.2f} -> {:10.2f} : {:+10.2f} = {:+7.3f}% (+/-{:.2f}%)".format(
                     name, av1, av2, av_diff, percent, percent_sd
                 )
             )
@@ -218,22 +274,39 @@ def compute_diff(file1, file2, diff_score):
 def main():
     cmd_parser = argparse.ArgumentParser(description="Run benchmarks for MicroPython")
     cmd_parser.add_argument(
-        "-t", "--diff-time", action="store_true", help="diff time outputs from a previous run"
+        "-m", "--diff-time", action="store_true", help="diff time outputs from a previous run"
     )
     cmd_parser.add_argument(
         "-s", "--diff-score", action="store_true", help="diff score outputs from a previous run"
     )
     cmd_parser.add_argument(
-        "-p", "--pyboard", action="store_true", help="run tests via pyboard.py"
+        "-t", "--test-instance", default="unix", help="the MicroPython instance to test"
     )
-    cmd_parser.add_argument(
-        "-d", "--device", default="/dev/ttyACM0", help="the device for pyboard.py"
-    )
+    cmd_parser.add_argument("--baudrate", default=115200, help="baud rate of the serial device")
+    cmd_parser.add_argument("--user", default="micro", help="telnet login username")
+    cmd_parser.add_argument("--password", default="python", help="telnet login password")
     cmd_parser.add_argument("-a", "--average", default="8", help="averaging number")
     cmd_parser.add_argument(
         "--emit", default="bytecode", help="MicroPython emitter to use (bytecode or native)"
     )
-    cmd_parser.add_argument("N", nargs=1, help="N parameter (approximate target CPU frequency)")
+    cmd_parser.add_argument("--heapsize", help="heapsize to use (use default if not specified)")
+    cmd_parser.add_argument("--via-mpy", action="store_true", help="compile code to .mpy first")
+    cmd_parser.add_argument("--mpy-cross-flags", default="", help="flags to pass to mpy-cross")
+    cmd_parser.add_argument(
+        "--begin",
+        metavar="PROLOGUE",
+        default=None,
+        help="prologue python file to execute before module import",
+    )
+    cmd_parser.add_argument(
+        "-r",
+        "--result-dir",
+        default=base_path("results"),
+        help="directory for test results",
+    )
+    cmd_parser.add_argument(
+        "N", nargs=1, help="N parameter (approximate target CPU frequency in MHz)"
+    )
     cmd_parser.add_argument("M", nargs=1, help="M parameter (approximate target heap in kbytes)")
     cmd_parser.add_argument("files", nargs="*", help="input test files")
     args = cmd_parser.parse_args()
@@ -242,6 +315,12 @@ def main():
         compute_diff(args.N[0], args.M[0], args.diff_score)
         sys.exit(0)
 
+    prologue = ""
+    if args.begin:
+        with open(args.begin, "rt") as source:
+            prologue = source.read()
+    set_injected_prologue(prologue)
+
     # N, M = 50, 25 # esp8266
     # N, M = 100, 100 # pyboard, esp32
     # N, M = 1000, 1000 # PC
@@ -249,32 +328,38 @@ def main():
     M = int(args.M[0])
     n_average = int(args.average)
 
-    if args.pyboard:
-        target = pyboard.Pyboard(args.device)
-        target.enter_raw_repl()
-    else:
+    target = get_test_instance(args.test_instance, args.baudrate, args.user, args.password)
+    if target is None:
+        # Use the unix port of MicroPython.
         target = [MICROPYTHON, "-X", "emit=" + args.emit]
+        if args.heapsize is not None:
+            target.extend(["-X", "heapsize=" + args.heapsize])
+    else:
+        # Use a remote target.
+        if not args.mpy_cross_flags:
+            args.mpy_cross_flags = "-march=armv7m"
 
     if len(args.files) == 0:
-        tests_skip = ("benchrun.py",)
-        if M <= 25:
-            # These scripts are too big to be compiled by the target
-            tests_skip += ("bm_chaos.py", "bm_hexiom.py", "misc_raytrace.py")
         tests = sorted(
             BENCH_SCRIPT_DIR + test_file
             for test_file in os.listdir(BENCH_SCRIPT_DIR)
-            if test_file.endswith(".py") and test_file not in tests_skip
+            if test_file.endswith(".py") and test_file != "benchrun.py"
         )
     else:
         tests = sorted(args.files)
 
     print("N={} M={} n_average={}".format(N, M, n_average))
 
-    run_benchmarks(target, N, M, n_average, tests)
+    os.makedirs(args.result_dir, exist_ok=True)
+    test_results = run_benchmarks(args, target, N, M, n_average, tests)
+    res = create_test_report(args, test_results)
 
-    if isinstance(target, pyboard.Pyboard):
+    if hasattr(target, "exit_raw_repl"):
         target.exit_raw_repl()
         target.close()
+
+    if not res:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

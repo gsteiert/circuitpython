@@ -1,28 +1,8 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/displayio/Group.h"
 
@@ -30,10 +10,15 @@
 #include "py/objlist.h"
 #include "shared-bindings/displayio/TileGrid.h"
 
-#if CIRCUITPY_VECTORIO
+#if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
 #include "shared-bindings/vectorio/VectorShape.h"
 #endif
 
+static void check_readonly(displayio_group_t *self) {
+    if (self->readonly) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Read-only"));
+    }
+}
 
 void common_hal_displayio_group_construct(displayio_group_t *self, uint32_t scale, mp_int_t x, mp_int_t y) {
     mp_obj_list_t *members = mp_obj_new_list(0, NULL);
@@ -48,6 +33,7 @@ void common_hal_displayio_group_set_hidden(displayio_group_t *self, bool hidden)
     if (self->hidden == hidden) {
         return;
     }
+    check_readonly(self);
     self->hidden = hidden;
     if (self->hidden_by_parent) {
         return;
@@ -66,6 +52,18 @@ void common_hal_displayio_group_set_hidden(displayio_group_t *self, bool hidden)
             displayio_group_set_hidden_by_parent(layer, hidden);
             continue;
         }
+        #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
+        const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[i]);
+        if (draw_protocol != NULL) {
+            layer = draw_protocol->draw_get_protocol_self(self->members->items[i]);
+            if (draw_protocol->draw_protocol_impl->draw_set_hidden != NULL) {
+                draw_protocol->draw_protocol_impl->draw_set_hidden(layer, hidden);
+            } else {
+                draw_protocol->draw_protocol_impl->draw_set_dirty(layer);
+            }
+            continue;
+        }
+        #endif
     }
 }
 
@@ -73,6 +71,7 @@ void displayio_group_set_hidden_by_parent(displayio_group_t *self, bool hidden) 
     if (self->hidden_by_parent == hidden) {
         return;
     }
+    check_readonly(self);
     self->hidden_by_parent = hidden;
     // If we're already hidden, then we're done.
     if (self->hidden) {
@@ -92,6 +91,18 @@ void displayio_group_set_hidden_by_parent(displayio_group_t *self, bool hidden) 
             displayio_group_set_hidden_by_parent(layer, hidden);
             continue;
         }
+        #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
+        const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[i]);
+        if (draw_protocol != NULL) {
+            layer = draw_protocol->draw_get_protocol_self(self->members->items[i]);
+            if (draw_protocol->draw_protocol_impl->draw_set_hidden != NULL) {
+                draw_protocol->draw_protocol_impl->draw_set_hidden(layer, hidden);
+            } else {
+                draw_protocol->draw_protocol_impl->draw_set_dirty(layer);
+            }
+            continue;
+        }
+        #endif
     }
 }
 
@@ -138,16 +149,20 @@ bool displayio_group_get_previous_area(displayio_group_t *self, displayio_area_t
 }
 
 static void _update_child_transforms(displayio_group_t *self) {
-    if (!self->in_group) {
-        return;
-    }
+    // Draw protocol layers get NULL while inactive. TileGrids and nested
+    // Groups always get the (zeroed when inactive) transform, since it also
+    // tracks their group membership.
+    #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
+    displayio_buffer_transform_t *draw_transform =
+        self->active ? &self->absolute_transform : NULL;
+    #endif
     for (size_t i = 0; i < self->members->len; i++) {
         mp_obj_t layer;
-        #if CIRCUITPY_VECTORIO
+        #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
         const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[i]);
         if (draw_protocol != NULL) {
             layer = draw_protocol->draw_get_protocol_self(self->members->items[i]);
-            draw_protocol->draw_protocol_impl->draw_update_transform(layer, &self->absolute_transform);
+            draw_protocol->draw_protocol_impl->draw_update_transform(layer, draw_transform);
             continue;
         }
         #endif
@@ -168,8 +183,8 @@ static void _update_child_transforms(displayio_group_t *self) {
 
 void displayio_group_update_transform(displayio_group_t *self,
     const displayio_buffer_transform_t *parent_transform) {
-    self->in_group = parent_transform != NULL;
-    if (self->in_group) {
+    self->active = parent_transform != NULL && parent_transform->scale != 0;
+    if (self->active) {
         int16_t x = self->x;
         int16_t y = self->y;
         if (parent_transform->transpose_xy) {
@@ -185,6 +200,10 @@ void displayio_group_update_transform(displayio_group_t *self,
         self->absolute_transform.mirror_y = parent_transform->mirror_y;
 
         self->absolute_transform.scale = parent_transform->scale * self->scale;
+    } else {
+        // Clear the transform so inactive layers can't act on a stale one.
+        displayio_buffer_transform_t no_transform = {};
+        self->absolute_transform = no_transform;
     }
     _update_child_transforms(self);
 }
@@ -193,6 +212,7 @@ void common_hal_displayio_group_set_scale(displayio_group_t *self, uint32_t scal
     if (self->scale == scale) {
         return;
     }
+    check_readonly(self);
     uint8_t parent_scale = self->absolute_transform.scale / self->scale;
     self->absolute_transform.dx = self->absolute_transform.dx / self->scale * scale;
     self->absolute_transform.dy = self->absolute_transform.dy / self->scale * scale;
@@ -209,6 +229,7 @@ void common_hal_displayio_group_set_x(displayio_group_t *self, mp_int_t x) {
     if (self->x == x) {
         return;
     }
+    check_readonly(self);
     if (self->absolute_transform.transpose_xy) {
         int16_t dy = self->absolute_transform.dy / self->scale;
         self->absolute_transform.y += dy * (x - self->x);
@@ -229,6 +250,7 @@ void common_hal_displayio_group_set_y(displayio_group_t *self, mp_int_t y) {
     if (self->y == y) {
         return;
     }
+    check_readonly(self);
     if (self->absolute_transform.transpose_xy) {
         int8_t dx = self->absolute_transform.dx / self->scale;
         self->absolute_transform.x += dx * (y - self->y);
@@ -241,10 +263,16 @@ void common_hal_displayio_group_set_y(displayio_group_t *self, mp_int_t y) {
 }
 
 static void _add_layer(displayio_group_t *self, mp_obj_t layer) {
-    #if CIRCUITPY_VECTORIO
+    check_readonly(self);
+    #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
     const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, layer);
     if (draw_protocol != NULL) {
-        draw_protocol->draw_protocol_impl->draw_update_transform(draw_protocol->draw_get_protocol_self(layer), &self->absolute_transform);
+        mp_obj_t protocol_self = draw_protocol->draw_get_protocol_self(layer);
+        if (draw_protocol->draw_protocol_impl->draw_set_in_group(protocol_self, true)) {
+            mp_raise_ValueError(MP_ERROR_TEXT("Layer already in a group"));
+        }
+        draw_protocol->draw_protocol_impl->draw_update_transform(
+            protocol_self, self->active ? &self->absolute_transform : NULL);
         return;
     }
     #endif
@@ -252,7 +280,7 @@ static void _add_layer(displayio_group_t *self, mp_obj_t layer) {
     if (native_layer != MP_OBJ_NULL) {
         displayio_tilegrid_t *tilegrid = native_layer;
         if (tilegrid->in_group) {
-            mp_raise_ValueError(translate("Layer already in a group."));
+            mp_raise_ValueError(MP_ERROR_TEXT("Layer already in a group"));
         } else {
             tilegrid->in_group = true;
         }
@@ -265,7 +293,7 @@ static void _add_layer(displayio_group_t *self, mp_obj_t layer) {
     if (native_layer != MP_OBJ_NULL) {
         displayio_group_t *group = native_layer;
         if (group->in_group) {
-            mp_raise_ValueError(translate("Layer already in a group."));
+            mp_raise_ValueError(MP_ERROR_TEXT("Layer already in a group"));
         } else {
             group->in_group = true;
         }
@@ -274,26 +302,29 @@ static void _add_layer(displayio_group_t *self, mp_obj_t layer) {
             group, self->hidden || self->hidden_by_parent);
         return;
     }
-    mp_raise_ValueError(translate("Layer must be a Group or TileGrid subclass."));
+    mp_raise_ValueError(MP_ERROR_TEXT("Layer must be a Group or TileGrid subclass"));
 }
 
 static void _remove_layer(displayio_group_t *self, size_t index) {
+    check_readonly(self);
     mp_obj_t layer;
     displayio_area_t layer_area;
     bool rendered_last_frame = false;
-    #if CIRCUITPY_VECTORIO
+    #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
     const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[index]);
     if (draw_protocol != NULL) {
         layer = draw_protocol->draw_get_protocol_self(self->members->items[index]);
         bool has_dirty_area = draw_protocol->draw_protocol_impl->draw_get_dirty_area(layer, &layer_area);
         rendered_last_frame = has_dirty_area;
         draw_protocol->draw_protocol_impl->draw_update_transform(layer, NULL);
+        draw_protocol->draw_protocol_impl->draw_set_in_group(layer, false);
     }
     #endif
     layer = mp_obj_cast_to_native_base(
         self->members->items[index], &displayio_tilegrid_type);
     if (layer != MP_OBJ_NULL) {
         displayio_tilegrid_t *tilegrid = layer;
+        tilegrid->in_group = false;
         rendered_last_frame = displayio_tilegrid_get_previous_area(tilegrid, &layer_area);
         displayio_tilegrid_update_transform(tilegrid, NULL);
     }
@@ -301,6 +332,7 @@ static void _remove_layer(displayio_group_t *self, size_t index) {
         self->members->items[index], &displayio_group_type);
     if (layer != MP_OBJ_NULL) {
         displayio_group_t *group = layer;
+        group->in_group = false;
         rendered_last_frame = displayio_group_get_previous_area(group, &layer_area);
         displayio_group_update_transform(group, NULL);
     }
@@ -353,38 +385,42 @@ void displayio_group_construct(displayio_group_t *self, mp_obj_list_t *members, 
     self->item_removed = false;
     self->scale = scale;
     self->in_group = false;
+    self->active = false;
+    self->readonly = false;
 }
 
 bool displayio_group_fill_area(displayio_group_t *self, const _displayio_colorspace_t *colorspace, const displayio_area_t *area, uint32_t *mask, uint32_t *buffer) {
     // Track if any of the layers finishes filling in the given area. We can ignore any remaining
     // layers at that point.
-    for (int32_t i = self->members->len - 1; i >= 0; i--) {
-        mp_obj_t layer;
-        #if CIRCUITPY_VECTORIO
-        const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[i]);
-        if (draw_protocol != NULL) {
-            layer = draw_protocol->draw_get_protocol_self(self->members->items[i]);
-            if (draw_protocol->draw_protocol_impl->draw_fill_area(layer, colorspace, area, mask, buffer)) {
-                return true;
+    if (self->hidden == false) {
+        for (int32_t i = self->members->len - 1; i >= 0; i--) {
+            mp_obj_t layer;
+            #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
+            const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[i]);
+            if (draw_protocol != NULL) {
+                layer = draw_protocol->draw_get_protocol_self(self->members->items[i]);
+                if (draw_protocol->draw_protocol_impl->draw_fill_area(layer, colorspace, area, mask, buffer)) {
+                    return true;
+                }
+                continue;
             }
-            continue;
-        }
-        #endif
-        layer = mp_obj_cast_to_native_base(
-            self->members->items[i], &displayio_tilegrid_type);
-        if (layer != MP_OBJ_NULL) {
-            if (displayio_tilegrid_fill_area(layer, colorspace, area, mask, buffer)) {
-                return true;
+            #endif
+            layer = mp_obj_cast_to_native_base(
+                self->members->items[i], &displayio_tilegrid_type);
+            if (layer != MP_OBJ_NULL) {
+                if (displayio_tilegrid_fill_area(layer, colorspace, area, mask, buffer)) {
+                    return true;
+                }
+                continue;
             }
-            continue;
-        }
-        layer = mp_obj_cast_to_native_base(
-            self->members->items[i], &displayio_group_type);
-        if (layer != MP_OBJ_NULL) {
-            if (displayio_group_fill_area(layer, colorspace, area, mask, buffer)) {
-                return true;
+            layer = mp_obj_cast_to_native_base(
+                self->members->items[i], &displayio_group_type);
+            if (layer != MP_OBJ_NULL) {
+                if (displayio_group_fill_area(layer, colorspace, area, mask, buffer)) {
+                    return true;
+                }
+                continue;
             }
-            continue;
         }
     }
     return false;
@@ -394,7 +430,7 @@ void displayio_group_finish_refresh(displayio_group_t *self) {
     self->item_removed = false;
     for (int32_t i = self->members->len - 1; i >= 0; i--) {
         mp_obj_t layer;
-        #if CIRCUITPY_VECTORIO
+        #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
         const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[i]);
         if (draw_protocol != NULL) {
             layer = draw_protocol->draw_get_protocol_self(self->members->items[i]);
@@ -417,7 +453,7 @@ void displayio_group_finish_refresh(displayio_group_t *self) {
     }
 }
 
-displayio_area_t *displayio_group_get_refresh_areas(displayio_group_t *self, displayio_area_t *tail) {
+static displayio_area_t *group_get_refresh_areas_impl(displayio_group_t *self, displayio_area_t *tail) {
     if (self->item_removed) {
         self->dirty_area.next = tail;
         tail = &self->dirty_area;
@@ -425,7 +461,7 @@ displayio_area_t *displayio_group_get_refresh_areas(displayio_group_t *self, dis
 
     for (int32_t i = self->members->len - 1; i >= 0; i--) {
         mp_obj_t layer;
-        #if CIRCUITPY_VECTORIO
+        #if CIRCUITPY_VECTORIO || CIRCUITPY_VIDEOCORE
         const vectorio_draw_protocol_t *draw_protocol = mp_proto_get(MP_QSTR_protocol_draw, self->members->items[i]);
         if (draw_protocol != NULL) {
             layer = draw_protocol->draw_get_protocol_self(self->members->items[i]);
@@ -436,16 +472,84 @@ displayio_area_t *displayio_group_get_refresh_areas(displayio_group_t *self, dis
         layer = mp_obj_cast_to_native_base(
             self->members->items[i], &displayio_tilegrid_type);
         if (layer != MP_OBJ_NULL) {
-            tail = displayio_tilegrid_get_refresh_areas(layer, tail);
+            if (!displayio_tilegrid_get_rendered_hidden(layer)) {
+                tail = displayio_tilegrid_get_refresh_areas(layer, tail);
+            }
             continue;
         }
         layer = mp_obj_cast_to_native_base(
             self->members->items[i], &displayio_group_type);
         if (layer != MP_OBJ_NULL) {
-            tail = displayio_group_get_refresh_areas(layer, tail);
+            tail = group_get_refresh_areas_impl(layer, tail);
             continue;
         }
     }
 
     return tail;
+}
+
+// Filter the dirty-rect list by containment: unlink every area that is fully contained
+// in another area in the list (a changing text label is the common case - the group
+// dirties the whole label region via item_removed plus one area per glyph, and the
+// glyph areas all sit inside the label region). Dropping a covered area is lossless:
+// the same pixels are refreshed by the survivor, in fewer transfers.
+//
+// The nodes are OWNED BY THE ITEMS (TileGrid reuses dirty_area as its tile-space dirty
+// accumulator between frames, vectorio keeps its current_area, ...), so their
+// coordinates must never be modified here. The ONLY mutation is the .next relink,
+// which is safe because every provider unconditionally reassigns .next at link time on
+// every get_refresh_areas call and never reads it back.
+//
+// Nodes at and past `tail` belong to the caller, so the sweep uses `tail` as its end
+// sentinel and never looks past it (every in-tree caller passes tail == NULL).
+//
+// One pass suffices: coordinates never change and unlinking preserves the relative
+// order of the remaining nodes, so every pair of surviving nodes is examined. Equal
+// areas satisfy the containment test in both directions; testing b-inside-a FIRST
+// keeps the earlier node and drops the later one - the two tests must stay an else-if
+// chain or equal areas would drop BOTH nodes and lose the area entirely.
+static displayio_area_t *filter_out_redundant_areas(displayio_area_t *head,
+    const displayio_area_t *tail) {
+    displayio_area_t *a_prev = NULL;
+    displayio_area_t *a = head;
+    while (a != tail) {
+        // The casts from the const .next field are safe: every node before `tail` is a
+        // mutable item-owned struct; only the field's declared type is pointer-to-const.
+        displayio_area_t *b_prev = a;
+        displayio_area_t *b = (displayio_area_t *)a->next;
+        bool a_dropped = false;
+        while (b != tail) {
+            if (b->x1 >= a->x1 && b->y1 >= a->y1 && b->x2 <= a->x2 && b->y2 <= a->y2) {
+                // b is contained in a (equal areas land here): unlink b.
+                b_prev->next = b->next;
+                b = (displayio_area_t *)b_prev->next;
+            } else if (a->x1 >= b->x1 && a->y1 >= b->y1 && a->x2 <= b->x2 && a->y2 <= b->y2) {
+                // a is strictly contained in the later b: unlink a and move on.
+                if (a_prev == NULL) {
+                    head = (displayio_area_t *)a->next;
+                } else {
+                    a_prev->next = a->next;
+                }
+                a_dropped = true;
+                break;
+            } else {
+                b_prev = b;
+                b = (displayio_area_t *)b->next;
+            }
+        }
+        if (a_dropped) {
+            a = (a_prev == NULL) ? head : (displayio_area_t *)a_prev->next;
+        } else {
+            a_prev = a;
+            a = (displayio_area_t *)a->next;
+        }
+    }
+    return head;
+}
+
+// Public entry point: displays call this once on their root group, so the whole tree's
+// list is filtered in one place and no display type needs its own copy of the logic.
+displayio_area_t *displayio_group_get_refresh_areas(displayio_group_t *self, displayio_area_t *tail) {
+    displayio_area_t *areas = group_get_refresh_areas_impl(self, tail);
+    return filter_out_redundant_areas(areas, tail);
 }

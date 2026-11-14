@@ -1,53 +1,41 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Lucian Copeland for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Lucian Copeland for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2022 Matthew McGowan for Blues Wireless Inc
+//
+// SPDX-License-Identifier: MIT
 
 #include "peripherals/rtc.h"
 #include STM32_HAL_H
 
 #include "py/mpconfig.h"
-#include "py/gc.h"
-#include "py/obj.h"
-#include "py/runtime.h"
 #include "shared/timeutils/timeutils.h"
 
 // Default period for ticks is 1/1024 second
-#define TICK_DIVISOR 1024
+#define TICKS_PER_SECOND 1024
+// A subtick is 1/32768 second, one period of a 32768 Hz crystal.
+#define SUBTICKS_PER_TICK 32
+#define SUBTICKS_PER_SECOND (TICKS_PER_SECOND * SUBTICKS_PER_TICK)
 
-STATIC RTC_HandleTypeDef hrtc;
+static RTC_HandleTypeDef hrtc;
 
 #if BOARD_HAS_LOW_SPEED_CRYSTAL
-STATIC uint32_t rtc_clock_frequency = LSE_VALUE;
+static uint32_t rtc_clock_frequency = LSE_VALUE;
 #else
-STATIC uint32_t rtc_clock_frequency = LSI_VALUE;
+static uint32_t rtc_clock_frequency = LSI_VALUE;
 #endif
 
 volatile uint32_t seconds_to_date = 0;
 volatile uint32_t cached_date = 0;
 volatile uint32_t seconds_to_minute = 0;
 volatile uint32_t cached_hours_minutes = 0;
+
+// The RTC starts at 2000-01-01 when it comes up.
+// If the RTC is set to a later time, the ticks the RTC returns will be offset by the new time.
+// Remember that offset so it can be removed when returning a monotonic tick count.
+static int64_t rtc_ticks_offset;
+// Normalized to be 0-31 inclusive, so always positive.
+static uint8_t rtc_subticks_offset;
 
 volatile bool alarmed_already[2];
 
@@ -61,6 +49,9 @@ uint32_t stm32_peripherals_get_rtc_freq(void) {
 }
 
 void stm32_peripherals_rtc_init(void) {
+    rtc_ticks_offset = 0;
+    rtc_subticks_offset = 0;
+
     // RTC oscillator selection is handled in peripherals/<family>/<line>/clocks.c
     __HAL_RCC_RTC_ENABLE();
     hrtc.Instance = RTC;
@@ -78,7 +69,7 @@ void stm32_peripherals_rtc_init(void) {
 
 // This function is called often for timing so we cache the seconds elapsed computation based on the
 // register value. The STM HAL always does shifts and conversion if we use it directly.
-uint64_t stm32_peripherals_rtc_raw_ticks(uint8_t *subticks) {
+static uint64_t stm32_peripherals_rtc_raw_ticks(uint8_t *subticks) {
     // Disable IRQs to ensure we read all of the RTC registers as close in time as possible. Read
     // SSR twice to make sure we didn't read across a tick.
     __disable_irq();
@@ -86,7 +77,7 @@ uint64_t stm32_peripherals_rtc_raw_ticks(uint8_t *subticks) {
     uint32_t time = (uint32_t)(RTC->TR & RTC_TR_RESERVED_MASK);
     uint32_t date = (uint32_t)(RTC->DR & RTC_DR_RESERVED_MASK);
     uint32_t ssr = (uint32_t)(RTC->SSR);
-    while (ssr != first_ssr) {
+    if (ssr != first_ssr) {
         first_ssr = ssr;
         time = (uint32_t)(RTC->TR & RTC_TR_RESERVED_MASK);
         date = (uint32_t)(RTC->DR & RTC_DR_RESERVED_MASK);
@@ -95,6 +86,10 @@ uint64_t stm32_peripherals_rtc_raw_ticks(uint8_t *subticks) {
     __enable_irq();
 
     uint32_t subseconds = rtc_clock_frequency - 1 - ssr;
+    // Unless the RTC clock is 32768 Hz, a step of the subsecond counter is not a whole subtick,
+    // so scale. subseconds < rtc_clock_frequency <= 32768 (the synchronous prescaler has 15
+    // bits), so the product is below 2^30.
+    uint32_t subticks_in_second = subseconds * SUBTICKS_PER_SECOND / rtc_clock_frequency;
 
     if (date != cached_date) {
         uint32_t year = (uint8_t)((date & (RTC_DR_YT | RTC_DR_YU)) >> 16U);
@@ -119,27 +114,94 @@ uint64_t stm32_peripherals_rtc_raw_ticks(uint8_t *subticks) {
     uint8_t seconds = (uint8_t)(time & (RTC_TR_ST | RTC_TR_SU));
     seconds = (uint8_t)RTC_Bcd2ToByte(seconds);
     if (subticks != NULL) {
-        *subticks = subseconds % 32;
+        *subticks = subticks_in_second % SUBTICKS_PER_TICK;
     }
 
-    uint64_t raw_ticks = ((uint64_t)TICK_DIVISOR) * (seconds_to_date + seconds_to_minute + seconds) + subseconds / 32;
+    uint64_t raw_ticks = ((uint64_t)TICKS_PER_SECOND) * (seconds_to_date + seconds_to_minute + seconds) + subticks_in_second / SUBTICKS_PER_TICK;
     return raw_ticks;
 }
+
+// This function returns monotonically increasing ticks by adjusting away the RTC tick offset
+// from the last time the date was set.
+uint64_t stm32_peripherals_rtc_monotonic_ticks(uint8_t *subticks) {
+    uint8_t raw_subticks;
+    uint64_t monotonic_ticks = stm32_peripherals_rtc_raw_ticks(&raw_subticks) - rtc_ticks_offset;
+    int8_t monotonic_subticks = raw_subticks - rtc_subticks_offset;
+    // Difference might be negative. Normalize to 0-31.
+    // `while` not really necessary; should only loop 0 or 1 times.
+    while (monotonic_subticks < 0) {
+        monotonic_ticks--;
+        monotonic_subticks += SUBTICKS_PER_TICK;
+    }
+    if (subticks != NULL) {
+        *subticks = (uint8_t)monotonic_subticks;
+    }
+    return monotonic_ticks;
+}
+
+#if CIRCUITPY_RTC
+void stm32_peripherals_rtc_get_time(timeutils_struct_time_t *tm) {
+    RTC_DateTypeDef date = {0};
+    RTC_TimeTypeDef time = {0};
+
+    int code;
+    if ((code = HAL_RTC_GetTime(&hrtc, &time, RTC_FORMAT_BIN)) == HAL_OK &&
+        (code = HAL_RTC_GetDate(&hrtc, &date, RTC_FORMAT_BIN)) == HAL_OK) {
+        tm->tm_hour = time.Hours;
+        tm->tm_min = time.Minutes;
+        tm->tm_sec = time.Seconds;
+        tm->tm_wday = date.WeekDay - 1;
+        tm->tm_mday = date.Date;
+        tm->tm_mon = date.Month;
+        tm->tm_year = date.Year + 2000;
+        tm->tm_yday = -1;
+    }
+}
+
+void stm32_peripherals_rtc_set_time(timeutils_struct_time_t *tm) {
+    RTC_DateTypeDef date = {0};
+    RTC_TimeTypeDef time = {0};
+
+    uint8_t current_monotonic_subticks;
+    uint64_t current_monotonic_ticks = stm32_peripherals_rtc_monotonic_ticks(&current_monotonic_subticks);
+
+    // SubSeconds will always be set to zero.
+    time.Hours = tm->tm_hour;
+    time.Minutes = tm->tm_min;
+    time.Seconds = tm->tm_sec;
+    date.WeekDay = tm->tm_wday + 1;
+    date.Date = tm->tm_mday;
+    date.Month = tm->tm_mon;
+    date.Year = tm->tm_year - 2000;
+    time.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+    time.StoreOperation = RTC_STOREOPERATION_RESET;
+
+    if (HAL_RTC_SetTime(&hrtc, &time, RTC_FORMAT_BIN) != HAL_OK ||
+        HAL_RTC_SetDate(&hrtc, &date, RTC_FORMAT_BIN) != HAL_OK) {
+        // todo - throw an exception
+    }
+
+    uint8_t raw_subticks;
+    rtc_ticks_offset = stm32_peripherals_rtc_raw_ticks(&raw_subticks) - current_monotonic_ticks;
+    int8_t rtc_subticks_offset_signed = raw_subticks - current_monotonic_subticks;
+    // Difference might be negative. Normalize subticks to 0-31.
+    // `while` not really necessary; should only loop 0 or 1 times.
+    while (rtc_subticks_offset_signed < 0) {
+        rtc_ticks_offset--;
+        rtc_subticks_offset_signed += SUBTICKS_PER_TICK;
+    }
+    rtc_subticks_offset = (uint8_t)rtc_subticks_offset_signed;
+}
+#endif
 
 void stm32_peripherals_rtc_assign_wkup_callback(void (*callback)(void)) {
     wkup_callback = callback;
 }
 
-void stm32_peripherals_rtc_set_wakeup_mode_seconds(uint32_t seconds) {
-    // prep stuff from CubeMX
-    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
-    __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(&hrtc, RTC_FLAG_WUTF);
-
-    HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, (rtc_clock_frequency / 16) * seconds, RTC_WAKEUPCLOCK_RTCCLK_DIV16);
-}
-
 void stm32_peripherals_rtc_set_wakeup_mode_tick(void) {
-    HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, (rtc_clock_frequency / 16) / TICK_DIVISOR, RTC_WAKEUPCLOCK_RTCCLK_DIV2);
+    // The timer counts RTCCLK / 2 and wakes every (counter + 1) counts.
+    uint32_t counter = (rtc_clock_frequency + TICKS_PER_SECOND) / (2 * TICKS_PER_SECOND) - 1;
+    HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, counter, RTC_WAKEUPCLOCK_RTCCLK_DIV2);
 }
 
 void stm32_peripherals_rtc_enable_wakeup_timer(void) {
@@ -154,9 +216,24 @@ void stm32_peripherals_rtc_disable_wakeup_timer(void) {
     HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
 }
 
+// A clear of the wakeup flag is lost if it comes less than 1.5 RTCCLK periods before the timer
+// sets the flag again, for example when a flash erase has held off the interrupt. The flag then
+// stays set, the EXTI line sees no new rising edge, and the tick stops. Call with interrupts
+// disabled: if that has happened, run the handler again so that it clears the flag.
+void stm32_peripherals_rtc_recover_wakeup(void) {
+    if (peripherals_wkup_on && __HAL_RTC_WAKEUPTIMER_GET_FLAG(&hrtc, RTC_FLAG_WUTF) &&
+        !__HAL_RTC_WAKEUPTIMER_EXTI_GET_FLAG()) {
+        NVIC_SetPendingIRQ(RTC_WKUP_IRQn);
+    }
+}
+
 void stm32_peripherals_rtc_reset_alarms(void) {
     HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_A);
     HAL_RTC_DeactivateAlarm(&hrtc, RTC_ALARM_B);
+}
+
+void stm32_peripherals_rtc_cancel_alarm(uint8_t alarm_idx) {
+    HAL_RTC_DeactivateAlarm(&hrtc, (alarm_idx == PERIPHERALS_ALARM_A) ? RTC_ALARM_A : RTC_ALARM_B);
 }
 
 void stm32_peripherals_rtc_assign_alarm_callback(uint8_t alarm_idx, void (*callback)(void)) {
@@ -164,12 +241,21 @@ void stm32_peripherals_rtc_assign_alarm_callback(uint8_t alarm_idx, void (*callb
 }
 
 void stm32_peripherals_rtc_set_alarm(uint8_t alarm_idx, uint32_t ticks) {
-    uint64_t raw_ticks = stm32_peripherals_rtc_raw_ticks(NULL) + ticks;
+    // Count from the current subtick, not from the start of the current tick, which would make
+    // the alarm up to a tick early.
+    uint8_t subticks;
+    uint64_t target = (stm32_peripherals_rtc_raw_ticks(&subticks) + ticks) * SUBTICKS_PER_TICK + subticks;
+    // The first subsecond count at which stm32_peripherals_rtc_raw_ticks() reaches the target:
+    // the inverse of its scaling, rounded up. Both factors of the product are at most 32768, so it
+    // is below 2^30. Rounding up can give a whole second, so add it to the seconds before splitting.
+    uint32_t subticks_in_second = target % SUBTICKS_PER_SECOND;
+    uint64_t count = (target / SUBTICKS_PER_SECOND) * rtc_clock_frequency +
+        (subticks_in_second * rtc_clock_frequency + SUBTICKS_PER_SECOND - 1) / SUBTICKS_PER_SECOND;
 
     RTC_AlarmTypeDef alarm;
-    if (ticks > TICK_DIVISOR) {
+    if (ticks > TICKS_PER_SECOND) {
         timeutils_struct_time_t tm;
-        timeutils_seconds_since_2000_to_struct_time(raw_ticks / TICK_DIVISOR, &tm);
+        timeutils_seconds_since_2000_to_struct_time(count / rtc_clock_frequency, &tm);
         alarm.AlarmTime.Hours = tm.tm_hour;
         alarm.AlarmTime.Minutes = tm.tm_min;
         alarm.AlarmTime.Seconds = tm.tm_sec;
@@ -182,18 +268,25 @@ void stm32_peripherals_rtc_set_alarm(uint8_t alarm_idx, uint32_t ticks) {
         alarm.AlarmMask = RTC_ALARMMASK_ALL;
     }
 
-    alarm.AlarmTime.SubSeconds = rtc_clock_frequency - 1 -
-        ((raw_ticks % TICK_DIVISOR) * 32);
+    alarm.AlarmTime.SubSeconds = rtc_clock_frequency - 1 - count % rtc_clock_frequency;
     alarm.AlarmTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
     alarm.AlarmTime.StoreOperation = RTC_STOREOPERATION_SET;
     // Masking here means that the bits are ignored so we set none of them.
     alarm.AlarmSubSecondMask = RTC_ALARMSUBSECONDMASK_NONE;
     alarm.AlarmDateWeekDaySel = RTC_ALARMDATEWEEKDAYSEL_DATE;
     alarm.Alarm = (alarm_idx == PERIPHERALS_ALARM_A) ? RTC_ALARM_A : RTC_ALARM_B;
-
     HAL_RTC_SetAlarm_IT(&hrtc, &alarm, RTC_FORMAT_BIN);
     HAL_NVIC_EnableIRQ(RTC_Alarm_IRQn);
     alarmed_already[alarm_idx] = false;
+    // The alarm matches only its exact subsecond count, and arming it takes a few RTC periods.
+    // If the target is less than a quarter tick away (or past), act as if the alarm had fired.
+    uint64_t now = stm32_peripherals_rtc_raw_ticks(&subticks);
+    if (now * SUBTICKS_PER_TICK + subticks + SUBTICKS_PER_TICK / 4 >= target) {
+        if (alarm_callbacks[alarm_idx]) {
+            alarm_callbacks[alarm_idx]();
+        }
+        alarmed_already[alarm_idx] = true;
+    }
 }
 
 bool stm32_peripherals_rtc_alarm_triggered(uint8_t alarm_idx) {

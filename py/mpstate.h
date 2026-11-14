@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2014 Damien P. George
+ * Copyright (c) 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -36,18 +36,53 @@
 #include "py/objlist.h"
 #include "py/objexcept.h"
 
+// CIRCUITPY-CHANGE
+#if CIRCUITPY_WARNINGS
+#include "shared-bindings/warnings/__init__.h"
+#endif
+
+// #if CIRCUITPY
+// #error CIRCUITPY is TRUE in mpstate.h.
+// #else
+// #error CIRCUITPY is **FALSE** in mpstate.h
+// #endif
+
 // This file contains structures defining the state of the MicroPython
 // memory system, runtime and virtual machine.  The state is a global
 // variable, but in the future it is hoped that the state can become local.
 
+#if MICROPY_PY_SYS_ATTR_DELEGATION
+// Must be kept in sync with sys_mutable_keys in modsys.c.
+enum {
+    #if MICROPY_PY_SYS_PATH
+    MP_SYS_MUTABLE_PATH,
+    #endif
+    #if MICROPY_PY_SYS_PS1_PS2
+    MP_SYS_MUTABLE_PS1,
+    MP_SYS_MUTABLE_PS2,
+    #endif
+    #if MICROPY_PY_SYS_TRACEBACKLIMIT
+    MP_SYS_MUTABLE_TRACEBACKLIMIT,
+    #endif
+    MP_SYS_MUTABLE_NUM,
+};
+#endif // MICROPY_PY_SYS_ATTR_DELEGATION
+
 // This structure contains dynamic configuration for the compiler.
 #if MICROPY_DYNAMIC_COMPILER
 typedef struct mp_dynamic_compiler_t {
+    // This is used to let mpy-cross pass options to the emitter chosen with
+    // `native_arch`.  The main use case for the time being is to give the
+    // RV32 emitter extended information about which extensions can be
+    // optionally used, in order to generate code that's better suited for the
+    // hardware platform the code will run on.
+    void *backend_options;
     uint8_t small_int_bits; // must be <= host small_int_bits
-    bool opt_cache_map_lookup_in_bytecode;
-    bool py_builtins_str_unicode;
     uint8_t native_arch;
     uint8_t nlr_buf_num_regs;
+    #if MICROPY_ENABLE_SOURCE_LINE
+    bool include_source_lines;
+    #endif
 } mp_dynamic_compiler_t;
 extern mp_dynamic_compiler_t mp_dynamic_compiler;
 #endif
@@ -62,6 +97,44 @@ typedef struct _mp_sched_item_t {
     mp_obj_t arg;
 } mp_sched_item_t;
 
+// gc_lock_depth field is a combination of the GC_COLLECT_FLAG
+// bit and a lock depth shifted GC_LOCK_DEPTH_SHIFT bits left.
+#if MICROPY_ENABLE_FINALISER
+#define GC_COLLECT_FLAG 1
+#define GC_LOCK_DEPTH_SHIFT 1
+#else
+// If finalisers are disabled then this check doesn't matter, as gc_lock()
+// is called anywhere else that heap can't be changed. So save some code size.
+#define GC_COLLECT_FLAG 0
+#define GC_LOCK_DEPTH_SHIFT 0
+#endif
+
+// This structure holds information about a single contiguous area of
+// memory reserved for the memory manager.
+typedef struct _mp_state_mem_area_t {
+    #if MICROPY_GC_SPLIT_HEAP
+    struct _mp_state_mem_area_t *next;
+    #endif
+
+    byte *gc_alloc_table_start;
+    size_t gc_alloc_table_byte_len;
+    #if MICROPY_ENABLE_FINALISER
+    byte *gc_finaliser_table_start;
+    #endif
+    // CIRCUITPY-CHANGE
+    #if MICROPY_ENABLE_SELECTIVE_COLLECT
+    byte *gc_collect_table_start;
+    #endif
+    #if MICROPY_PY_WEAKREF
+    byte *gc_weakref_table_start;
+    #endif
+    byte *gc_pool_start;
+    byte *gc_pool_end;
+
+    size_t gc_last_free_atb_index;
+    size_t gc_last_used_block; // The block ID of the highest block allocated in the area
+} mp_state_mem_area_t;
+
 // This structure hold information about the memory allocation system.
 typedef struct _mp_state_mem_t {
     #if MICROPY_MEM_STATS
@@ -70,31 +143,32 @@ typedef struct _mp_state_mem_t {
     size_t peak_bytes_allocated;
     #endif
 
-    byte *gc_alloc_table_start;
-    size_t gc_alloc_table_byte_len;
-    #if MICROPY_ENABLE_FINALISER
-    byte *gc_finaliser_table_start;
+    mp_state_mem_area_t area;
+    #if MICROPY_GC_SPLIT_HEAP
+    byte *area_pool_min;  // Min of all gc_pool_start values across all areas
+    byte *area_pool_max;  // Max of all gc_pool_end values across all areas
     #endif
-    byte *gc_pool_start;
-    byte *gc_pool_end;
-
-    void *gc_lowest_long_lived_ptr;
 
     int gc_stack_overflow;
-    MICROPY_GC_STACK_ENTRY_TYPE gc_stack[MICROPY_ALLOC_GC_STACK_SIZE];
+    MICROPY_GC_STACK_ENTRY_TYPE gc_block_stack[MICROPY_ALLOC_GC_STACK_SIZE];
+    #if MICROPY_GC_SPLIT_HEAP
+    // Array that tracks the area for each block on gc_block_stack.
+    mp_state_mem_area_t *gc_area_stack[MICROPY_ALLOC_GC_STACK_SIZE];
+    #endif
 
-    // This variable controls auto garbage collection.  If set to false then the
+    // This variable controls auto garbage collection.  If set to 0 then the
     // GC won't automatically run when gc_alloc can't find enough blocks.  But
     // you can still allocate/free memory and also explicitly call gc_collect.
-    bool gc_auto_collect_enabled;
+    uint16_t gc_auto_collect_enabled;
 
     #if MICROPY_GC_ALLOC_THRESHOLD
     size_t gc_alloc_amount;
     size_t gc_alloc_threshold;
     #endif
 
-    size_t gc_first_free_atb_index[MICROPY_ATB_INDICES];
-    size_t gc_last_free_atb_index;
+    #if MICROPY_GC_SPLIT_HEAP
+    mp_state_mem_area_t *gc_last_free_area;
+    #endif
 
     #if MICROPY_PY_GC_COLLECT_RETVAL
     size_t gc_collected;
@@ -102,10 +176,8 @@ typedef struct _mp_state_mem_t {
 
     #if MICROPY_PY_THREAD && !MICROPY_PY_THREAD_GIL
     // This is a global mutex used to make the GC thread-safe.
-    mp_thread_mutex_t gc_mutex;
+    mp_thread_recursive_mutex_t gc_mutex;
     #endif
-
-    void **permanent_pointers;
 } mp_state_mem_t;
 
 // This structure hold runtime and VM information.  It includes a section
@@ -120,6 +192,11 @@ typedef struct _mp_state_vm_t {
 
     qstr_pool_t *last_pool;
 
+    #if MICROPY_TRACKED_ALLOC
+    struct _m_tracked_node_t *m_tracked_head;
+    #endif
+
+    // CIRCUITPY-CHANGE: trackback
     // non-heap memory for creating a traceback if we can't allocate RAM
     mp_obj_traceback_t mp_emergency_traceback_obj;
 
@@ -142,55 +219,26 @@ typedef struct _mp_state_vm_t {
     mp_obj_exception_t mp_kbd_exception;
     #endif
 
+    // CIRCUITPY-CHANGE
     // exception object of type ReloadException
     mp_obj_exception_t mp_reload_exception;
 
     // dictionary with loaded modules (may be exposed as sys.modules)
     mp_obj_dict_t mp_loaded_modules_dict;
 
-    #if MICROPY_ENABLE_SCHEDULER
-    mp_sched_item_t sched_queue[MICROPY_SCHEDULER_DEPTH];
-    #endif
-
-    // current exception being handled, for sys.exc_info()
-    #if MICROPY_PY_SYS_EXC_INFO
-    mp_obj_base_t *cur_exception;
-    #endif
-
-    #if MICROPY_PY_SYS_ATEXIT
-    // exposed through sys.atexit function
-    mp_obj_t sys_exitfunc;
-    #endif
-
     // dictionary for the __main__ module
     mp_obj_dict_t dict_main;
-
-    // these two lists must be initialised per port, after the call to mp_init
-    mp_obj_list_t mp_sys_path_obj;
-    mp_obj_list_t mp_sys_argv_obj;
 
     // dictionary for overridden builtins
     #if MICROPY_CAN_OVERRIDE_BUILTINS
     mp_obj_dict_t *mp_module_builtins_override_dict;
     #endif
 
-    #if MICROPY_PERSISTENT_CODE_TRACK_RELOC_CODE
-    // An mp_obj_list_t that tracks relocated native code to prevent the GC from reclaiming them.
-    mp_obj_t track_reloc_code_list;
-    #endif
-
-    // include any root pointers defined by a port
-    MICROPY_PORT_ROOT_POINTERS
-
-    // root pointers for extmod
-
-    #if MICROPY_REPL_EVENT_DRIVEN
-    vstr_t *repl_line;
-    #endif
-
-    #if MICROPY_VFS
-    struct _mp_vfs_mount_t *vfs_cur;
-    struct _mp_vfs_mount_t *vfs_mount_table;
+    // Include any root pointers registered with MP_REGISTER_ROOT_POINTER().
+    #ifndef NO_QSTR
+    // Only include root pointer definitions when not doing qstr extraction, because
+    // the qstr extraction stage also generates the root pointers header file.
+    #include "genhdr/root_pointers.h"
     #endif
 
     //
@@ -213,6 +261,9 @@ typedef struct _mp_state_vm_t {
     #if MICROPY_EMIT_NATIVE
     uint8_t default_emit_opt; // one of MP_EMIT_OPT_xxx
     #endif
+    #if MICROPY_DEBUG_PRINTERS
+    mp_uint_t mp_verbose_flag;
+    #endif
     #endif
 
     // size of the emergency exception buf, if it's dynamically allocated
@@ -222,22 +273,45 @@ typedef struct _mp_state_vm_t {
 
     #if MICROPY_ENABLE_SCHEDULER
     volatile int16_t sched_state;
+
+    #if MICROPY_SCHEDULER_STATIC_NODES
+    // These will usually point to statically allocated memory.  They are not
+    // traced by the GC.  They are assumed to be zero'd out before mp_init() is
+    // called (usually because this struct lives in the BSS).
+    struct _mp_sched_node_t *sched_head;
+    struct _mp_sched_node_t *sched_tail;
+    #endif
+
+    // These index sched_queue.
     uint8_t sched_len;
     uint8_t sched_idx;
+    #endif
+
+    #if MICROPY_ENABLE_VM_ABORT
+    bool vm_abort;
+    nlr_buf_t *nlr_abort;
     #endif
 
     #if MICROPY_PY_THREAD_GIL
     // This is a global mutex used to make the VM/runtime thread-safe.
     mp_thread_mutex_t gil_mutex;
     #endif
+
+    #if MICROPY_OPT_MAP_LOOKUP_CACHE
+    // See mp_map_lookup.
+    uint8_t map_lookup_cache[MICROPY_OPT_MAP_LOOKUP_CACHE_SIZE];
+    #endif
 } mp_state_vm_t;
 
-// This structure holds state that is specific to a given thread.
-// Everything in this structure is scanned for root pointers.
+// This structure holds state that is specific to a given thread. Everything
+// in this structure is scanned for root pointers.  Anything added to this
+// structure must have corresponding initialisation added to thread_entry (in
+// py/modthread.c).
 typedef struct _mp_state_thread_t {
     // Stack top at the start of program
     char *stack_top;
 
+    // CIRCUITPY-CHANGE
     #if MICROPY_MAX_STACK_USAGE
     char *stack_bottom;
     #endif
@@ -253,6 +327,7 @@ typedef struct _mp_state_thread_t {
     #endif
 
     // Locking of the GC is done per thread.
+    // See GC_LOCK_DEPTH_SHIFT for an explanation of this field.
     uint16_t gc_lock_depth;
 
     ////////////////////////////////////////////////////////////
@@ -265,6 +340,7 @@ typedef struct _mp_state_thread_t {
     mp_obj_dict_t *dict_globals;
 
     nlr_buf_t *nlr_top;
+    nlr_jump_callback_node_t *nlr_jump_callback_top;
 
     // pending exception object (MP_OBJ_NULL if not pending)
     volatile mp_obj_t mp_pending_exception;
@@ -276,6 +352,15 @@ typedef struct _mp_state_thread_t {
     mp_obj_t prof_trace_callback;
     bool prof_callback_is_executing;
     struct _mp_code_state_t *current_code_state;
+    #endif
+
+    #if MICROPY_PY_SSL_MBEDTLS_NEED_ACTIVE_CONTEXT
+    struct _mp_obj_ssl_context_t *tls_ssl_context;
+    #endif
+
+    // CIRCUITPY-CHANGE
+    #if CIRCUITPY_WARNINGS
+    warnings_action_t warnings_action;
     #endif
 } mp_state_thread_t;
 
@@ -294,10 +379,16 @@ extern mp_state_ctx_t mp_state_ctx;
 #define MP_STATE_MAIN_THREAD(x) (mp_state_ctx.thread.x)
 
 #if MICROPY_PY_THREAD
+// CIRCUITPY-CHANGE: explicit declaration
 extern mp_state_thread_t *mp_thread_get_state(void);
 #define MP_STATE_THREAD(x) (mp_thread_get_state()->x)
+#define mp_thread_is_main_thread() (mp_thread_get_state() == &mp_state_ctx.thread)
 #else
 #define MP_STATE_THREAD(x)  MP_STATE_MAIN_THREAD(x)
+#define mp_thread_is_main_thread() (true)
 #endif
+
+// CIRCUITPY-CHANGE: defined in main.c
+bool vm_is_running(void);
 
 #endif // MICROPY_INCLUDED_PY_MPSTATE_H

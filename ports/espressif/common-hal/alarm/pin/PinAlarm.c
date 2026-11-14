@@ -1,51 +1,37 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 Dan Halbert for Adafruit Industries
- * Copyright (c) 2020 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Dan Halbert for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2020 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "py/runtime.h"
+#include "supervisor/port.h"
 
-#include "supervisor/esp_port.h"
+#include "common-hal/alarm/__init__.h"
 #include "shared-bindings/alarm/pin/PinAlarm.h"
-#include "shared-bindings/microcontroller/Pin.h"
 #include "shared-bindings/microcontroller/__init__.h"
 
 #include "esp_sleep.h"
 #include "hal/gpio_ll.h"
+#include "driver/gpio.h"
 #include "esp_debug_helpers.h"
 
-#include "components/driver/include/driver/rtc_io.h"
-#include "components/freertos/include/freertos/FreeRTOS.h"
+#ifdef SOC_PM_SUPPORT_EXT0_WAKEUP
+#include "soc/rtc_cntl_reg.h"
+#include "soc/rtc_io_reg.h"
+#endif
+
+#include "driver/rtc_io.h"
+#include "freertos/FreeRTOS.h"
 
 void common_hal_alarm_pin_pinalarm_construct(alarm_pin_pinalarm_obj_t *self, const mcu_pin_obj_t *pin, bool value, bool edge, bool pull) {
     if (edge) {
-        mp_raise_ValueError(translate("Cannot wake on pin edge. Only level."));
+        mp_raise_ValueError(MP_ERROR_TEXT("Cannot wake on pin edge. Only level."));
     }
 
     if (pull && !GPIO_IS_VALID_OUTPUT_GPIO(pin->number)) {
-        mp_raise_ValueError(translate("Cannot pull on input-only pin."));
+        mp_raise_ValueError(MP_ERROR_TEXT("Cannot pull on input-only pin."));
     }
     self->pin = pin;
     self->value = value;
@@ -72,13 +58,15 @@ gpio_isr_handle_t gpio_interrupt_handle;
 // Low and high are relative to pin number. 32+ is high. <32 is low.
 static volatile uint32_t pin_31_0_status = 0;
 static volatile uint32_t pin_63_32_status = 0;
-STATIC void gpio_interrupt(void *arg) {
+static void gpio_interrupt(void *arg) {
     (void)arg;
 
     gpio_ll_get_intr_status(&GPIO, xPortGetCoreID(), (uint32_t *)&pin_31_0_status);
     gpio_ll_clear_intr_status(&GPIO, pin_31_0_status);
+    #if SOC_GPIO_PIN_COUNT > 32
     gpio_ll_get_intr_status_high(&GPIO, xPortGetCoreID(), (uint32_t *)&pin_63_32_status);
     gpio_ll_clear_intr_status_high(&GPIO, pin_63_32_status);
+    #endif
 
     // disable the interrupts that fired, maybe all of them
     for (size_t i = 0; i < 32; i++) {
@@ -86,15 +74,13 @@ STATIC void gpio_interrupt(void *arg) {
         if ((pin_31_0_status & mask) != 0) {
             gpio_ll_intr_disable(&GPIO, i);
         }
+        #if SOC_GPIO_PIN_COUNT > 32
         if ((pin_63_32_status & mask) != 0) {
             gpio_ll_intr_disable(&GPIO, 32 + i);
         }
+        #endif
     }
-    BaseType_t high_task_wakeup;
-    vTaskNotifyGiveFromISR(circuitpython_task, &high_task_wakeup);
-    if (high_task_wakeup) {
-        portYIELD_FROM_ISR();
-    }
+    port_wake_main_task_from_isr();
 }
 
 bool alarm_pin_pinalarm_woke_this_cycle(void) {
@@ -115,31 +101,53 @@ mp_obj_t alarm_pin_pinalarm_find_triggered_alarm(size_t n_alarms, const mp_obj_t
     return mp_const_none;
 }
 
-mp_obj_t alarm_pin_pinalarm_create_wakeup_alarm(void) {
-    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+mp_obj_t alarm_pin_pinalarm_record_wake_alarm(void) {
+    uint32_t causes = esp_sleep_get_wakeup_causes();
 
     // Pin status will persist into a fake deep sleep
     uint64_t pin_status = ((uint64_t)pin_63_32_status) << 32 | pin_31_0_status;
     size_t pin_number = 64;
 
-    if (cause == ESP_SLEEP_WAKEUP_EXT0) {
-        pin_number = REG_GET_FIELD(RTC_IO_EXT_WAKEUP0_REG, RTC_IO_EXT_WAKEUP0_SEL);
-    } else {
-        if (cause == ESP_SLEEP_WAKEUP_EXT1) {
-            pin_status = esp_sleep_get_ext1_wakeup_status();
-        }
-        // If the cause is GPIO, we've already snagged pin_status in the interrupt.
-        // We'll only get here if we pretended to deep sleep. Light sleep will
-        // pass in existing objects.
-        for (size_t i = 0; i < 64; i++) {
-            if ((pin_status & (1ull << i)) != 0) {
-                pin_number = i;
+    #ifdef SOC_PM_SUPPORT_EXT0_WAKEUP
+    if (causes & (1 << ESP_SLEEP_WAKEUP_EXT0)) {
+        int rtc_io_pin_number = REG_GET_FIELD(RTC_IO_EXT_WAKEUP0_REG, RTC_IO_EXT_WAKEUP0_SEL);
+        // Look up the GPIO equivalent pin for this RTC GPIO pin. On ESP32, the numbering
+        // is different for RTC_GPIO and regular GPIO, and there's no mapping table.
+        // The RTC and GPIO pin numbers match for all other current chips, so we could skip this
+        // for those chips, but it's not expensive, and maybe there will be another mismatch in the future.
+        for (gpio_num_t gpio_num = 0; gpio_num < SOC_GPIO_PIN_COUNT; gpio_num++) {
+            if (rtc_io_number_get(gpio_num) == rtc_io_pin_number) {
+                pin_number = gpio_num;
                 break;
             }
         }
+    } else {
+    #endif
+    #ifdef SOC_PM_SUPPORT_EXT1_WAKEUP
+    if (causes & (1 << ESP_SLEEP_WAKEUP_EXT1)) {
+        pin_status = esp_sleep_get_ext1_wakeup_status();
     }
+    #endif
+    #ifdef SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP
+    if (causes & (1 << ESP_SLEEP_WAKEUP_GPIO)) {
+        pin_status = esp_sleep_get_gpio_wakeup_status();
+    }
+    #endif
+    // If the cause is GPIO, we've already snagged pin_status in the interrupt.
+    // We'll only get here if we pretended to deep sleep. Light sleep will
+    // pass in existing objects.
+    for (size_t i = 0; i < 64; i++) {
+        if ((pin_status & (1ull << i)) != 0) {
+            pin_number = i;
+            break;
+        }
+    }
+    #ifdef SOC_PM_SUPPORT_EXT0_WAKEUP
+}
+    #endif
 
-    alarm_pin_pinalarm_obj_t *alarm = m_new_obj(alarm_pin_pinalarm_obj_t);
+    alarm_pin_pinalarm_obj_t *const alarm = &alarm_wake_alarm.pin_alarm;
+
     alarm->base.type = &alarm_pin_pinalarm_type;
     alarm->pin = NULL;
     // Map the pin number back to a pin object.
@@ -180,6 +188,135 @@ void alarm_pin_pinalarm_reset(void) {
     pin_31_0_status = 0;
 }
 
+#if defined(SOC_PM_SUPPORT_EXT1_WAKEUP) && !defined(SOC_PM_SUPPORT_EXT0_WAKEUP)
+static esp_err_t _setup_ext1(size_t low_count, size_t high_count) {
+    esp_err_t result;
+    if (low_count > 0) {
+        result = esp_sleep_enable_ext1_wakeup_io(low_alarms, ESP_EXT1_WAKEUP_ANY_LOW);
+        if (result != ESP_OK) {
+            return result;
+        }
+    }
+    if (high_count > 0) {
+        result = esp_sleep_enable_ext1_wakeup_io(high_alarms, ESP_EXT1_WAKEUP_ANY_HIGH);
+        if (result != ESP_OK) {
+            return result;
+        }
+    }
+
+    #ifdef SOC_PM_SUPPORT_RTC_PERIPH_PD
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    #endif
+    return ESP_OK;
+}
+#endif
+
+// How to wake from deep sleep by a pin varies a lot across the ESP line and isn't hidden behind
+// the IDF API. So we change our _setup_deep_sleep() implementation based on what the ESP SoC can
+// do.
+#ifdef CONFIG_IDF_TARGET_ESP32
+static esp_err_t _setup_deep_sleep(size_t low_count, size_t high_count) {
+    if (low_count > 2 && high_count == 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Can only alarm on two low pins from deep sleep."));
+    }
+    if (low_count > 1 && high_count > 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Can only alarm on one low pin while others alarm high from deep sleep."));
+    }
+    esp_err_t result;
+    if (high_count > 0) {
+        result = esp_sleep_enable_ext1_wakeup_io(high_alarms, ESP_EXT1_WAKEUP_ANY_HIGH);
+        if (result != ESP_OK) {
+            return result;
+        }
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    }
+    size_t low_pins[2];
+    size_t j = 0;
+    for (size_t i = 0; i < 64; i++) {
+        uint64_t mask = 1ull << i;
+        if ((low_alarms & mask) != 0) {
+            low_pins[j++] = i;
+        }
+        if (j == 2) {
+            break;
+        }
+    }
+    if (low_count > 1) {
+        if (esp_sleep_enable_ext1_wakeup_io(1ull << low_pins[1], ESP_EXT1_WAKEUP_ALL_LOW) != ESP_OK) {
+            mp_raise_ValueError(MP_ERROR_TEXT("Can only alarm on RTC IO from deep sleep."));
+        }
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    }
+    if (low_count > 0) {
+        #ifdef SOC_PM_SUPPORT_EXT0_WAKEUP
+        if (esp_sleep_enable_ext0_wakeup(low_pins[0], 0) != ESP_OK) {
+            mp_raise_ValueError(MP_ERROR_TEXT("Can only alarm on RTC IO from deep sleep."));
+        }
+        #endif
+    }
+    return ESP_OK;
+}
+#elif defined(SOC_PM_SUPPORT_EXT0_WAKEUP) // S2 and S3
+static esp_err_t _setup_deep_sleep(size_t low_count, size_t high_count) {
+    if (low_count > 1 && high_count > 1) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Can only alarm on one low pin while others alarm high from deep sleep."));
+    }
+    uint64_t ext1_pin_mask;
+    esp_sleep_ext1_wakeup_mode_t ext1_mode;
+
+    esp_err_t result;
+    // Only use EXT0 if we need to trigger both directions.
+    if (low_count > 0 && high_count > 0) {
+        size_t ext0_pin_number;
+        size_t level;
+        if (low_count == 1) {
+            ext0_pin_number = __builtin_ctzll(low_alarms);
+            level = 0;
+            ext1_pin_mask = high_alarms;
+            ext1_mode = ESP_EXT1_WAKEUP_ANY_HIGH;
+        } else {
+            ext0_pin_number = __builtin_ctzll(high_alarms);
+            level = 1;
+            ext1_pin_mask = low_alarms;
+            ext1_mode = ESP_EXT1_WAKEUP_ANY_LOW;
+        }
+        result = esp_sleep_enable_ext0_wakeup(ext0_pin_number, level);
+        if (result != ESP_OK) {
+            return result;
+        }
+    } else if (low_count > 0) {
+        ext1_pin_mask = low_alarms;
+        ext1_mode = ESP_EXT1_WAKEUP_ANY_LOW;
+    } else {
+        ext1_pin_mask = high_alarms;
+        ext1_mode = ESP_EXT1_WAKEUP_ANY_HIGH;
+    }
+
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    return esp_sleep_enable_ext1_wakeup_io(ext1_pin_mask, ext1_mode);
+}
+#elif defined(SOC_PM_SUPPORT_EXT1_WAKEUP) && defined(SOC_PM_SUPPORT_EXT1_WAKEUP_MODE_PER_PIN)
+static esp_err_t _setup_deep_sleep(size_t low_count, size_t high_count) {
+    return _setup_ext1(low_count, high_count);
+}
+#elif defined(SOC_GPIO_SUPPORT_DEEPSLEEP_WAKEUP)
+static esp_err_t _setup_deep_sleep(size_t low_count, size_t high_count) {
+    #ifdef SOC_PM_SUPPORT_EXT1_WAKEUP
+    // Don't turn on RTC GPIO if we can use EXT1.
+    if (low_count == 0 || high_count == 0) {
+        return _setup_ext1(low_count, high_count);
+    }
+    #endif
+    esp_err_t result = esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(low_alarms, ESP_GPIO_WAKEUP_GPIO_LOW);
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(high_alarms, ESP_GPIO_WAKEUP_GPIO_HIGH);
+    return result;
+}
+#else
+#error "Unsupported deep sleep capabilities."
+#endif
 void alarm_pin_pinalarm_set_alarms(bool deep_sleep, size_t n_alarms, const mp_obj_t *alarms) {
     // Bitmask of wake up settings.
     size_t high_count = 0;
@@ -207,39 +344,10 @@ void alarm_pin_pinalarm_set_alarms(bool deep_sleep, size_t n_alarms, const mp_ob
     if (high_count == 0 && low_count == 0) {
         return;
     }
-    if (deep_sleep && low_count > 2 && high_count == 0) {
-        mp_raise_ValueError(translate("Can only alarm on two low pins from deep sleep."));
-    }
-    if (deep_sleep && low_count > 1 && high_count > 0) {
-        mp_raise_ValueError(translate("Can only alarm on one low pin while others alarm high from deep sleep."));
-    }
     // Only use ext0 and ext1 during deep sleep.
     if (deep_sleep) {
-        if (high_count > 0) {
-            if (esp_sleep_enable_ext1_wakeup(high_alarms, ESP_EXT1_WAKEUP_ANY_HIGH) != ESP_OK) {
-                mp_raise_ValueError(translate("Can only alarm on RTC IO from deep sleep."));
-            }
-        }
-        size_t low_pins[2];
-        size_t j = 0;
-        for (size_t i = 0; i < 64; i++) {
-            uint64_t mask = 1ull << i;
-            if ((low_alarms & mask) != 0) {
-                low_pins[j++] = i;
-            }
-            if (j == 2) {
-                break;
-            }
-        }
-        if (low_count > 1) {
-            if (esp_sleep_enable_ext1_wakeup(1ull << low_pins[1], ESP_EXT1_WAKEUP_ALL_LOW) != ESP_OK) {
-                mp_raise_ValueError(translate("Can only alarm on RTC IO from deep sleep."));
-            }
-        }
-        if (low_count > 0) {
-            if (esp_sleep_enable_ext0_wakeup(low_pins[0], 0) != ESP_OK) {
-                mp_raise_ValueError(translate("Can only alarm on RTC IO from deep sleep."));
-            }
+        if (_setup_deep_sleep(low_count, high_count) != ESP_OK) {
+            mp_raise_ValueError(MP_ERROR_TEXT("Can only alarm on RTC IO from deep sleep."));
         }
     } else {
         // Enable GPIO wake up if we're sleeping.
@@ -250,43 +358,44 @@ void alarm_pin_pinalarm_set_alarms(bool deep_sleep, size_t n_alarms, const mp_ob
     pin_31_0_status = 0;
     pin_63_32_status = 0;
     if (gpio_isr_register(gpio_interrupt, NULL, 0, &gpio_interrupt_handle) != ESP_OK) {
-        mp_raise_ValueError(translate("Can only alarm on RTC IO from deep sleep."));
+        mp_raise_ValueError(MP_ERROR_TEXT("Can only alarm on RTC IO from deep sleep."));
     }
-    for (size_t i = 0; i < 64; i++) {
-        uint64_t mask = 1ull << i;
+    for (gpio_num_t pin = 0; pin < SOC_GPIO_PIN_COUNT; pin++) {
+        uint64_t mask = 1ULL << pin;
         bool high = (high_alarms & mask) != 0;
         bool low = (low_alarms & mask) != 0;
         bool pull = (pull_pins & mask) != 0;
         if (!(high || low)) {
             continue;
         }
-        if (rtc_gpio_is_valid_gpio(i)) {
-            rtc_gpio_deinit(i);
+        if (rtc_gpio_is_valid_gpio(pin)) {
+            #ifdef SOC_PM_SUPPORT_RTC_PERIPH_PD
+            rtc_gpio_deinit(pin);
+            #endif
         }
-        gpio_int_type_t interrupt_mode = GPIO_INTR_DISABLE;
-        gpio_pull_mode_t pull_mode = GPIO_FLOATING;
+        gpio_set_direction(pin, GPIO_MODE_INPUT);
+        if (pull) {
+            if (high) {
+                ESP_ERROR_CHECK(gpio_set_pull_mode(pin, GPIO_PULLDOWN_ONLY));
+            } else {
+                ESP_ERROR_CHECK(gpio_set_pull_mode(pin, GPIO_PULLUP_ONLY));
+            }
+        } else {
+            ESP_ERROR_CHECK(gpio_set_pull_mode(pin, GPIO_FLOATING));
+        }
+        gpio_int_type_t intr = GPIO_INTR_DISABLE;
         if (high) {
-            interrupt_mode = GPIO_INTR_HIGH_LEVEL;
-            pull_mode = GPIO_PULLDOWN_ONLY;
+            intr = GPIO_INTR_HIGH_LEVEL;
         }
         if (low) {
-            interrupt_mode = GPIO_INTR_LOW_LEVEL;
-            pull_mode = GPIO_PULLUP_ONLY;
+            intr = GPIO_INTR_LOW_LEVEL;
         }
-        gpio_set_direction(i, GPIO_MODE_DEF_INPUT);
-        PIN_FUNC_SELECT(GPIO_PIN_MUX_REG[i], PIN_FUNC_GPIO);
-        if (pull) {
-            gpio_set_pull_mode(i, pull_mode);
-            size_t j = 0;
-            while (gpio_get_level(i) == false) {
-                j++;
-            }
-        }
-        never_reset_pin_number(i);
-        // Sets interrupt type and wakeup bits.
-        gpio_wakeup_enable(i, interrupt_mode);
-        gpio_intr_enable(i);
+        gpio_wakeup_enable(pin, intr);
+        gpio_set_intr_type(pin, intr);
+        gpio_intr_enable(pin);
     }
+    // Wait for any pulls to settle.
+    mp_hal_delay_ms(50);
 }
 
 
@@ -304,12 +413,22 @@ void alarm_pin_pinalarm_prepare_for_deep_sleep(void) {
         bool low = (low_alarms & mask) != 0;
         // The pull direction is opposite from alarm value.
         if (high) {
+            #ifdef SOC_PM_SUPPORT_RTC_PERIPH_PD
             rtc_gpio_pullup_dis(i);
             rtc_gpio_pulldown_en(i);
+            #else
+            gpio_pullup_dis(i);
+            gpio_pulldown_en(i);
+            #endif
         }
         if (low) {
+            #ifdef SOC_PM_SUPPORT_RTC_PERIPH_PD
             rtc_gpio_pullup_en(i);
             rtc_gpio_pulldown_dis(i);
+            #else
+            gpio_pullup_en(i);
+            gpio_pulldown_dis(i);
+            #endif
         }
     }
 }

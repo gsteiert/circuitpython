@@ -1,56 +1,227 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 microDev
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 microDev
+//
+// SPDX-License-Identifier: MIT
 
 #include "peripherals/touch.h"
 
-static bool touch_inited = false;
-static bool touch_never_reset = false;
+static touch_sensor_handle_t touch_controller = NULL;
+static touch_channel_handle_t touch_channels[TOUCH_TOTAL_CHAN_NUM] = {NULL};
+static bool touch_enabled = false;
+static bool touch_scanning = false;
+
+static int chan_index(int channel_id) {
+    return channel_id - TOUCH_MIN_CHAN_ID;
+}
+
+touch_sensor_handle_t peripherals_touch_get_controller(void) {
+    return touch_controller;
+}
+
+touch_channel_handle_t peripherals_touch_get_handle(int channel_id) {
+    return touch_channels[chan_index(channel_id)];
+}
+
+void peripherals_touch_deinit(const int channel_id) {
+    int idx = chan_index(channel_id);
+
+    if (touch_channels[idx] == NULL) {
+        return;
+    }
+
+    // ESP-IDF deletes channels only while the controller is disabled.
+    if (touch_scanning) {
+        touch_sensor_stop_continuous_scanning(touch_controller);
+        touch_scanning = false;
+    }
+    if (touch_enabled) {
+        touch_sensor_disable(touch_controller);
+        touch_enabled = false;
+    }
+
+    touch_sensor_del_channel(touch_channels[idx]);
+    touch_channels[idx] = NULL;
+
+    bool any_channel = false;
+    for (unsigned int i = 0; i < TOUCH_TOTAL_CHAN_NUM; i++) {
+        if (touch_channels[i] != NULL) {
+            any_channel = true;
+            break;
+        }
+    }
+
+    if (any_channel) {
+        // Resume scanning the remaining channels.
+        if (touch_sensor_enable(touch_controller) == ESP_OK) {
+            touch_enabled = true;
+            if (touch_sensor_start_continuous_scanning(touch_controller) == ESP_OK) {
+                touch_scanning = true;
+            }
+        }
+        return;
+    }
+
+    touch_sensor_del_controller(touch_controller);
+    touch_controller = NULL;
+}
 
 void peripherals_touch_reset(void) {
-    if (touch_inited && !touch_never_reset) {
-        touch_pad_deinit();
-        touch_inited = false;
+    if (touch_controller != NULL) {
+        if (touch_scanning) {
+            touch_sensor_stop_continuous_scanning(touch_controller);
+            touch_scanning = false;
+        }
+        if (touch_enabled) {
+            touch_sensor_disable(touch_controller);
+            touch_enabled = false;
+        }
+        for (unsigned int i = 0; i < TOUCH_TOTAL_CHAN_NUM; i++) {
+            if (touch_channels[i] != NULL) {
+                touch_sensor_del_channel(touch_channels[i]);
+                touch_channels[i] = NULL;
+            }
+        }
+        touch_sensor_del_controller(touch_controller);
+        touch_controller = NULL;
     }
 }
 
-void peripherals_touch_never_reset(const bool enable) {
-    touch_never_reset = enable;
+static esp_err_t first_error(esp_err_t first, esp_err_t second) {
+    return first != ESP_OK ? first : second;
 }
 
-void peripherals_touch_init(const touch_pad_t touchpad) {
-    if (!touch_inited) {
-        touch_pad_init();
-        touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER);
+esp_err_t peripherals_touch_init(const int channel_id) {
+    int idx = chan_index(channel_id);
+
+    // Already initialized this channel
+    if (touch_channels[idx] != NULL) {
+        return ESP_OK;
     }
-    // touch_pad_config() must be done before touch_pad_fsm_start() the first time.
-    // Otherwise the calibration is wrong and we get maximum raw values if there is
-    // a trace of any significant length on the pin.
-    touch_pad_config(touchpad);
-    if (!touch_inited) {
-        touch_pad_fsm_start();
-        touch_inited = true;
+
+    esp_err_t err;
+
+    // Stop scanning and disable before modifying channels
+    if (touch_scanning) {
+        err = touch_sensor_stop_continuous_scanning(touch_controller);
+        if (err != ESP_OK) {
+            return err;
+        }
+        touch_scanning = false;
     }
+    if (touch_enabled) {
+        err = touch_sensor_disable(touch_controller);
+        if (err != ESP_OK) {
+            return err;
+        }
+        touch_enabled = false;
+    }
+
+    if (touch_controller == NULL) {
+        #if SOC_TOUCH_SENSOR_VERSION == 1
+        touch_sensor_sample_config_t sample_cfg = TOUCH_SENSOR_V1_DEFAULT_SAMPLE_CONFIG(5.0, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_1V7);
+        #elif SOC_TOUCH_SENSOR_VERSION == 2
+        touch_sensor_sample_config_t sample_cfg = TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(500, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V2);
+        #elif SOC_TOUCH_SENSOR_VERSION == 3
+        touch_sensor_sample_config_t sample_cfg = TOUCH_SENSOR_V3_DEFAULT_SAMPLE_CONFIG2(3, 29, 8, 3);
+        #else
+        #error bad SOC_TOUCH_SENSOR_VERSION
+        #endif
+        touch_sensor_config_t sens_cfg = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(1, &sample_cfg);
+        err = touch_sensor_new_controller(&sens_cfg, &touch_controller);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    #if SOC_TOUCH_SENSOR_VERSION == 1
+    touch_channel_config_t chan_cfg = {
+        .abs_active_thresh = {1000},
+        .charge_speed = TOUCH_CHARGE_SPEED_7,
+        .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
+        .group = TOUCH_CHAN_TRIG_GROUP_BOTH,
+    };
+    #elif SOC_TOUCH_SENSOR_VERSION == 2
+    touch_channel_config_t chan_cfg = {
+        .active_thresh = {2000},
+        .charge_speed = TOUCH_CHARGE_SPEED_7,
+        .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
+    };
+    #elif SOC_TOUCH_SENSOR_VERSION == 3
+    // Values are similar to an ESP-IDF example: 1000, 2500, 5000.
+    touch_channel_config_t chan_cfg = {
+        .active_thresh = {1000, 2000, 5000},
+    };
+    #else
+    #error bad SOC_TOUCH_SENSOR_VERSION
+    #endif
+
+    // On failure, touch_channels[idx] is left NULL.
+    esp_err_t result = touch_sensor_new_channel(touch_controller, channel_id, &chan_cfg, &touch_channels[idx]);
+
+    // Enable and start continuous scanning, even if the new channel failed,
+    // so existing channels keep working. Return the first error.
+    err = touch_sensor_enable(touch_controller);
+    if (err != ESP_OK) {
+        return first_error(result, err);
+    }
+    touch_enabled = true;
+
+    #if SOC_TOUCH_SENSOR_VERSION >= 2
+    // On touch V2 and V3, a channel's data is invalid (reads >= 65535) until it has
+    // been measured, for example after a chip reset. TouchIn would then set its
+    // threshold from that invalid value. Scan a few times first, as the ESP-IDF
+    // touch_sens_basic example does.
+    for (int i = 0; i < 3; i++) {
+        err = touch_sensor_trigger_oneshot_scanning(touch_controller, 100);
+        if (err != ESP_OK) {
+            result = first_error(result, err);
+            break;
+        }
+    }
+    #endif
+
+    err = touch_sensor_start_continuous_scanning(touch_controller);
+    if (err != ESP_OK) {
+        return first_error(result, err);
+    }
+    touch_scanning = true;
+
+    return result;
+}
+
+uint16_t peripherals_touch_read(int channel_id) {
+    int idx = chan_index(channel_id);
+    if (touch_channels[idx] == NULL) {
+        return 0;
+    }
+
+    uint32_t touch_value = 0;
+
+    #if SOC_TOUCH_SENSOR_VERSION == 1
+    // ESP32 touch reads a lower value when touched.
+    // Flip the values to be consistent with TouchIn assumptions.
+    touch_channel_read_data(touch_channels[idx], TOUCH_CHAN_DATA_TYPE_RAW, &touch_value);
+    if (touch_value > UINT16_MAX) {
+        return 0;
+    }
+    return UINT16_MAX - (uint16_t)touch_value;
+
+    #elif SOC_TOUCH_SENSOR_VERSION == 2
+    touch_channel_read_data(touch_channels[idx], TOUCH_CHAN_DATA_TYPE_RAW, &touch_value);
+    if (touch_value > UINT16_MAX) {
+        return UINT16_MAX;
+    }
+    return (uint16_t)touch_value;
+
+    #elif SOC_TOUCH_SENSOR_VERSION == 3
+    touch_channel_read_data(touch_channels[idx], TOUCH_CHAN_DATA_TYPE_SMOOTH, &touch_value);
+    if (touch_value > UINT16_MAX) {
+        return UINT16_MAX;
+    }
+    return (uint16_t)touch_value;
+
+    #else
+    #error bad SOC_TOUCH_SENSOR_VERSION
+    #endif
 }

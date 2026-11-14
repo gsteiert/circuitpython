@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -43,6 +43,7 @@ char *prompt(char *p) {
     // simple read string
     static char buf[256];
     fputs(p, stdout);
+    fflush(stdout);
     char *s = fgets(buf, sizeof(buf), stdin);
     if (!s) {
         return NULL;
@@ -103,6 +104,9 @@ void prompt_write_history(void) {
     #if MICROPY_USE_READLINE == 1
     char *home = getenv("HOME");
     if (home != NULL) {
+        if (MP_STATE_THREAD(gc_lock_depth) != 0) {
+            return;
+        }
         vstr_t vstr;
         vstr_init(&vstr, 50);
         vstr_printf(&vstr, "%s/.micropython.history", home);

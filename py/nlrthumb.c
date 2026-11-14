@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013-2017 Damien P. George
+ * Copyright (c) 2013-2017 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,7 +26,7 @@
 
 #include "py/mpstate.h"
 
-#if defined(MICROPY_NLR_THUMB) && MICROPY_NLR_THUMB
+#if MICROPY_NLR_THUMB
 
 #undef nlr_push
 
@@ -38,6 +38,14 @@
 
 __attribute__((naked)) unsigned int nlr_push(nlr_buf_t *nlr) {
 
+    // If you get a linker error here, indicating that a relocation doesn't
+    // fit, try the following (in that order):
+    //
+    // 1. Ensure that nlr.o nlrthumb.o are linked closely together, i.e.
+    //    there aren't too many other files between them in the linker list
+    //    (PY_CORE_O_BASENAME in py/py.mk)
+    // 2. Set -DMICROPY_NLR_THUMB_USE_LONG_JUMP=1 during the build
+    //
     __asm volatile (
         "str    r4, [r0, #12]       \n" // store r4 into nlr_buf
         "str    r5, [r0, #16]       \n" // store r5 into nlr_buf
@@ -71,7 +79,7 @@ __attribute__((naked)) unsigned int nlr_push(nlr_buf_t *nlr) {
         "str    lr, [r0, #8]        \n" // store lr into nlr_buf
         #endif
 
-        #if !defined(__thumb2__)
+        #if MICROPY_NLR_THUMB_USE_LONG_JUMP
         "ldr    r1, nlr_push_tail_var \n"
         "bx     r1                  \n" // do the rest in C
         ".align 2                   \n"
@@ -83,6 +91,10 @@ __attribute__((naked)) unsigned int nlr_push(nlr_buf_t *nlr) {
         "b      nlr_push_tail       \n" // do the rest in C
         #endif
         #endif
+        // CIRCUITPY-CHANGE: add input and clobbers to prevent smashing registers.
+        :                               // output operands
+        : "r" (nlr)                     // input operands
+        : "r1", "r2", "r3"              // clobbers
         );
 
     #if !defined(__clang__) && defined(__GNUC__) && (__GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 8))
@@ -92,7 +104,7 @@ __attribute__((naked)) unsigned int nlr_push(nlr_buf_t *nlr) {
     #endif
 }
 
-NORETURN void nlr_jump(void *val) {
+MP_NORETURN void nlr_jump(void *val) {
     MP_NLR_JUMP_HEAD(val, top)
 
     __asm volatile (
@@ -132,7 +144,8 @@ NORETURN void nlr_jump(void *val) {
         "bx     lr                  \n" // return
         :                           // output operands
         : "r" (top)                 // input operands
-        :                           // clobbered registers
+        // CIRCUITPY-CHANGE: better comment
+        : "memory"                  // clobbers
         );
 
     MP_UNREACHABLE

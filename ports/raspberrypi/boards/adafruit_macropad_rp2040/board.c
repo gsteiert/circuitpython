@@ -1,40 +1,19 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/board/__init__.h"
-#include "shared-bindings/displayio/FourWire.h"
+#include "shared-bindings/fourwire/FourWire.h"
 #include "shared-module/displayio/__init__.h"
 #include "shared-module/displayio/mipi_constants.h"
 #include "shared-bindings/busio/SPI.h"
 #include "shared-bindings/microcontroller/Pin.h"
-#include "src/rp2_common/hardware_gpio/include/hardware/gpio.h"
+#include "hardware/gpio.h"
 #include "supervisor/board.h"
 #include "supervisor/shared/board.h"
 
-displayio_fourwire_obj_t board_display_obj;
 
 #define DELAY 0x80
 
@@ -50,7 +29,7 @@ uint8_t display_init_sequence[] = {
     0xda, 1, 0x12, // com pins
     0x81, 1, 0xff, // contrast 255
     0xd9, 1, 0x1f, // pre/dis-charge 2DCLKs/2CLKs
-    0xdb, 1, 0x20, // VCOM deslect 0.770
+    0xdb, 1, 0x20, // VCOM select 0.770
     0x20, 1, 0x20,
     0x33, 0, // VPP 9V
     0xa6, 0, // not inverted
@@ -59,24 +38,23 @@ uint8_t display_init_sequence[] = {
 };
 
 void board_init(void) {
-    busio_spi_obj_t *spi = &displays[0].fourwire_bus.inline_bus;
-    common_hal_busio_spi_construct(spi, &pin_GPIO26, &pin_GPIO27, NULL);
-    common_hal_busio_spi_never_reset(spi);
+    fourwire_fourwire_obj_t *bus = &allocate_display_bus()->fourwire_bus;
+    busio_spi_obj_t *spi = &bus->inline_bus;
+    common_hal_busio_spi_construct(spi, &pin_GPIO26, &pin_GPIO27, NULL, false);
 
-    displayio_fourwire_obj_t *bus = &displays[0].fourwire_bus;
-    bus->base.type = &displayio_fourwire_type;
-    common_hal_displayio_fourwire_construct(bus,
+    bus->base.type = &fourwire_fourwire_type;
+    common_hal_fourwire_fourwire_construct(bus,
         spi,
-        &pin_GPIO24, // Command or data
-        &pin_GPIO22, // Chip select
-        &pin_GPIO23, // Reset
+        MP_OBJ_FROM_PTR(&pin_GPIO24), // Command or data
+        MP_OBJ_FROM_PTR(&pin_GPIO22), // Chip select
+        MP_OBJ_FROM_PTR(&pin_GPIO23), // Reset
         10000000, // Baudrate
         0, // Polarity
         0); // Phase
 
-    displayio_display_obj_t *display = &displays[0].display;
-    display->base.type = &displayio_display_type;
-    common_hal_displayio_display_construct(display,
+    busdisplay_busdisplay_obj_t *display = &allocate_display()->display;
+    display->base.type = &busdisplay_busdisplay_type;
+    common_hal_busdisplay_busdisplay_construct(display,
         bus,
         128, // Width
         64, // Height
@@ -97,17 +75,13 @@ void board_init(void) {
         NULL,
         0x81,
         1.0f, // brightness
-        false, // auto_brightness
         true, // single_byte_bounds
         true, // data as commands
         true, // auto_refresh
         60, // native_frames_per_second
         true, // backlight_on_high
-        true); // SH1107_addressing
-}
-
-bool board_requests_safe_mode(void) {
-    return false;
+        true, // SH1107_addressing
+        50000); // backlight pwm frequency
 }
 
 void reset_board(void) {
@@ -115,5 +89,4 @@ void reset_board(void) {
     board_reset_user_neopixels(&pin_GPIO19, 12);
 }
 
-void board_deinit(void) {
-}
+// Use the MP_WEAK supervisor/shared/board.c versions of routines not defined here.

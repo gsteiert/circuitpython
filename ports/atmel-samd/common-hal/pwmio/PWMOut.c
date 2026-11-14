@@ -1,29 +1,9 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
- * SPDX-FileCopyrightText: Copyright (c) 2016 Damien P. George
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2016 Damien P. George
+//
+// SPDX-License-Identifier: MIT
 
 #include <stdint.h>
 
@@ -31,14 +11,12 @@
 #include "common-hal/pwmio/PWMOut.h"
 #include "shared-bindings/pwmio/PWMOut.h"
 #include "shared-bindings/microcontroller/Processor.h"
-#include "shared_timers.h"
 #include "timer_handler.h"
 
 #include "atmel_start_pins.h"
 #include "hal/utils/include/utils_repeat_macro.h"
 #include "samd/pins.h"
 #include "samd/timers.h"
-#include "supervisor/shared/translate.h"
 
 #undef ENABLE
 
@@ -53,37 +31,10 @@ uint32_t target_tcc_frequencies[TCC_INST_NUM];
 uint8_t tcc_refcount[TCC_INST_NUM];
 
 // This bitmask keeps track of which channels of a TCC are currently claimed.
-#ifdef SAMD21
-uint8_t tcc_channels[3];   // Set by pwmout_reset() to {0xf0, 0xfc, 0xfc} initially.
-#endif
-#ifdef SAM_D5X_E5X
-uint8_t tcc_channels[5];   // Set by pwmout_reset() to {0xc0, 0xf0, 0xf8, 0xfc, 0xfc} initially.
-#endif
+// A variable-frequency PWMOut claims all of them (0xff).
+uint8_t tcc_channels[TCC_INST_NUM];
 
 
-void common_hal_pwmio_pwmout_never_reset(pwmio_pwmout_obj_t *self) {
-    timer_never_reset(self->timer->index, self->timer->is_tc);
-
-    never_reset_pin_number(self->pin->number);
-}
-
-void common_hal_pwmio_pwmout_reset_ok(pwmio_pwmout_obj_t *self) {
-    timer_reset_ok(self->timer->index, self->timer->is_tc);
-}
-
-void pwmout_reset(void) {
-    // Reset all timers
-    for (int i = 0; i < TCC_INST_NUM; i++) {
-        target_tcc_frequencies[i] = 0;
-        tcc_refcount[i] = 0;
-    }
-    for (int i = 0; i < TCC_INST_NUM; i++) {
-        if (!timer_ok_to_reset(i, false)) {
-            continue;
-        }
-        tcc_channels[i] = 0xff << tcc_cc_num[i];
-    }
-}
 
 static uint8_t tcc_channel(const pin_timer_t *t) {
     // For the SAMD51 this hardcodes the use of OTMX == 0x0, the output matrix mapping, which uses
@@ -91,10 +42,26 @@ static uint8_t tcc_channel(const pin_timer_t *t) {
     return t->wave_output % tcc_cc_num[t->index];
 }
 
-STATIC bool channel_ok(const pin_timer_t *t) {
+static bool channel_ok(const pin_timer_t *t) {
     uint8_t channel_bit = 1 << tcc_channel(t);
     return (!t->is_tc && ((tcc_channels[t->index] & channel_bit) == 0)) ||
            t->is_tc;
+}
+
+// Find the divisor that gets the highest resolution: the smallest prescaler for which
+// the period fits in the timer. Sets *top to the period.
+static uint8_t compute_divisor(const pin_timer_t *t, uint32_t system_clock, uint32_t frequency,
+    uint32_t *top) {
+    // TCC resolution varies so look it up.
+    uint8_t resolution = t->is_tc ? 16 : tcc_sizes[t->index];
+    uint8_t divisor;
+    for (divisor = 0; divisor < 8; divisor++) {
+        *top = (system_clock / prescaler[divisor] / frequency) - 1;
+        if (*top < (1u << resolution)) {
+            break;
+        }
+    }
+    return divisor;
 }
 
 pwmout_result_t common_hal_pwmio_pwmout_construct(pwmio_pwmout_obj_t *self,
@@ -102,7 +69,6 @@ pwmout_result_t common_hal_pwmio_pwmout_construct(pwmio_pwmout_obj_t *self,
     uint16_t duty,
     uint32_t frequency,
     bool variable_frequency) {
-    self->pin = pin;
     self->variable_frequency = variable_frequency;
     self->duty_cycle = duty;
 
@@ -155,7 +121,6 @@ pwmout_result_t common_hal_pwmio_pwmout_construct(pwmio_pwmout_obj_t *self,
         // one output so we start with the TCs to see if they work.
         int8_t direction = -1;
         uint8_t start = NUM_TIMERS_PER_PIN - 1;
-        bool found = false;
         if (variable_frequency) {
             direction = 1;
             start = 0;
@@ -167,7 +132,6 @@ pwmout_result_t common_hal_pwmio_pwmout_construct(pwmio_pwmout_obj_t *self,
                 continue;
             }
             if (t->is_tc) {
-                found = true;
                 Tc *tc = tc_insts[t->index];
                 if (tc->COUNT16.CTRLA.bit.ENABLE == 0 && t->wave_output == 1) {
                     timer = t;
@@ -183,28 +147,11 @@ pwmout_result_t common_hal_pwmio_pwmout_construct(pwmio_pwmout_obj_t *self,
         }
 
         if (timer == NULL) {
-            if (found) {
-                return PWMOUT_ALL_TIMERS_ON_PIN_IN_USE;
-            }
-            return PWMOUT_ALL_TIMERS_IN_USE;
+            return PWMOUT_INTERNAL_RESOURCES_IN_USE;
         }
 
-        uint8_t resolution = 0;
-        if (timer->is_tc) {
-            resolution = 16;
-        } else {
-            // TCC resolution varies so look it up.
-            resolution = tcc_sizes[timer->index];
-        }
-        // First determine the divisor that gets us the highest resolution.
         uint32_t top;
-        uint8_t divisor;
-        for (divisor = 0; divisor < 8; divisor++) {
-            top = (system_clock / prescaler[divisor] / frequency) - 1;
-            if (top < (1u << resolution)) {
-                break;
-            }
-        }
+        uint8_t divisor = compute_divisor(timer, system_clock, frequency, &top);
 
         set_timer_handler(timer->is_tc, timer->index, TC_HANDLER_NO_INTERRUPT);
         // We use the zeroeth clock on either port to go full speed.
@@ -252,8 +199,10 @@ pwmout_result_t common_hal_pwmio_pwmout_construct(pwmio_pwmout_obj_t *self,
     }
 
     self->timer = timer;
+    self->pin = pin;
 
     gpio_set_pin_function(pin->number, GPIO_PIN_FUNCTION_E + mux_position);
+    claim_pin(pin);
 
     common_hal_pwmio_pwmout_set_duty_cycle(self, duty);
     return PWMOUT_OK;
@@ -273,10 +222,13 @@ void common_hal_pwmio_pwmout_deinit(pwmio_pwmout_obj_t *self) {
         tc_set_enable(tc, false);
         tc->COUNT16.CTRLA.bit.SWRST = true;
         tc_wait_for_sync(tc);
+        turn_off_clocks(TIMER_TYPE_TC, t->index);
     } else {
         tcc_refcount[t->index]--;
         tcc_channels[t->index] &= ~(1 << tcc_channel(t));
         if (tcc_refcount[t->index] == 0) {
+            // A variable-frequency PWMOut claimed every channel, not just its own.
+            tcc_channels[t->index] = 0;
             target_tcc_frequencies[t->index] = 0;
             Tcc *tcc = tcc_insts[t->index];
             tcc_set_enable(tcc, false);
@@ -284,6 +236,7 @@ void common_hal_pwmio_pwmout_deinit(pwmio_pwmout_obj_t *self) {
             while (tcc->SYNCBUSY.bit.SWRST != 0) {
                 /* Wait for sync */
             }
+            turn_off_clocks(TIMER_TYPE_TCC, t->index);
         }
     }
     reset_pin_number(self->pin->number);
@@ -377,24 +330,11 @@ void common_hal_pwmio_pwmout_set_frequency(pwmio_pwmout_obj_t *self,
     uint32_t frequency) {
     uint32_t system_clock = common_hal_mcu_processor_get_frequency();
     if (frequency == 0 || frequency > system_clock / 2) {
-        mp_raise_ValueError(translate("Invalid PWM frequency"));
+        mp_arg_error_invalid(MP_QSTR_frequency);
     }
     const pin_timer_t *t = self->timer;
-    uint8_t resolution;
-    if (t->is_tc) {
-        resolution = 16;
-    } else {
-        // TCC resolution varies so look it up.
-        resolution = tcc_sizes[t->index];
-    }
     uint32_t new_top;
-    uint8_t new_divisor;
-    for (new_divisor = 0; new_divisor < 8; new_divisor++) {
-        new_top = (system_clock / prescaler[new_divisor] / frequency) - 1;
-        if (new_top < (1u << resolution)) {
-            break;
-        }
-    }
+    uint8_t new_divisor = compute_divisor(t, system_clock, frequency, &new_top);
     if (t->is_tc) {
         Tc *tc = tc_insts[t->index];
         uint8_t old_divisor = tc->COUNT16.CTRLA.bit.PRESCALER;

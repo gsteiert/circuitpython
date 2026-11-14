@@ -1,0 +1,65 @@
+name: Fetch external deps
+
+inputs:
+  action:
+    required: false
+    default: restore
+    type: choice
+    options:
+    - cache
+    - restore
+
+  port:
+    required: false
+    default: none
+    type: string
+
+runs:
+  using: composite
+  steps:
+    # arm
+    - name: Get arm toolchain
+      if: >-
+        inputs.port != 'none' &&
+        inputs.port != 'espressif' &&
+        inputs.port != 'zephyr-cp'
+      uses: carlosperate/arm-none-eabi-gcc-action@v1
+      with:
+        release: '15.3.Rel1'
+
+    # espressif
+    - name: Install IDF tools
+      if: inputs.port == 'espressif'
+      run: |
+        $IDF_PATH/install.sh
+        $IDF_PATH/tools/idf_tools.py install ninja
+        rm -rf $IDF_TOOLS_PATH/dist
+      shell: bash
+    - name: Set environment
+      if: inputs.port == 'espressif'
+      run: |
+        source $IDF_PATH/export.sh
+        echo >> $GITHUB_ENV "IDF_PYTHON_ENV_PATH=$IDF_PYTHON_ENV_PATH"
+        echo >> $GITHUB_ENV "ESP_IDF_VERSION=$ESP_IDF_VERSION"
+        echo >> $GITHUB_PATH "$PATH"
+      shell: bash
+
+    # common
+    - name: Cache python dependencies
+      if: inputs.port != 'espressif' && inputs.port != 'zephyr-cp'
+      uses: ./.github/actions/deps/python
+      with:
+        action: ${{ inputs.action }}
+    - name: Set ESP-IDF constraints path
+      if: inputs.port == 'espressif'
+      run: python3 -u tools/ci_set_idf_constraint.py
+      shell: bash
+
+    - name: Install python dependencies
+      run: |
+        if [ -n "${IDF_CONSTRAINT_FILE:-}" ] && [ -f "$IDF_CONSTRAINT_FILE" ]; then
+          pip install -c "$IDF_CONSTRAINT_FILE" -r requirements-dev.txt
+        else
+          pip install -r requirements-dev.txt
+        fi
+      shell: bash

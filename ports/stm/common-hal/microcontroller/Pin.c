@@ -1,38 +1,18 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2016 Scott Shawcroft for Adafruit Industries
- * Copyright (c) 2019 Lucian Copeland for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2016 Scott Shawcroft for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2019 Lucian Copeland for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/microcontroller/Pin.h"
-#include "shared-bindings/digitalio/DigitalInOut.h"
 
-#include "py/mphal.h"
 #include "pins.h"
 
 #if defined(TFBGA216)
 GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE, GPIOF, GPIOG, GPIOH, GPIOI, GPIOJ, GPIOK};
+#elif defined(UFBGA176)
+GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE, GPIOF, GPIOG, GPIOH, GPIOI};
 #elif defined(LQFP144) || defined(WLCSP144)
 GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE, GPIOF, GPIOG};
 #elif defined(LQFP100_f4) || (LQFP100_x7)
@@ -41,6 +21,8 @@ GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC, GPIOD, GPIOE};
 GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC, GPIOD};
 #elif defined(UFQFPN48)
 GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC};
+#elif defined(LQFP48)
+GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC};
 #else
     #error Unknown package type
 #endif
@@ -48,18 +30,7 @@ GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC};
 
 #define GPIO_PORT_COUNT (MP_ARRAY_SIZE(ports))
 
-STATIC uint16_t claimed_pins[GPIO_PORT_COUNT];
-STATIC uint16_t __ALIGNED(4) never_reset_pins[GPIO_PORT_COUNT];
-
-void reset_all_pins(void) {
-    // Reset claimed pins
-    for (uint8_t i = 0; i < GPIO_PORT_COUNT; i++) {
-        claimed_pins[i] = never_reset_pins[i];
-    }
-    for (uint8_t i = 0; i < GPIO_PORT_COUNT; i++) {
-        HAL_GPIO_DeInit(ports[i], ~never_reset_pins[i]);
-    }
-}
+static uint16_t claimed_pins[GPIO_PORT_COUNT];
 
 // Mark pin as free and return it to a quiescent state.
 void reset_pin_number(uint8_t pin_port, uint8_t pin_number) {
@@ -72,22 +43,9 @@ void reset_pin_number(uint8_t pin_port, uint8_t pin_number) {
     }
     // Clear claimed bit & reset
     claimed_pins[pin_port] &= ~(1 << pin_number);
-    never_reset_pins[pin_port] &= ~(1 << pin_number);
     HAL_GPIO_DeInit(ports[pin_port], 1 << pin_number);
 }
 
-void never_reset_pin_number(uint8_t pin_port, uint8_t pin_number) {
-    if (pin_number == NO_PIN) {
-        return;
-    }
-    never_reset_pins[pin_port] |= 1 << pin_number;
-    // Make sure never reset pins are also always claimed
-    claimed_pins[pin_port] |= 1 << pin_number;
-}
-
-void common_hal_never_reset_pin(const mcu_pin_obj_t *pin) {
-    never_reset_pin_number(pin->port, pin->number);
-}
 
 void common_hal_reset_pin(const mcu_pin_obj_t *pin) {
     if (pin == NULL) {

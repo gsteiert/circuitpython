@@ -15,7 +15,7 @@ https://learn.adafruit.com/building-circuitpython/
 
 ## Setup
 
-Please ensure you setup your build environment appropriately, as per the guide.  You will need:
+Please ensure you set up your build environment appropriately, as per the guide.  You will need:
 
 * Linux: https://learn.adafruit.com/building-circuitpython/linux
 * MacOS: https://learn.adafruit.com/building-circuitpython/macos
@@ -25,14 +25,28 @@ Please ensure you setup your build environment appropriately, as per the guide. 
 
 This project has a bunch of git submodules.  You will need to update them regularly.
 
-    git submodule sync
-    git submodule update --init
+Fetch only what the board you are building needs. From the root folder of the CircuitPython
+repository:
+
+    make -C ports/raspberrypi fetch-board-submodules BOARD=raspberry_pi_pico
+
+Or everything one port needs, which is what you want if you build several boards from it:
+
+    make -C ports/raspberrypi fetch-port-submodules
+
+There is also a target that fetches the submodules of every port at once. That is a few gigabytes
+against a few hundred megabytes for one board, so use it only if you really are building for
+more than one port:
+
+    make fetch-all-submodules
 
 ### Required Python Packages
 
 Failing to install these will prevent from properly building.
 
     pip3 install -r requirements-dev.txt
+
+If you run into an error installing minify_html, you may need to install `rust`.
 
 ### mpy-cross
 
@@ -41,7 +55,7 @@ To compile (or recompile) mpy-cross:
 
     make -C mpy-cross
 
-# Building
+## Building
 
 There a number of ports of CircuitPython!  To build for your board, change to the appropriate ports directory and build.
 
@@ -50,14 +64,60 @@ Examples:
     cd ports/atmel-samd
     make BOARD=circuitplayground_express
 
-    cd ports/nrf
+    cd ports/nordic
     make BOARD=circuitplayground_bluefruit
 
 If you aren't sure what boards exist, have a peek in the boards subdirectory of your port.
 If you have a fast computer with many cores, consider adding `-j` to your build flags, such as `-j17` on
 a 6-core 12-thread machine.
 
-# Testing
+## Configuration
+
+Ports and boards are preconfigured, thus make knows how to build a specific
+board. Power users can change the configuration of a specific board or port,
+either by passing compile-time options to make, or by creating appropriate
+make include files.
+
+The configuration system is hierarchical. A higher level will typically only
+set an option that a lower level hasn't configured:
+
+* board configuration: `mpconfigport.mk`
+* pre-port user configuration: `user_pre_mpconfigport.mk`
+* port configuration: `mpconfigport.mk`
+* post-port user configuration: `user_post_mpconfigport.mk`
+* global configuration: `py/circuitpython_mpconfig.mk`
+
+The board configuration is within the board-directory, e.g.
+`ports/raspberrypi/boards/raspberry_pi_pico/`, the port configuration is
+in the port-directory, e.g. `ports/raspberrypi/`.
+
+Editing these configuration files is the way to go if you want to change
+the default behavior and ultimately create a pull-request. Otherwise,
+changes should go into one of the user configuration files.
+
+User specific configurations are optional and should be maintained out of
+tree. Passing `-I directory` tells make where to search for the additional
+configuration files. E.g. to speed up boots by removing the wait-time for
+the save-mode button press, you would:
+
+* create a directory: `mkdir -p ~/my_cp_config`
+* create the config file: `echo 'CIRCUITPY_SKIP_SAFE_MODE_WAIT=0' > ~/my_cp_config/user_pre_mpconfigport.mk`
+* run make with: `make -I ~/my_cp_config BOARD=raspberry_pi_pico`
+
+Besides the `user*mpconfigport.mk` files, there is another optional file
+named `user_post_circuitpy_defns.mk`. This file is included at the end
+and can be used to tweak compiler-definitions that are not covered by
+one of the compile time options `CIRCUITPY_*`.
+
+Example: to create a build for the Pico2-W with an integrated saves-partition,
+you would create a `user_post_circuitpy_defns.mk` with the following content:
+
+    $(info ===> processing user_post_circuitpy_defns.mk)
+    ifeq (${BOARD},raspberry_pi_pico2_w)
+    CFLAGS += -DCIRCUITPY_SAVES_PARTITION_SIZE=1048576
+    endif
+
+## Testing
 
 If you are working on changes to the core language, you might find it useful to run the test suite.
 The test suite in the top level `tests` directory.  It needs the unix port to run.
@@ -69,7 +129,7 @@ The test suite in the top level `tests` directory.  It needs the unix port to ru
 Then you can run the test suite:
 
     cd ../../tests
-    ./run-tests
+    ./run-tests.py
 
 A successful run will say something like
 
@@ -77,7 +137,7 @@ A successful run will say something like
     676 tests passed
     30 tests skipped: buffered_writer builtin_help builtin_range_binop class_delattr_setattr cmd_parsetree extra_coverage framebuf1 framebuf16 framebuf2 framebuf4 framebuf8 framebuf_subclass mpy_invalid namedtuple_asdict non_compliant resource_stream schedule sys_getsizeof urandom_extra ure_groups ure_span ure_sub ure_sub_unmatched vfs_basic vfs_fat_fileio1 vfs_fat_fileio2 vfs_fat_more vfs_fat_oldproto vfs_fat_ramdisk vfs_userfs
 
-# Debugging
+## Debugging
 
 The easiest way to debug CircuitPython on hardware is with a JLink device, JLinkGDBServer, and an appropriate GDB.
 Instructions can be found at https://learn.adafruit.com/debugging-the-samd21-with-gdb
@@ -92,7 +152,7 @@ Example:
 If your port/build includes `arm-none-eabi-gdb-py`, consider using it instead, as it can be used for better register
 debugging with https://github.com/bnahill/PyCortexMDebug
 
-# Code Quality Checks
+## Code Quality Checks
 
 We apply code quality checks using pre-commit.  Install pre-commit once per system with
 
@@ -100,13 +160,13 @@ We apply code quality checks using pre-commit.  Install pre-commit once per syst
 
 Activate it once per git clone with
 
-    pre-commit --install
+    pre-commit install
 
 Pre-commit also requires some additional programs to be installed through your package manager:
 
  * Standard Unix tools such as make, find, etc
  * The gettext package, any modern version
- * uncrustify version 0.71 (0.72 is also tested)
+ * uncrustify version 0.71 (0.72 is also tested and OK; 0.75 is not OK)
 
 Each time you create a git commit, the pre-commit quality checks will be run.  You can also run them e.g., with `pre-commit run foo.c` or `pre-commit run --all` to run on all files whether modified or not.
 

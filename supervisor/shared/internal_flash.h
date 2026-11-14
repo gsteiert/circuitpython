@@ -1,33 +1,17 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 Scott Shawcroft, for Adafruit Industries LLC
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-#ifndef MICROPY_INCLUDED_SUPERVISOR_SHARED_INTERNAL_FLASH_H
-#define MICROPY_INCLUDED_SUPERVISOR_SHARED_INTERNAL_FLASH_H
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Scott Shawcroft, for Adafruit Industries LLC
+//
+// SPDX-License-Identifier: MIT
+#pragma once
 
 #include "supervisor/internal_flash.h" // This is per-port.
 
 void port_internal_flash_flush(void);
 
-#endif  // MICROPY_INCLUDED_SUPERVISOR_SHARED_INTERNAL_FLASH_H
+#if CIRCUITPY_STORAGE_MAP_FILE
+// The memory-mapped address of a drive block, NULL if the port cannot map it; *contiguous
+// receives how many blocks from it are contiguous in the mapping. A port that sets
+// CIRCUITPY_STORAGE_MAP_FILE implements this.
+const uint8_t *port_internal_flash_xip_address(uint32_t block, uint32_t *contiguous);
+#endif

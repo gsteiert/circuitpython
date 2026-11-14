@@ -1,0 +1,112 @@
+name: 'Fetch Submodules'
+
+inputs:
+  target:
+    description: 'The target for ci_fetch_deps'
+    required: false
+    type: string
+
+  submodules:
+    description: 'The submodules to cache'
+    required: false
+    default: '["extmod/ulab", "lib/", "tools/"]'
+    type: string
+
+  port:
+    description: 'Also cache the submodules of this port, in their own entry'
+    required: false
+    default: ''
+    type: string
+
+  action:
+    description: 'The cache action to use'
+    required: false
+    default: 'restore'
+    type: choice
+    options:
+    - cache
+    - restore
+
+  version:
+    description: 'Whether to fetch tags to identify CP version'
+    required: false
+    default: false
+    type: boolean
+
+outputs:
+  frozen:
+    description: 'Whether frozen submodules were fetched'
+    value: ${{ steps.cp-deps.outputs.frozen_tags }}
+
+  version:
+    description: 'The CP version'
+    value: ${{ steps.cp-version.outputs.cp-version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Create submodule status
+      id: create-submodule-status
+      run: |
+        git submodule status ${{ join(fromJSON(inputs.submodules), ' ') }} >> submodule_status
+        echo $(cut -d ' ' -f 2 submodule_status) | echo "submodules=[\"$(sed "s/ /\", \"/g")\"]" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Cache submodules
+      if: ${{ inputs.action == 'cache' }}
+      uses: actions/cache@v5
+      with:
+        path: ".git/modules/\n${{ join(fromJSON(steps.create-submodule-status.outputs.submodules), '\n') }}"
+        key: submodules-common-${{ hashFiles('submodule_status') }}
+        enableCrossOsArchive: true
+
+    - name: Restore submodules
+      if: ${{ inputs.action == 'restore' }}
+      uses: actions/cache/restore@v5
+      with:
+        path: ".git/modules/\n${{ join(fromJSON(steps.create-submodule-status.outputs.submodules), '\n') }}"
+        key: submodules-common-${{ hashFiles('submodule_status') }}
+        enableCrossOsArchive: true
+
+    - name: Port submodule status
+      id: port-submodule-status
+      # The ports whose board jobs clone the most over the network: 29 CMSIS and HAL
+      # repositories on stm, the sdk and lwip on raspberrypi and mimxrt10xx. espressif
+      # and zephyr-cp fetch theirs in their own way; the rest have little to gain.
+      if: ${{ contains(fromJSON('["stm", "raspberrypi", "mimxrt10xx"]'), inputs.port) }}
+      run: |
+        git submodule status ports/${{ inputs.port }} > port_submodule_status
+        echo $(cut -d ' ' -f 2 port_submodule_status) | echo "submodules=[\"$(sed "s/ /\", \"/g")\"]" >> $GITHUB_OUTPUT
+      shell: bash
+
+    - name: Cache port submodules
+      if: ${{ steps.port-submodule-status.outcome == 'success' }}
+      uses: actions/cache@v5
+      with:
+        path: ".git/modules/ports/${{ inputs.port }}\n${{ join(fromJSON(steps.port-submodule-status.outputs.submodules), '\n') }}"
+        key: submodules-${{ inputs.port }}-${{ hashFiles('port_submodule_status') }}
+        enableCrossOsArchive: true
+
+    - name: Remove submodule status
+      run: rm -f submodule_status port_submodule_status
+      shell: bash
+
+    - name: CircuitPython dependencies
+      id: cp-deps
+      run: python tools/ci_fetch_deps.py ${{ inputs.target || matrix.board || github.job }}
+      shell: bash
+
+    - name: CircuitPython version
+      id: cp-version
+      if: ${{ inputs.version == 'true' }}
+      run: |
+        echo "::group::Fetch history and tags"
+        git fetch --no-recurse-submodules --shallow-since="2021-07-01" --tags https://github.com/adafruit/circuitpython HEAD
+        git fetch --no-recurse-submodules --shallow-since="2021-07-01" origin $GITHUB_SHA
+        git repack -d
+        echo "::endgroup::"
+        CP_VERSION=$(python py/version.py)
+        echo "$CP_VERSION"
+        echo "CP_VERSION=$CP_VERSION" >> $GITHUB_ENV
+        echo "cp-version=$CP_VERSION" >> $GITHUB_OUTPUT
+      shell: bash

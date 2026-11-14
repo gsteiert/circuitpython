@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2016 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2016 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 #include "hpl_gpio.h"
 
 #include "py/mphal.h"
@@ -42,9 +22,12 @@
 #include "hri/hri_nvmctrl_d51.h"
 #endif
 
-__attribute__((naked,noinline,aligned(16)))
+__attribute__((naked, noinline, aligned(16)))
 static void neopixel_send_buffer_core(volatile uint32_t *clraddr, uint32_t pinMask,
     const uint8_t *ptr, int numBytes);
+
+// The SAMD21 timing loop durations below are approximate,
+// because the other instructions take significant time.
 
 static void neopixel_send_buffer_core(volatile uint32_t *clraddr, uint32_t pinMask,
     const uint8_t *ptr, int numBytes) {
@@ -54,25 +37,28 @@ static void neopixel_send_buffer_core(volatile uint32_t *clraddr, uint32_t pinMa
         "        ldrb r5, [r2, #0];"          // r5 := *ptr
         "        add  r2, #1;"                // ptr++
         "        movs    r4, #128;"           // r4-mask, 0x80
+
         "loopBit:"
         "        str r1, [r0, #4];"                             // set
         #ifdef SAMD21
-        "        movs r6, #3; d2: sub r6, #1; bne d2;"          // delay 3
+        "        movs r6, #2; d2: sub r6, #1; bne d2;"          // 248 ns high (entire T0H or start T1H)
         #endif
         #ifdef SAM_D5X_E5X
-        "        movs r6, #16; d2: subs r6, #1; bne d2;"          // delay 3
+        "        movs r6, #11; d2: subs r6, #1; bne d2;"        // 300 ns high (entire T0H or start T1H)
         #endif
         "        tst r4, r5;"                                   // mask&r5
         "        bne skipclr;"
         "        str r1, [r0, #0];"          // clr
+
         "skipclr:"
         #ifdef SAMD21
-        "        movs r6, #6; d0: sub r6, #1; bne d0;"          // delay 6
+        "        movs r6, #7; d0: sub r6, #1; bne d0;"          // 772 ns low or high (start T0L or end T1H)
         #endif
         #ifdef SAM_D5X_E5X
-        "        movs r6, #16; d0: subs r6, #1; bne d0;"          // delay 6
+        "        movs r6, #15; d0: subs r6, #1; bne d0;"        // 388 ns low or high (start T0L or end T1H)
         #endif
         "        str r1, [r0, #0];"            // clr (possibly again, doesn't matter)
+
         #ifdef SAMD21
         "        asr     r4, r4, #1;"          // mask >>= 1
         #endif
@@ -82,15 +68,20 @@ static void neopixel_send_buffer_core(volatile uint32_t *clraddr, uint32_t pinMa
         "        beq     nextbyte;"
         "        uxtb    r4, r4;"
         #ifdef SAMD21
-        "        movs r6, #2; d1: sub r6, #1; bne d1;"          // delay 2
+        "        movs r6, #5; d1: sub r6, #1; bne d1;"          // 496 ns (end TOL or entire T1L)
         #endif
         #ifdef SAM_D5X_E5X
-        "        movs r6, #15; d1: subs r6, #1; bne d1;"          // delay 2
+        "        movs r6, #20; d1: subs r6, #1; bne d1;"        // 548 ns (end TOL or entire T1L)
         #endif
         "        b       loopBit;"
+
         "nextbyte:"
+        #ifdef SAMD21
+        "        movs r6, #1; d3: sub r6, #1; bne d3;"          // 60 ns (end TOL or entire T1L)
+                                                                // other instructions add more delay
+        #endif
         #ifdef SAM_D5X_E5X
-        "        movs r6, #12; d3: subs r6, #1; bne d3;"          // delay 2
+        "        movs r6, #18; d3: subs r6, #1; bne d3;"        // extra for 936 ns total (byte end T0L or entire T1L)
         #endif
         "        cmp r2, r3;"
         "        bcs neopixel_stop;"
@@ -100,7 +91,7 @@ static void neopixel_send_buffer_core(volatile uint32_t *clraddr, uint32_t pinMa
         "");
 }
 
-uint64_t next_start_raw_ticks = 0;
+static uint64_t next_start_raw_ticks = 0;
 
 void common_hal_neopixel_write(const digitalio_digitalinout_obj_t *digitalinout, uint8_t *pixels, uint32_t numBytes) {
     // This is adapted directly from the Adafruit NeoPixel library SAMD21G18A code:

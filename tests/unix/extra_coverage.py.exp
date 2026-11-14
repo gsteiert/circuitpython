@@ -2,52 +2,102 @@
 -123 +123  123
 -0123
 123
-123
-1ABCDEF
+123f
+123F
+7fffffffffffffff
+7FFFFFFFFFFFFFFF
+18446744073709551615
+789f
+789F
 ab abc ' abc' ' True' 'Tru'
 
 false true
 (null)
 -2147483648
 2147483648
-80000000
-80000000
+8000000f
+8000000F
 abc
 %
+.a  .
+<%>
+<aaaa>
+<true>
+<43690>
+<43690>
+<43690>
+<test>
+<1000.000000>
+<True>
+<9223372036854775807>
 # GC
-0x0
-0x0
+0
+0
+1
+1
+# GC part 2
+pass
+# tracked allocation
+m_tracked_head = 0
+0 1
+1 1
+2 1
+3 1
+4 1
+5 1
+6 1
+7 1
+1
+0 1
+1 1
+2 1
+3 1
+4 1
+5 1
+6 1
+7 1
+m_tracked_head = 0
+# tracked realloc
+grow preserves data: 1
+shrink preserves data: 1
+realloc gc stable: 1
+realloc(NULL) ok: 1
+realloc(ptr, 0) returns NULL: 1
+m_tracked_head after cleanup: 0
 # vstr
 tests
 sts
 
 test
 tes
-RuntimeError: 
-RuntimeError: 
+RuntimeError: \$
+RuntimeError: \$
 # repl
 ame__
-mport 
+port \$
 
-builtins        micropython     _thread         aesio
-array           binascii        bitmaptools     btree
-cexample        cmath           collections     cppexample
-displayio       errno           ffi             framebuf
-gc              gifio           hashlib         json
-math            qrio            rainbowio       re
-sys             termios         traceback       ubinascii
-uctypes         uerrno          uheapq          uio
-ujson           ulab            uos             urandom
-ure             uselect         ustruct         utime
-utimeq          uzlib
-ime
+builtins        micropython     __future__      _asyncio
+_thread         aesio           array           audiocore
+audiomixer      audiomp3        binascii        bitmapfilter
+bitmaptools     cexample        cmath           codeop
+collections     cppexample      displayio       errno
+example_package                 floppyio        gc
+hashlib         heapq           io              jpegio
+json            locale          math            os
+platform        qrio            rainbowio       random
+re              select          struct          synthio
+sys             time            traceback       uctypes
+ulab            zlib
+me
 
-utime           utimeq
+rainbowio       random
 
-argv            byteorder       exc_info        exit
-getsizeof       implementation  maxsize         modules
-path            platform        stderr          stdin
-stdout          version         version_info
+argv            atexit          byteorder       exc_info
+executable      exit            getsizeof       implementation
+intern          maxsize         modules         path
+platform        print_exception                 ps1
+ps2             stderr          stdin           stdout
+tracebacklimit  version         version_info
 ementation
 # attrtuple
 (start=1, stop=2, step=3)
@@ -66,22 +116,36 @@ data
 1
 12345
 6
+-1
+0
+1
+0
+0.000000
+deadbeef
+c0ffee777c0ffee
+deadbeef
+0deadbeef
+c0ffee
+000c0ffee
+# list argument helpers
+TypeError: \$
+ValueError: \$
+mp_obj_list_ensure same list? 1
+mp_obj_list_optional_arg same list? 1
+mp_obj_list_optional_arg new list len 3
+mp_obj_list_optional_arg new list from NULL len 3
 # runtime utils
 TypeError: unsupported type for __abs__: 'str'
 TypeError: unsupported types for __divmod__: 'str', 'str'
+0
 1
 2
 OverflowError: overflow converting long int to machine word
 OverflowError: overflow converting long int to machine word
-ValueError: 
+TypeError: can't convert NoneType to int
+TypeError: can't convert NoneType to int
+ValueError: \$
 Warning: test
-# format float
-?
-+1e+00
-+1e+00
-# binary
-123
-456
 # VM
 2 1
 # scheduler
@@ -95,9 +159,16 @@ unlocked
 1
 2
 3
-KeyboardInterrupt: 
-KeyboardInterrupt: 
+KeyboardInterrupt: \$
+KeyboardInterrupt: \$
 10
+loop
+scheduled function
+loop
+scheduled function
+loop
+scheduled function
+scheduled function
 # ringbuf
 99 0
 98 1
@@ -120,6 +191,11 @@ cc99
 22ff
 -1
 -1
+0
+0
+abc123
+-1
+-2
 # pairheap
 create: 0 0 0 0
 pop all: 0 1 2 3
@@ -140,6 +216,8 @@ pop all: 1 2 4 5
 1 1
 0 0
 1 1
+# stackctrl
+1 1
 # end coverage.c
 0123456789 b'0123456789'
 7300
@@ -152,28 +230,59 @@ None
 None
 None
 None
+None
 b'123'
 b'123'
 b'123'
 OSError
 0
+# stream.readinto
+OSError True
+bytearray(b'123\x00')
+3 bytearray(b'123\x00')
+# stream textio
 None
 None
 cpp None
-5
 (3, 'hellocpp')
 frzstr1
 frzstr1.py
 frzmpy1
-.frozen/frzmpy1.py
+frzmpy1.py
 frzstr_pkg1.__init__
 frzstr_pkg1/__init__.py 1
 frzmpy_pkg1.__init__
-.frozen/frzmpy_pkg1/__init__.py 1
+frzmpy_pkg1/__init__.py 1
 frzstr_pkg2.mod
 1
 frzmpy_pkg2.mod
 1
 ZeroDivisionError
-b'# test frozen package'
+\
+
+X
+'\x1b'
+b'\x00\xff'
+frzmpy4 1
+frzmpy4 2
 NULL
+interned
+a long string that is not interned
+a string that has unicode αβγ chars
+b'bytes 1234\x01'
+123456789
+0
+1
+2
+3
+frozentest.py
+example_package.__init__
+<module 'example_package.foo.bar'>
+example_package.foo.bar.f
+<module 'example_package'> <module 'example_package.foo'> <module 'example_package.foo.bar'>
+example_package.f
+example_package.foo.f
+example_package.foo.bar.f
+True
+example_package.foo.f
+True

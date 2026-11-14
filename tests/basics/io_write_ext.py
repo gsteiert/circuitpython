@@ -1,14 +1,15 @@
 # This tests extended (MicroPython-specific) form of write:
 # write(buf, len) and write(buf, offset, len)
-import uio
 
 try:
-    uio.BytesIO
-except AttributeError:
-    print("SKIP")
+    import io
+
+    io.BytesIO
+except (AttributeError, ImportError):
+    print('SKIP')
     raise SystemExit
 
-buf = uio.BytesIO()
+buf = io.BytesIO()
 
 buf.write(b"foo", 2)
 print(buf.getvalue())

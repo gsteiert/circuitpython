@@ -1,45 +1,25 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 Jeff Epler for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Jeff Epler for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 #include <stdbool.h>
 
 #include "shared-bindings/sdioio/SDCard.h"
+
+#include "extmod/vfs.h"
 #include "py/mperrno.h"
 #include "py/runtime.h"
 
 #include "shared-bindings/microcontroller/__init__.h"
 #include "shared-bindings/util.h"
 #include "supervisor/board.h"
-#include "supervisor/shared/translate.h"
 #include "common-hal/microcontroller/Pin.h"
 #include "shared-bindings/microcontroller/Pin.h"
 
-STATIC bool reserved_sdio[MP_ARRAY_SIZE(mcu_sdio_banks)];
-STATIC bool never_reset_sdio[MP_ARRAY_SIZE(mcu_sdio_banks)];
+static bool reserved_sdio[MP_ARRAY_SIZE(mcu_sdio_banks)];
 
-STATIC const mcu_periph_obj_t *find_pin_function(const mcu_periph_obj_t *table, size_t sz, const mcu_pin_obj_t *pin, int periph_index) {
+static const mcu_periph_obj_t *find_pin_function(const mcu_periph_obj_t *table, size_t sz, const mcu_pin_obj_t *pin, int periph_index) {
     for (size_t i = 0; i < sz; i++, table++) {
         if (periph_index == table->periph_index && pin == table->pin) {
             return table;
@@ -49,7 +29,7 @@ STATIC const mcu_periph_obj_t *find_pin_function(const mcu_periph_obj_t *table, 
 }
 
 // match pins to SDIO objects
-STATIC int check_pins(sdioio_sdcard_obj_t *self,
+static int check_pins(sdioio_sdcard_obj_t *self,
     const mcu_pin_obj_t *clock, const mcu_pin_obj_t *command,
     uint8_t num_data, const mcu_pin_obj_t **data) {
     bool sdio_taken = false;
@@ -113,19 +93,32 @@ STATIC int check_pins(sdioio_sdcard_obj_t *self,
     }
 
     if (sdio_taken) {
-        mp_raise_ValueError(translate("Hardware busy, try alternative pins"));
+        mp_raise_ValueError(MP_ERROR_TEXT("Hardware in use, try alternative pins"));
     } else {
-        mp_raise_ValueError_varg(translate("Invalid %q pin selection"), MP_QSTR_SDIO);
+        raise_ValueError_invalid_pin();
     }
 }
 
+
+static void mark_deinit(sdioio_sdcard_obj_t *self) {
+    self->command = NULL;
+    self->clock = NULL;
+    for (size_t i = 0; i < MP_ARRAY_SIZE(self->data); i++) {
+        self->data[i] = NULL;
+    }
+}
 
 void common_hal_sdioio_sdcard_construct(sdioio_sdcard_obj_t *self,
     const mcu_pin_obj_t *clock, const mcu_pin_obj_t *command,
     uint8_t num_data, const mcu_pin_obj_t **data, uint32_t frequency) {
 
+    mark_deinit(self);
     int periph_index = check_pins(self, clock, command, num_data, data);
+    #ifdef STM32H750xx
+    SDMMC_TypeDef *SDMMCx = mcu_sdio_banks[periph_index - 1];
+    #else
     SDIO_TypeDef *SDIOx = mcu_sdio_banks[periph_index - 1];
+    #endif
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
@@ -149,6 +142,26 @@ void common_hal_sdioio_sdcard_construct(sdioio_sdcard_obj_t *self,
     GPIO_InitStruct.Pin = pin_mask(clock->number);
     HAL_GPIO_Init(pin_port(clock->port), &GPIO_InitStruct);
 
+    #ifdef STM32H750xx
+    RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+    PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_SDMMC;
+    PeriphClkInitStruct.SdmmcClockSelection = RCC_SDMMCCLKSOURCE_PLL;
+    if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK) {
+        common_hal_sdioio_sdcard_deinit(self);
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("MMC/SDIO Clock Error %x"));
+    }
+    __HAL_RCC_SDMMC1_CLK_ENABLE();
+
+    self->handle.Init.ClockDiv = SDMMC_NSPEED_CLK_DIV;
+    self->handle.Init.ClockEdge = SDMMC_CLOCK_EDGE_RISING;
+    self->handle.Init.ClockPowerSave = SDMMC_CLOCK_POWER_SAVE_DISABLE;
+    self->handle.Init.BusWide = SDMMC_BUS_WIDE_1B;
+    // For the SDMMC controller Hardware Flow Control needs to be enabled
+    // at the default speed of 25MHz, in order to avoid FIFO underrun (TX mode)
+    // and overrun (RX mode) errors.
+    self->handle.Init.HardwareFlowControl = SDMMC_HARDWARE_FLOW_CONTROL_ENABLE;
+    self->handle.Instance = SDMMCx;
+    #else
     __HAL_RCC_SDIO_CLK_ENABLE();
 
     self->handle.Init.ClockDiv = SDIO_TRANSFER_CLK_DIV;
@@ -158,22 +171,30 @@ void common_hal_sdioio_sdcard_construct(sdioio_sdcard_obj_t *self,
     self->handle.Init.BusWide = SDIO_BUS_WIDE_1B;
     self->handle.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
     self->handle.Instance = SDIOx;
+    #endif
 
     HAL_StatusTypeDef r = HAL_SD_Init(&self->handle);
     if (r != HAL_OK) {
-        mp_raise_ValueError_varg(translate("SDIO Init Error %d"), (int)r);
+        common_hal_sdioio_sdcard_deinit(self);
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("SDIO Init Error 0x%02x"), (unsigned int)r);
     }
 
     HAL_SD_CardInfoTypeDef info;
     r = HAL_SD_GetCardInfo(&self->handle, &info);
     if (r != HAL_OK) {
-        mp_raise_ValueError_varg(translate("SDIO GetCardInfo Error %d"), (int)r);
+        common_hal_sdioio_sdcard_deinit(self);
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("SDIO GetCardInfo Error %d"), (int)r);
     }
 
     self->num_data = 1;
+    #ifdef STM32H750xx
+    uint32_t bus_wide_opt = SDMMC_BUS_WIDE_4B;
+    #else
+    uint32_t bus_wide_opt = SDIO_BUS_WIDE_4B;
+    #endif
     if (num_data == 4) {
-        if ((r = HAL_SD_ConfigWideBusOperation(&self->handle, SDIO_BUS_WIDE_4B)) == HAL_SD_ERROR_NONE) {
-            self->handle.Init.BusWide = SDIO_BUS_WIDE_4B;
+        if ((r = HAL_SD_ConfigWideBusOperation(&self->handle, bus_wide_opt)) == HAL_SD_ERROR_NONE) {
+            self->handle.Init.BusWide = bus_wide_opt;
             self->num_data = 4;
         } else {
         }
@@ -205,13 +226,13 @@ uint8_t common_hal_sdioio_sdcard_get_width(sdioio_sdcard_obj_t *self) {
     return self->num_data;
 }
 
-STATIC void check_whole_block(mp_buffer_info_t *bufinfo) {
+static void check_whole_block(mp_buffer_info_t *bufinfo) {
     if (bufinfo->len % 512) {
-        mp_raise_ValueError(translate("Buffer must be a multiple of 512 bytes"));
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("Buffer must be a multiple of %d bytes"), 512);
     }
 }
 
-STATIC void wait_write_complete(sdioio_sdcard_obj_t *self) {
+static void wait_write_complete(sdioio_sdcard_obj_t *self) {
     if (self->state_programming) {
         HAL_SD_CardStateTypedef st = HAL_SD_CARD_PROGRAMMING;
         // This waits up to 60s for programming to complete.  This seems like
@@ -225,37 +246,94 @@ STATIC void wait_write_complete(sdioio_sdcard_obj_t *self) {
     }
 }
 
-STATIC void check_for_deinit(sdioio_sdcard_obj_t *self) {
+static void check_for_deinit(sdioio_sdcard_obj_t *self) {
     if (common_hal_sdioio_sdcard_deinited(self)) {
         raise_deinited_error();
     }
 }
 
-int common_hal_sdioio_sdcard_writeblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
-    check_for_deinit(self);
-    check_whole_block(bufinfo);
+// Native function for VFS blockdev layer
+mp_negative_errno_t sdioio_sdcard_writeblocks(mp_obj_t self_in, uint8_t *buf,
+    uint32_t start_block, uint32_t num_blocks) {
+    sdioio_sdcard_obj_t *self = MP_OBJ_TO_PTR(self_in);
     wait_write_complete(self);
     self->state_programming = true;
     common_hal_mcu_disable_interrupts();
-    HAL_StatusTypeDef r = HAL_SD_WriteBlocks(&self->handle, bufinfo->buf, start_block, bufinfo->len / 512, 1000);
+    #ifdef STM32H750xx
+    // longer timeouts needed because code executing from QSPI is slower
+    uint32_t time_out = SDMMC_DATATIMEOUT;
+    #else
+    uint32_t time_out = 1000;
+    #endif
+    HAL_StatusTypeDef r = HAL_SD_WriteBlocks(&self->handle, buf, start_block, num_blocks, time_out);
     common_hal_mcu_enable_interrupts();
     if (r != HAL_OK) {
-        return -EIO;
+        return -MP_EIO;
     }
     return 0;
 }
 
-int common_hal_sdioio_sdcard_readblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
+mp_negative_errno_t common_hal_sdioio_sdcard_writeblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
     check_for_deinit(self);
     check_whole_block(bufinfo);
+
+    uint32_t num_blocks = bufinfo->len / 512;
+    return sdioio_sdcard_writeblocks(MP_OBJ_FROM_PTR(self), bufinfo->buf,
+        start_block, num_blocks);
+}
+
+// Native function for VFS blockdev layer
+mp_negative_errno_t sdioio_sdcard_readblocks(mp_obj_t self_in, uint8_t *buf,
+    uint32_t start_block, uint32_t num_blocks) {
+    sdioio_sdcard_obj_t *self = MP_OBJ_TO_PTR(self_in);
     wait_write_complete(self);
     common_hal_mcu_disable_interrupts();
-    HAL_StatusTypeDef r = HAL_SD_ReadBlocks(&self->handle, bufinfo->buf, start_block, bufinfo->len / 512, 1000);
+    #ifdef STM32H750xx
+    // longer timeouts needed because code executing from QSPI is slower
+    uint32_t time_out = SDMMC_DATATIMEOUT;
+    #else
+    uint32_t time_out = 1000;
+    #endif
+    HAL_StatusTypeDef r = HAL_SD_ReadBlocks(&self->handle, buf, start_block, num_blocks, time_out);
     common_hal_mcu_enable_interrupts();
     if (r != HAL_OK) {
-        return -EIO;
+        return -MP_EIO;
     }
     return 0;
+}
+
+mp_negative_errno_t common_hal_sdioio_sdcard_readblocks(sdioio_sdcard_obj_t *self, uint32_t start_block, mp_buffer_info_t *bufinfo) {
+    check_for_deinit(self);
+    check_whole_block(bufinfo);
+
+    uint32_t num_blocks = bufinfo->len / 512;
+    return sdioio_sdcard_readblocks(MP_OBJ_FROM_PTR(self), bufinfo->buf,
+        start_block, num_blocks);
+}
+
+// Native function for VFS blockdev layer
+bool sdioio_sdcard_ioctl(mp_obj_t self_in, size_t cmd, size_t arg,
+    mp_int_t *out_value) {
+    sdioio_sdcard_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    *out_value = 0;
+
+    switch (cmd) {
+        case MP_BLOCKDEV_IOCTL_DEINIT:
+        case MP_BLOCKDEV_IOCTL_SYNC:
+            // SDIO operations are synchronous, no action needed
+            return true;
+
+        case MP_BLOCKDEV_IOCTL_BLOCK_COUNT:
+            *out_value = common_hal_sdioio_sdcard_get_count(self);
+            return true;
+
+        case MP_BLOCKDEV_IOCTL_BLOCK_SIZE:
+            *out_value = 512;  // SD cards use 512-byte sectors
+            return true;
+
+        default:
+            return false;  // Unsupported command
+    }
 }
 
 bool common_hal_sdioio_sdcard_configure(sdioio_sdcard_obj_t *self, uint32_t frequency, uint8_t bits) {
@@ -267,15 +345,9 @@ bool common_hal_sdioio_sdcard_deinited(sdioio_sdcard_obj_t *self) {
     return self->command == NULL;
 }
 
-STATIC void never_reset_mcu_periph(const mcu_periph_obj_t *periph) {
+static void reset_mcu_periph(const mcu_periph_obj_t *periph) {
     if (periph) {
-        never_reset_pin_number(periph->pin->port,periph->pin->number);
-    }
-}
-
-STATIC void reset_mcu_periph(const mcu_periph_obj_t *periph) {
-    if (periph) {
-        reset_pin_number(periph->pin->port,periph->pin->number);
+        reset_pin_number(periph->pin->port, periph->pin->number);
     }
 }
 
@@ -285,43 +357,11 @@ void common_hal_sdioio_sdcard_deinit(sdioio_sdcard_obj_t *self) {
     }
 
     reserved_sdio[self->command->periph_index - 1] = false;
-    never_reset_sdio[self->command->periph_index - 1] = false;
 
     reset_mcu_periph(self->command);
-    self->command = NULL;
-
     reset_mcu_periph(self->clock);
-    self->command = NULL;
-
     for (size_t i = 0; i < MP_ARRAY_SIZE(self->data); i++) {
         reset_mcu_periph(self->data[i]);
-        self->data[i] = NULL;
     }
-}
-
-void common_hal_sdioio_sdcard_never_reset(sdioio_sdcard_obj_t *self) {
-    if (common_hal_sdioio_sdcard_deinited(self)) {
-        return;
-    }
-
-    if (never_reset_sdio[self->command->periph_index] - 1) {
-        return;
-    }
-
-    never_reset_sdio[self->command->periph_index - 1] = true;
-
-    never_reset_mcu_periph(self->command);
-    never_reset_mcu_periph(self->clock);
-
-    for (size_t i = 0; i < MP_ARRAY_SIZE(self->data); i++) {
-        never_reset_mcu_periph(self->data[i]);
-    }
-}
-
-void sdioio_reset() {
-    for (size_t i = 0; i < MP_ARRAY_SIZE(reserved_sdio); i++) {
-        if (!never_reset_sdio[i]) {
-            reserved_sdio[i] = false;
-        }
-    }
+    mark_deinit(self);
 }

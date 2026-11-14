@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Dan Halbertfor Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Dan Halbert for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include <stdint.h>
 
@@ -31,8 +11,6 @@
 
 #include "shared-bindings/usb_cdc/__init__.h"
 #include "shared-bindings/usb_cdc/Serial.h"
-
-#include "py/runtime.h"
 
 //| """USB CDC Serial streams
 //|
@@ -61,6 +39,8 @@
 //| """A `Serial` object that can be used to send and receive binary data to and from
 //| the host.
 //| Note that `data` is *disabled* by default. ``data`` is ``None`` if disabled."""
+//|
+//|
 
 //| def disable() -> None:
 //|     """Do not present any USB CDC device to the host.
@@ -68,9 +48,10 @@
 //|     Equivalent to ``usb_cdc.enable(console=False, data=False)``."""
 //|     ...
 //|
-STATIC mp_obj_t usb_cdc_disable(void) {
+//|
+static mp_obj_t usb_cdc_disable(void) {
     if (!common_hal_usb_cdc_disable()) {
-        mp_raise_RuntimeError(translate("Cannot change USB devices now"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Cannot change USB devices now"));
     }
     return mp_const_none;
 }
@@ -91,7 +72,8 @@ MP_DEFINE_CONST_FUN_OBJ_0(usb_cdc_disable_obj, usb_cdc_disable);
 //|     """
 //|     ...
 //|
-STATIC mp_obj_t usb_cdc_enable(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+//|
+static mp_obj_t usb_cdc_enable(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_console, ARG_data };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_console, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true } },
@@ -101,11 +83,94 @@ STATIC mp_obj_t usb_cdc_enable(size_t n_args, const mp_obj_t *pos_args, mp_map_t
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     if (!common_hal_usb_cdc_enable(args[ARG_console].u_bool, args[ARG_data].u_bool)) {
-        mp_raise_RuntimeError(translate("Cannot change USB devices now"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Cannot change USB devices now"));
     }
     return mp_const_none;
 }
 MP_DEFINE_CONST_FUN_OBJ_KW(usb_cdc_enable_obj, 0, usb_cdc_enable);
+
+#if CIRCUITPY_FULL_BUILD
+char *custom_usb_cdc_console_control_interface_name = NULL;
+char *custom_usb_cdc_console_data_interface_name = NULL;
+char *custom_usb_cdc_data_control_interface_name = NULL;
+char *custom_usb_cdc_data_data_interface_name = NULL;
+
+static void set_name(mp_obj_t name_obj, qstr arg_name_qstr, char **custom_name_p) {
+    if (name_obj != mp_const_none) {
+        mp_buffer_info_t name;
+        mp_get_buffer_raise(name_obj, &name, MP_BUFFER_READ);
+        mp_arg_validate_length_range(name.len, 1, 126, arg_name_qstr);
+
+        if (*custom_name_p == NULL) {
+            *custom_name_p = port_malloc(sizeof(char) * 128, false);
+        }
+
+        memcpy(*custom_name_p, name.buf, name.len);
+        (*custom_name_p)[name.len] = 0;
+    }
+}
+
+//| def set_names(
+//|     *,
+//|     console_control_interface_name: Optional[str] = None,
+//|     console_data_interface_name: Optional[str] = None,
+//|     data_control_interface_name: Optional[str] = None,
+//|     data_data_interface_name: Optional[str] = None,
+//| ) -> None:
+//|     """Override the CDC interface names in the USB Interface Descriptors.
+//|
+//|     Each CDC serial device has a control interface and a data interface.
+//|
+//|     :param Optional[str] console_control_interface_name: an ASCII string (or buffer) of at most 126 characters for the console control interface, or ``None`` to use the default name.
+//|     :param Optional[str] console_data_interface_name: an ASCII string (or buffer) of at most 126 characters for the console data interface, or ``None`` to use the default name.
+//|     :param Optional[str] data_control_interface_name: an ASCII string (or buffer) of at most 126 characters for the data-port control interface, or ``None`` to use the default name.
+//|     :param Optional[str] data_data_interface_name: an ASCII string (or buffer) of at most 126 characters for the data-port data interface, or ``None`` to use the default name.
+//|
+//|     This method must be called in ``boot.py`` to have any effect.
+//|
+//|     Not available on boards without native USB support or on reduced builds.
+//|     """
+//|     ...
+//|
+//|
+static mp_obj_t usb_cdc_set_names(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum {
+        ARG_console_control_interface_name,
+        ARG_console_data_interface_name,
+        ARG_data_control_interface_name,
+        ARG_data_data_interface_name
+    };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_console_control_interface_name, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = mp_const_none} },
+        { MP_QSTR_console_data_interface_name,    MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = mp_const_none} },
+        { MP_QSTR_data_control_interface_name,    MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = mp_const_none} },
+        { MP_QSTR_data_data_interface_name,       MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = mp_const_none} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, (mp_arg_val_t *)&args);
+
+    set_name(
+        args[ARG_console_control_interface_name].u_obj,
+        MP_QSTR_console_control_interface_name,
+        &custom_usb_cdc_console_control_interface_name);
+    set_name(
+        args[ARG_console_data_interface_name].u_obj,
+        MP_QSTR_console_data_interface_name,
+        &custom_usb_cdc_console_data_interface_name);
+    set_name(
+        args[ARG_data_control_interface_name].u_obj,
+        MP_QSTR_data_control_interface_name,
+        &custom_usb_cdc_data_control_interface_name);
+    set_name(
+        args[ARG_data_data_interface_name].u_obj,
+        MP_QSTR_data_data_interface_name,
+        &custom_usb_cdc_data_data_interface_name);
+
+    return mp_const_none;
+}
+MP_DEFINE_CONST_FUN_OBJ_KW(usb_cdc_set_names_obj, 0, usb_cdc_set_names);
+
+#endif
 
 // The usb_cdc module dict is mutable so that .console and .data may
 // be set to a Serial or to None depending on whether they are enabled or not.
@@ -116,6 +181,9 @@ static mp_map_elem_t usb_cdc_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_data),     mp_const_none },
     { MP_ROM_QSTR(MP_QSTR_disable),  MP_OBJ_FROM_PTR(&usb_cdc_disable_obj) },
     { MP_ROM_QSTR(MP_QSTR_enable),   MP_OBJ_FROM_PTR(&usb_cdc_enable_obj) },
+    #if CIRCUITPY_FULL_BUILD
+    { MP_ROM_QSTR(MP_QSTR_set_names), MP_OBJ_FROM_PTR(&usb_cdc_set_names_obj) },
+    #endif
 };
 
 static MP_DEFINE_MUTABLE_DICT(usb_cdc_module_globals, usb_cdc_module_globals_table);
@@ -140,4 +208,4 @@ void usb_cdc_set_data(mp_obj_t serial_obj) {
     set_module_dict_entry(MP_ROM_QSTR(MP_QSTR_data), serial_obj);
 }
 
-MP_REGISTER_MODULE(MP_QSTR_usb_cdc, usb_cdc_module, CIRCUITPY_USB_CDC);
+MP_REGISTER_MODULE(MP_QSTR_usb_cdc, usb_cdc_module);

@@ -1,0 +1,309 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2023 Jeff Epler for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
+
+#include "py/runtime.h"
+#include "py/objtype.h"
+#include "py/stream.h"
+
+#include "shared-bindings/jpegio/JpegDecoder.h"
+#include "shared-bindings/bitmaptools/__init__.h"
+#include "shared-module/jpegio/JpegDecoder.h"
+
+typedef size_t (*input_func)(JDEC *jd, uint8_t *dest, size_t len);
+
+// Given a pointer `ptr` to the field `field_name` inside a structure of type `type`,
+// retrieve a pointer to the containing object.
+// This is used to retrieve the jpegio_jpegdecoder_obj_t object given the JDEC.
+// Similar macros of this type are frequently employed in low-level code, but this is
+// not standardized.
+#define CONTAINER_OF(ptr, type, field_name) ((type *)(void *)(((uint8_t *)ptr) - offsetof(type, field_name)))
+
+static void check_jresult(JRESULT j) {
+    mp_rom_error_text_t msg = 0;
+    switch (j) {
+        case JDR_OK:
+            return;
+        case JDR_INTR:
+            msg = MP_ERROR_TEXT("Interrupted by output function");
+            break;
+        case JDR_INP:
+            msg = MP_ERROR_TEXT("Device error or wrong termination of input stream");
+            break;
+        case JDR_MEM1:
+            msg = MP_ERROR_TEXT("Insufficient memory pool for the image");
+            break;
+        case JDR_MEM2:
+            msg = MP_ERROR_TEXT("Insufficient stream input buffer");
+            break;
+        case JDR_PAR:
+            msg = MP_ERROR_TEXT("Parameter error");
+            break;
+        case JDR_FMT1:
+            msg = MP_ERROR_TEXT("Data format error (may be broken data)");
+            break;
+        case JDR_FMT2:
+            msg = MP_ERROR_TEXT("Right format but not supported");
+            break;
+        case JDR_FMT3:
+            msg = MP_ERROR_TEXT("Unsupported JPEG (may be progressive)");
+            break;
+    }
+    mp_raise_RuntimeError(msg);
+}
+
+void common_hal_jpegio_jpegdecoder_construct(jpegio_jpegdecoder_obj_t *self, bool software_ok) {
+    self->data_obj = MP_OBJ_NULL;
+    self->software_ok = software_ok;
+    #if CIRCUITPY_JPEGIO_HW
+    jpegio_jpegdecoder_hw_init(self);
+    #endif
+}
+
+void common_hal_jpegio_jpegdecoder_deinit(jpegio_jpegdecoder_obj_t *self) {
+    #if CIRCUITPY_JPEGIO_HW
+    jpegio_jpegdecoder_hw_deinit(self);
+    #endif
+}
+
+void common_hal_jpegio_jpegdecoder_close(jpegio_jpegdecoder_obj_t *self) {
+    self->data_obj = MP_OBJ_NULL;
+    memset(&self->bufinfo, 0, sizeof(self->bufinfo));
+}
+
+static mp_obj_t common_hal_jpegio_jpegdecoder_decode_common(jpegio_jpegdecoder_obj_t *self, input_func fun) {
+    JRESULT result = jd_prepare(&self->decoder, fun, &self->workspace, sizeof(self->workspace), NULL);
+    if (result != JDR_OK) {
+        common_hal_jpegio_jpegdecoder_close(self);
+    }
+    check_jresult(result);
+    mp_obj_t elems[] = {
+        MP_OBJ_NEW_SMALL_INT(self->decoder.width),
+        MP_OBJ_NEW_SMALL_INT(self->decoder.height)
+    };
+    return mp_obj_new_tuple(MP_ARRAY_SIZE(elems), elems);
+}
+
+static size_t file_input(JDEC *jd, uint8_t *dest, size_t len) {
+    jpegio_jpegdecoder_obj_t *self = CONTAINER_OF(jd, jpegio_jpegdecoder_obj_t, decoder);
+
+    if (!dest) {
+        // caller passes NULL to skip data; we need to read over the data.
+        // Don't assume a seekable stream, because we want to decode jpegs
+        // right from a native socket object
+        uint8_t buf[512];
+        size_t total = 0;
+        size_t read;
+        do {
+            size_t to_discard = MIN(len - total, sizeof(buf));
+            read = file_input(jd, buf, to_discard);
+            total += read;
+        } while (read != 0 && total != len);
+        return total;
+    }
+
+    int errcode = 0;
+    size_t result = mp_stream_rw(self->data_obj, dest, len, &errcode, MP_STREAM_RW_READ);
+    if (errcode != 0) { // raise our own error in case of I/O failure, it's better than the decoder's error
+        mp_raise_OSError(errcode);
+    }
+    return result;
+}
+
+mp_obj_t common_hal_jpegio_jpegdecoder_set_source_file(jpegio_jpegdecoder_obj_t *self, mp_obj_t file_obj) {
+    self->data_obj = file_obj;
+    #if CIRCUITPY_JPEGIO_FAST
+    self->stream_start_position = -1;
+    // Seeking a Python io.IOBase subclass calls its ioctl method, which may not
+    // exist, so only native streams are read whole.
+    if (mp_obj_is_native_type(mp_obj_get_type(file_obj)) && mp_get_stream(file_obj)->ioctl != NULL) {
+        int errcode;
+        self->stream_start_position = mp_stream_seek(file_obj, 0, MP_SEEK_CUR, &errcode);
+    }
+    #endif
+    return common_hal_jpegio_jpegdecoder_decode_common(self, file_input);
+}
+
+static size_t buffer_input(JDEC *jd, uint8_t *dest, size_t len) {
+    jpegio_jpegdecoder_obj_t *self = CONTAINER_OF(jd, jpegio_jpegdecoder_obj_t, decoder);
+    mp_buffer_info_t *src = &self->bufinfo;
+    size_t to_copy = MIN(len, src->len);
+    if (dest) { // passes NULL to skip data
+        memcpy(dest, src->buf, to_copy);
+    }
+    src->buf = (uint8_t *)src->buf + to_copy;
+    src->len -= to_copy;
+    return to_copy;
+}
+
+mp_obj_t common_hal_jpegio_jpegdecoder_set_source_buffer(jpegio_jpegdecoder_obj_t *self, mp_obj_t buffer_obj) {
+    self->data_obj = buffer_obj;
+    mp_get_buffer_raise(buffer_obj, &self->bufinfo, MP_BUFFER_READ);
+    return common_hal_jpegio_jpegdecoder_decode_common(self, buffer_input);
+}
+
+bool jpegio_jpegdecoder_blit_rect(jpegio_jpegdecoder_obj_t *self, displayio_bitmap_t *src, int left, int top) {
+    int src_width = src->width, src_height = src->height;
+    int x = self->x;
+    int y = self->y;
+    int x1 = self->lim.x1 - left;
+    int x2 = self->lim.x2 - left;
+    int y1 = self->lim.y1 - top;
+    int y2 = self->lim.y2 - top;
+
+    if (y2 <= 0) {
+        // The last row in the source image to copy FROM is above of this, so
+        // no more pixels on any rows
+        return false;
+    }
+
+    y2 = MIN(y2, src_height);
+    if (x2 <= 0) {
+        // The last column in the source image to copy FROM is left of this, so
+        // no more pixels on this row but could be on subsequent rows
+        return true;
+    }
+    x2 = MIN(x2, src_width);
+
+    // The first column in the source image to copy FROM is left of this, so copy starting with
+    // *local source* x1 equal to 0, and *target* x adjusted right by the same amount
+    if (x1 < 0) {
+        x += -x1;
+        x1 = 0;
+    }
+
+    // the same, but for Y coordinates
+    if (y1 < 0) {
+        y += -y1;
+        y1 = 0;
+    }
+
+    // blit takes care of x, y out of range
+    assert(x1 >= 0);
+    assert(y1 >= 0);
+    // blit takes care of x1 >= x2 and y1 >= y2 cases
+    assert(x2 <= src_width);
+    assert(y2 <= src_height);
+
+    common_hal_bitmaptools_blit(self->dest, src, x, y, x1, y1, x2, y2, self->skip_source_index, self->skip_source_index_none, self->skip_dest_index, self->skip_dest_index_none);
+    return true;
+}
+
+#define DECODER_CONTINUE (1)
+#define DECODER_INTERRUPT (0)
+static int bitmap_output(JDEC *jd, void *data, JRECT *rect) {
+    jpegio_jpegdecoder_obj_t *self = CONTAINER_OF(jd, jpegio_jpegdecoder_obj_t, decoder);
+    int src_width = rect->right - rect->left + 1, src_pixel_stride = src_width /* in units of pixels! */, src_height = rect->bottom - rect->top + 1;
+
+    displayio_bitmap_t src = {
+        .width = src_width,
+        .height = src_height,
+        .data = data,
+        .stride = src_pixel_stride / 2, /* in units of uint32_t */
+        .bits_per_value = 16,
+        .x_shift = 1,
+        .x_mask = 1,
+        .bitmask = 0xffff,
+    };
+
+    return jpegio_jpegdecoder_blit_rect(self, &src, rect->left, rect->top) ? DECODER_CONTINUE : DECODER_INTERRUPT;
+}
+
+#if CIRCUITPY_JPEGIO_FAST
+// Read a seekable file or stream, from where the JPEG starts to the end, into
+// memory and pass it to the port's decoder. If the port declines, the stream is
+// put back where TJpgDec left it, so TJpgDec can continue.
+static bool fast_decode_stream(jpegio_jpegdecoder_obj_t *self, int scale) {
+    mp_obj_t stream = self->data_obj;
+    mp_off_t start = self->stream_start_position;
+    if (start == (mp_off_t)-1) {
+        return false;
+    }
+    int errcode;
+    mp_off_t pos = mp_stream_seek(stream, 0, MP_SEEK_CUR, &errcode);
+    if (pos == (mp_off_t)-1) {
+        return false;
+    }
+    mp_off_t end = mp_stream_seek(stream, 0, MP_SEEK_END, &errcode);
+    bool ok = false;
+    if (end != (mp_off_t)-1 && end > start) {
+        size_t size = end - start;
+        uint8_t *data = m_malloc_maybe(size);
+        if (data != NULL && mp_stream_seek(stream, start, MP_SEEK_SET, &errcode) == start &&
+            mp_stream_rw(stream, data, size, &errcode, MP_STREAM_RW_READ) == size) {
+            mp_buffer_info_t jpeg = { .buf = data, .len = size };
+            ok = jpegio_jpegdecoder_fast_decode(self, &jpeg, scale);
+        }
+        m_free(data);
+    }
+    if (!ok) {
+        mp_stream_seek(stream, pos, MP_SEEK_SET, &errcode);
+    }
+    return ok;
+}
+
+static bool fast_decode(jpegio_jpegdecoder_obj_t *self, int scale) {
+    if (!jpegio_jpegdecoder_fast_supported(self, scale)) {
+        return false;
+    }
+    if (self->decoder.infunc == file_input) {
+        return fast_decode_stream(self, scale);
+    }
+    mp_buffer_info_t jpeg;
+    return mp_get_buffer(self->data_obj, &jpeg, MP_BUFFER_READ) &&
+           jpegio_jpegdecoder_fast_decode(self, &jpeg, scale);
+}
+#endif
+
+void common_hal_jpegio_jpegdecoder_decode_into(
+    jpegio_jpegdecoder_obj_t *self,
+    displayio_bitmap_t *bitmap, int scale, int16_t x, int16_t y,
+    bitmaptools_rect_t *lim,
+    uint32_t skip_source_index, bool skip_source_index_none,
+    uint32_t skip_dest_index, bool skip_dest_index_none) {
+    if (self->data_obj == MP_OBJ_NULL) {
+        mp_raise_RuntimeError_varg(MP_ERROR_TEXT("%q() without %q()"), MP_QSTR_decode, MP_QSTR_open);
+    }
+
+    self->x = x;
+    self->y = y;
+    self->lim = *lim;
+    self->skip_source_index = skip_source_index;
+    self->skip_source_index_none = skip_source_index_none;
+    self->skip_dest_index = skip_dest_index;
+    self->skip_dest_index_none = skip_dest_index_none;
+
+    self->dest = bitmap;
+
+    #if CIRCUITPY_JPEGIO_HW
+    mp_buffer_info_t jpeg;
+    if (self->decoder.infunc == buffer_input &&
+        mp_get_buffer(self->data_obj, &jpeg, MP_BUFFER_READ)) {
+        if (jpegio_jpegdecoder_hw_decode(self, &jpeg, scale)) {
+            common_hal_jpegio_jpegdecoder_close(self);
+            return;
+        }
+    } else if (!self->software_ok) {
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("Invalid %q"), MP_QSTR_data_source);
+    }
+    #else
+    if (!self->software_ok) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Operation or feature not supported"));
+    }
+    #endif
+
+    #if CIRCUITPY_JPEGIO_FAST
+    if (fast_decode(self, scale)) {
+        common_hal_jpegio_jpegdecoder_close(self);
+        return;
+    }
+    #endif
+
+    JRESULT result = jd_decomp(&self->decoder, bitmap_output, scale);
+    common_hal_jpegio_jpegdecoder_close(self);
+    if (result != JDR_INTR) {
+        check_jresult(result);
+    }
+}

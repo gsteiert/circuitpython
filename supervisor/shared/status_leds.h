@@ -1,31 +1,10 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
-#ifndef MICROPY_INCLUDED_SUPERVISOR_STATUS_LEDS_H
-#define MICROPY_INCLUDED_SUPERVISOR_STATUS_LEDS_H
+#pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -44,19 +23,31 @@
 // To work with a NeoPixel, one must have MICROPY_HW_NEOPIXEL defined and
 // neopixel_write implemented.
 
-#define CIRCUITPY_PWM_RGB_LED defined(CIRCUITPY_RGB_STATUS_R) || defined(CIRCUITPY_RGB_STATUS_G) || defined(CIRCUITPY_RGB_STATUS_B)
-#define CIRCUITPY_STATUS_LED (CIRCUITPY_DIGITALIO && defined(MICROPY_HW_LED_STATUS)) || defined(MICROPY_HW_NEOPIXEL) || (defined(MICROPY_HW_APA102_MOSI) && defined(MICROPY_HW_APA102_SCK)) || CIRCUITPY_PWM_RGB_LED
+#define CIRCUITPY_PWM_RGB_LED (defined(CIRCUITPY_RGB_STATUS_R) || defined(CIRCUITPY_RGB_STATUS_G) || defined(CIRCUITPY_RGB_STATUS_B))
+#define CIRCUITPY_STATUS_LED ((CIRCUITPY_DIGITALIO && defined(MICROPY_HW_LED_STATUS)) || defined(MICROPY_HW_NEOPIXEL) || (defined(MICROPY_HW_APA102_MOSI) && defined(MICROPY_HW_APA102_SCK)) || CIRCUITPY_PWM_RGB_LED)
 
 void status_led_init(void);
 void status_led_deinit(void);
 void new_status_color(uint32_t rgb);
 
+typedef enum {
+    STATUS_NEOPIXEL_ORDER_GRB,
+    STATUS_NEOPIXEL_ORDER_RGB,
+} status_neopixel_order_t;
+
+// Set the byte order sent to a status NeoPixel, for boards whose variants
+// differ in LED order. STATUS_NEOPIXEL_ORDER_GRB sends G,R,B (most WS2812s).
+// STATUS_NEOPIXEL_ORDER_RGB sends R,G,B. The default is MICROPY_HW_NEOPIXEL_ORDER.
+// Only sets the order; call it from board_init(), and the next status_led_init()
+// writes the LED with it.
+// Does nothing on boards without MICROPY_HW_NEOPIXEL.
+void status_led_set_neopixel_order(status_neopixel_order_t order);
+
 uint32_t color_brightness(uint32_t color, uint8_t brightness);
 void set_status_brightness(uint8_t level);
+uint8_t get_status_brightness(void);
 
 void init_rxtx_leds(void);
 void deinit_rxtx_leds(void);
 void toggle_rx_led(void);
 void toggle_tx_led(void);
-
-#endif  // MICROPY_INCLUDED_SUPERVISOR_STATUS_LEDS_H

@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include <string.h>
 
@@ -35,37 +15,42 @@
 #include "shared-bindings/_bleio/Service.h"
 #include "shared-bindings/_bleio/UUID.h"
 #include "shared-module/storage/__init__.h"
+#include "supervisor/shared/bluetooth/bluetooth.h"
 #include "supervisor/shared/bluetooth/serial.h"
 
 #include "common-hal/_bleio/__init__.h"
 
 #include "py/mpstate.h"
 
-STATIC bleio_service_obj_t supervisor_ble_circuitpython_service;
-STATIC bleio_uuid_obj_t supervisor_ble_circuitpython_service_uuid;
-STATIC bleio_characteristic_obj_t supervisor_ble_circuitpython_rx_characteristic;
-STATIC bleio_uuid_obj_t supervisor_ble_circuitpython_rx_uuid;
-STATIC bleio_characteristic_obj_t supervisor_ble_circuitpython_tx_characteristic;
-STATIC bleio_uuid_obj_t supervisor_ble_circuitpython_tx_uuid;
-STATIC bleio_characteristic_obj_t supervisor_ble_circuitpython_version_characteristic;
-STATIC bleio_uuid_obj_t supervisor_ble_circuitpython_version_uuid;
+static bleio_service_obj_t supervisor_ble_circuitpython_service;
+static bleio_uuid_obj_t supervisor_ble_circuitpython_service_uuid;
+static bleio_characteristic_obj_t supervisor_ble_circuitpython_rx_characteristic;
+static bleio_uuid_obj_t supervisor_ble_circuitpython_rx_uuid;
+static bleio_characteristic_obj_t supervisor_ble_circuitpython_tx_characteristic;
+static bleio_uuid_obj_t supervisor_ble_circuitpython_tx_uuid;
+static bleio_characteristic_obj_t supervisor_ble_circuitpython_version_characteristic;
+static bleio_uuid_obj_t supervisor_ble_circuitpython_version_uuid;
 
-// This is the base UUID for the CircuitPython service.
-const uint8_t circuitpython_base_uuid[16] = {0x6e, 0x68, 0x74, 0x79, 0x50, 0x74, 0x69, 0x75, 0x63, 0x72, 0x69, 0x43, 0x00, 0x00, 0xaf, 0xad };
+static mp_obj_list_t characteristic_list;
+static mp_obj_t characteristic_list_items[3];
 
-STATIC mp_obj_list_t characteristic_list;
-STATIC mp_obj_t characteristic_list_items[3];
-
-STATIC uint32_t _outgoing1[BLE_GATTS_VAR_ATTR_LEN_MAX / 4];
-STATIC uint32_t _outgoing2[BLE_GATTS_VAR_ATTR_LEN_MAX / 4];
-STATIC ble_drv_evt_handler_entry_t rx_static_handler_entry;
-STATIC ble_drv_evt_handler_entry_t tx_static_handler_entry;
-STATIC bleio_packet_buffer_obj_t _tx_packet_buffer;
-STATIC uint32_t _incoming[64];
-STATIC bleio_characteristic_buffer_obj_t _rx_buffer;
+#if BLEIO_PACKET_BUFFER_MAX_PACKET_SIZE % 4 != 0
+#error "BLEIO_PACKET_BUFFER_MAX_PACKET_SIZE must be a multiple of 4"
+#endif
+static uint32_t _outgoing1[BLEIO_PACKET_BUFFER_MAX_PACKET_SIZE / 4];
+// TODO: _outgoing2 is unused on espressif, whose NimBLE send calls copy the data
+// rather than retaining the buffer as the nordic SoftDevice does. Letting a port
+// declare how many outgoing buffers it needs would drop this static allocation
+// there; nordic requires both.
+static uint32_t _outgoing2[BLEIO_PACKET_BUFFER_MAX_PACKET_SIZE / 4];
+static ble_event_handler_t rx_static_handler_entry;
+static ble_event_handler_t tx_static_handler_entry;
+static bleio_packet_buffer_obj_t _tx_packet_buffer;
+static uint32_t _incoming[64];
+static bleio_characteristic_buffer_obj_t _rx_buffer;
 
 // Internal enabling so we can disable while printing BLE debugging.
-STATIC bool _enabled;
+static bool _enabled;
 
 void supervisor_start_bluetooth_serial(void) {
     supervisor_ble_circuitpython_service_uuid.base.type = &bleio_uuid_type;
@@ -84,6 +69,7 @@ void supervisor_start_bluetooth_serial(void) {
     // RX
     supervisor_ble_circuitpython_rx_uuid.base.type = &bleio_uuid_type;
     common_hal_bleio_uuid_construct(&supervisor_ble_circuitpython_rx_uuid, 0x0002, circuitpython_base_uuid);
+    supervisor_ble_circuitpython_rx_characteristic.base.type = &bleio_characteristic_type;
     common_hal_bleio_characteristic_construct(&supervisor_ble_circuitpython_rx_characteristic,
         &supervisor_ble_circuitpython_service,
         0,                                       // handle (for remote only)
@@ -91,7 +77,7 @@ void supervisor_start_bluetooth_serial(void) {
         CHAR_PROP_WRITE | CHAR_PROP_WRITE_NO_RESPONSE,
         SECURITY_MODE_NO_ACCESS,
         SECURITY_MODE_ENC_NO_MITM,
-        BLE_GATTS_VAR_ATTR_LEN_MAX,                 // max length
+        BLEIO_PACKET_BUFFER_MAX_PACKET_SIZE,                 // max length
         false,                                      // fixed length
         NULL,                                      // no initial value
         NULL);
@@ -99,6 +85,7 @@ void supervisor_start_bluetooth_serial(void) {
     // TX
     supervisor_ble_circuitpython_tx_uuid.base.type = &bleio_uuid_type;
     common_hal_bleio_uuid_construct(&supervisor_ble_circuitpython_tx_uuid, 0x0003, circuitpython_base_uuid);
+    supervisor_ble_circuitpython_tx_characteristic.base.type = &bleio_characteristic_type;
     common_hal_bleio_characteristic_construct(&supervisor_ble_circuitpython_tx_characteristic,
         &supervisor_ble_circuitpython_service,
         0,                                       // handle (for remote only)
@@ -106,7 +93,7 @@ void supervisor_start_bluetooth_serial(void) {
         CHAR_PROP_NOTIFY,
         SECURITY_MODE_ENC_NO_MITM,
         SECURITY_MODE_NO_ACCESS,
-        BLE_GATTS_VAR_ATTR_LEN_MAX,                  // max length
+        BLEIO_PACKET_BUFFER_MAX_PACKET_SIZE,                  // max length
         false,                                       // fixed length
         NULL,                                       // no initial value
         NULL);
@@ -119,6 +106,7 @@ void supervisor_start_bluetooth_serial(void) {
 
     supervisor_ble_circuitpython_version_uuid.base.type = &bleio_uuid_type;
     common_hal_bleio_uuid_construct(&supervisor_ble_circuitpython_version_uuid, 0x0100, circuitpython_base_uuid);
+    supervisor_ble_circuitpython_version_characteristic.base.type = &bleio_characteristic_type;
     common_hal_bleio_characteristic_construct(&supervisor_ble_circuitpython_version_characteristic,
         &supervisor_ble_circuitpython_service,
         0,                                       // handle (for remote only)
@@ -135,18 +123,21 @@ void supervisor_start_bluetooth_serial(void) {
 
     // Use a PacketBuffer to transmit so that we glom characters to transmit
     // together and save BLE overhead.
+    _tx_packet_buffer.base.type = &bleio_packet_buffer_type;
     _common_hal_bleio_packet_buffer_construct(
         &_tx_packet_buffer, &supervisor_ble_circuitpython_tx_characteristic,
         NULL, 0,
-        _outgoing1, _outgoing2, BLE_GATTS_VAR_ATTR_LEN_MAX,
+        _outgoing1, _outgoing2, BLEIO_PACKET_BUFFER_MAX_PACKET_SIZE,
         &tx_static_handler_entry);
 
     // Use a CharacteristicBuffer for rx so we can read a single character at a time.
+    _rx_buffer.base.type = &bleio_characteristic_buffer_type;
     _common_hal_bleio_characteristic_buffer_construct(&_rx_buffer,
         &supervisor_ble_circuitpython_rx_characteristic,
         0.1f,
-        (uint8_t *)_incoming, sizeof(_incoming) * sizeof(uint32_t),
-        &rx_static_handler_entry);
+        (uint8_t *)_incoming, sizeof(_incoming),
+        &rx_static_handler_entry,
+        true /* watch for interrupt character */);
 
     _enabled = true;
 }
@@ -159,16 +150,23 @@ void supervisor_stop_bluetooth_serial(void) {
         return;
     }
     common_hal_bleio_packet_buffer_flush(&_tx_packet_buffer);
+    common_hal_bleio_packet_buffer_deinit(&_tx_packet_buffer);
+    common_hal_bleio_characteristic_deinit(&supervisor_ble_circuitpython_rx_characteristic);
+    common_hal_bleio_characteristic_deinit(&supervisor_ble_circuitpython_tx_characteristic);
+    common_hal_bleio_characteristic_deinit(&supervisor_ble_circuitpython_version_characteristic);
+    common_hal_bleio_service_deinit(&supervisor_ble_circuitpython_service);
 }
 
 bool ble_serial_connected(void) {
-    return _tx_packet_buffer.conn_handle != BLE_CONN_HANDLE_INVALID;
+    return common_hal_bleio_packet_buffer_connected(&_tx_packet_buffer);
 }
 
-bool ble_serial_available(void) {
-    return _enabled &&
-           !common_hal_bleio_characteristic_buffer_deinited(&_rx_buffer) &&
-           common_hal_bleio_characteristic_buffer_rx_characters_available(&_rx_buffer);
+uint32_t ble_serial_available(void) {
+    if (_enabled && !common_hal_bleio_characteristic_buffer_deinited(&_rx_buffer)) {
+        return common_hal_bleio_characteristic_buffer_rx_characters_available(&_rx_buffer);
+    } else {
+        return 0;
+    }
 }
 
 char ble_serial_read_char(void) {

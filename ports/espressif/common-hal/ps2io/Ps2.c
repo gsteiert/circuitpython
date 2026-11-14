@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 microDev
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 microDev
+//
+// SPDX-License-Identifier: MIT
 
 #include "common-hal/ps2io/Ps2.h"
 #include "shared-bindings/ps2io/Ps2.h"
@@ -48,10 +28,6 @@
 #define ERROR_TX_ACKCLK 0x800
 #define ERROR_TX_RTS 0x1000
 #define ERROR_TX_NORESP 0x2000
-
-void ps2_reset(void) {
-    gpio_uninstall_isr_service();
-}
 
 static void delay_us(uint32_t t) {
     common_hal_mcu_delay_us(t);
@@ -252,7 +228,10 @@ void common_hal_ps2io_ps2_deinit(ps2io_ps2_obj_t *self) {
     if (common_hal_ps2io_ps2_deinited(self)) {
         return;
     }
-    gpio_uninstall_isr_service();
+    // Remove only this object's handler. Uninstalling the GPIO ISR service
+    // would remove every other object's GPIO interrupt handler too.
+    disable_interrupt(self);
+    gpio_set_intr_type(self->clk_pin, GPIO_INTR_DISABLE);
     reset_pin_number(self->clk_pin);
     reset_pin_number(self->data_pin);
     self->clk_pin = GPIO_NUM_MAX;

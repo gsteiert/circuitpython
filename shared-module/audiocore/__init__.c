@@ -1,57 +1,31 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-module/audioio/__init__.h"
 
 #include "py/obj.h"
+#include "py/runtime.h"
+#include "shared-bindings/audiocore/__init__.h"
 #include "shared-bindings/audiocore/RawSample.h"
 #include "shared-bindings/audiocore/WaveFile.h"
 #include "shared-module/audiocore/RawSample.h"
 #include "shared-module/audiocore/WaveFile.h"
 
+#if CIRCUITPY_AUDIOSPEED
+#include "shared-bindings/audiospeed/Resampler.h"
+#endif
+
 #include "shared-bindings/audiomixer/Mixer.h"
 #include "shared-module/audiomixer/Mixer.h"
 
-uint32_t audiosample_sample_rate(mp_obj_t sample_obj) {
-    const audiosample_p_t *proto = mp_proto_get_or_throw(MP_QSTR_protocol_audiosample, sample_obj);
-    return proto->sample_rate(MP_OBJ_TO_PTR(sample_obj));
-}
-
-uint8_t audiosample_bits_per_sample(mp_obj_t sample_obj) {
-    const audiosample_p_t *proto = mp_proto_get_or_throw(MP_QSTR_protocol_audiosample, sample_obj);
-    return proto->bits_per_sample(MP_OBJ_TO_PTR(sample_obj));
-}
-
-uint8_t audiosample_channel_count(mp_obj_t sample_obj) {
-    const audiosample_p_t *proto = mp_proto_get_or_throw(MP_QSTR_protocol_audiosample, sample_obj);
-    return proto->channel_count(MP_OBJ_TO_PTR(sample_obj));
-}
-
 void audiosample_reset_buffer(mp_obj_t sample_obj, bool single_channel_output, uint8_t audio_channel) {
     const audiosample_p_t *proto = mp_proto_get_or_throw(MP_QSTR_protocol_audiosample, sample_obj);
+    if (audiosample_deinited(audiosample_cast_obj(sample_obj))) {
+        return;
+    }
     proto->reset_buffer(MP_OBJ_TO_PTR(sample_obj), single_channel_output, audio_channel);
 }
 
@@ -60,15 +34,12 @@ audioio_get_buffer_result_t audiosample_get_buffer(mp_obj_t sample_obj,
     uint8_t channel,
     uint8_t **buffer, uint32_t *buffer_length) {
     const audiosample_p_t *proto = mp_proto_get_or_throw(MP_QSTR_protocol_audiosample, sample_obj);
+    if (audiosample_deinited(audiosample_cast_obj(sample_obj))) {
+        *buffer = NULL;
+        *buffer_length = 0;
+        return GET_BUFFER_ERROR;
+    }
     return proto->get_buffer(MP_OBJ_TO_PTR(sample_obj), single_channel_output, channel, buffer, buffer_length);
-}
-
-void audiosample_get_buffer_structure(mp_obj_t sample_obj, bool single_channel_output,
-    bool *single_buffer, bool *samples_signed,
-    uint32_t *max_buffer_length, uint8_t *spacing) {
-    const audiosample_p_t *proto = mp_proto_get_or_throw(MP_QSTR_protocol_audiosample, sample_obj);
-    proto->get_buffer_structure(MP_OBJ_TO_PTR(sample_obj), single_channel_output, single_buffer,
-        samples_signed, max_buffer_length, spacing);
 }
 
 void audiosample_convert_u8m_s16s(int16_t *buffer_out, const uint8_t *buffer_in, size_t nframes) {
@@ -78,7 +49,6 @@ void audiosample_convert_u8m_s16s(int16_t *buffer_out, const uint8_t *buffer_in,
         *buffer_out++ = sample;
     }
 }
-
 
 void audiosample_convert_u8s_s16s(int16_t *buffer_out, const uint8_t *buffer_in, size_t nframes) {
     size_t nsamples = 2 * nframes;
@@ -96,7 +66,6 @@ void audiosample_convert_s8m_s16s(int16_t *buffer_out, const int8_t *buffer_in, 
     }
 }
 
-
 void audiosample_convert_s8s_s16s(int16_t *buffer_out, const int8_t *buffer_in, size_t nframes) {
     size_t nsamples = 2 * nframes;
     for (; nsamples--;) {
@@ -105,7 +74,6 @@ void audiosample_convert_s8s_s16s(int16_t *buffer_out, const int8_t *buffer_in, 
     }
 }
 
-
 void audiosample_convert_u16m_s16s(int16_t *buffer_out, const uint16_t *buffer_in, size_t nframes) {
     for (; nframes--;) {
         int16_t sample = *buffer_in++ - 0x8000;
@@ -113,7 +81,6 @@ void audiosample_convert_u16m_s16s(int16_t *buffer_out, const uint16_t *buffer_i
         *buffer_out++ = sample;
     }
 }
-
 
 void audiosample_convert_u16s_s16s(int16_t *buffer_out, const uint16_t *buffer_in, size_t nframes) {
     size_t nsamples = 2 * nframes;
@@ -129,4 +96,143 @@ void audiosample_convert_s16m_s16s(int16_t *buffer_out, const int16_t *buffer_in
         *buffer_out++ = sample;
         *buffer_out++ = sample;
     }
+}
+
+
+void audiosample_convert_u8s_u8m(uint8_t *buffer_out, const uint8_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = *buffer_in++ + 0x80;
+        *buffer_out++ = sample;
+        buffer_in++;
+    }
+}
+
+void audiosample_convert_s8m_u8m(uint8_t *buffer_out, const int8_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = *buffer_in++ + 0x80;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_s8s_u8m(uint8_t *buffer_out, const int8_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = *buffer_in++ + 0x80;
+        *buffer_out++ = sample;
+        buffer_in++;
+    }
+}
+
+void audiosample_convert_u16m_u8m(uint8_t *buffer_out, const uint16_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = (*buffer_in++) >> 8;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_u16s_u8m(uint8_t *buffer_out, const uint16_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = (*buffer_in++) >> 8;
+        *buffer_out++ = sample;
+        buffer_in++;
+    }
+}
+
+void audiosample_convert_s16m_u8m(uint8_t *buffer_out, const int16_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = (*buffer_in++ + 0x8000) >> 8;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_s16s_u8m(uint8_t *buffer_out, const int16_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = (*buffer_in++ + 0x8000) >> 8;
+        *buffer_out++ = sample;
+        buffer_in++;
+    }
+}
+
+
+void audiosample_convert_u8m_u8s(uint8_t *buffer_out, const uint8_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = *buffer_in++;
+        *buffer_out++ = sample;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_s8m_u8s(uint8_t *buffer_out, const int8_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = *buffer_in++ + 0x80;
+        *buffer_out++ = sample;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_s8s_u8s(uint8_t *buffer_out, const int8_t *buffer_in, size_t nframes) {
+    size_t nsamples = 2 * nframes;
+    for (; nsamples--;) {
+        uint8_t sample = *buffer_in++ + 0x80;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_u16m_u8s(uint8_t *buffer_out, const uint16_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = (*buffer_in++) >> 8;
+        *buffer_out++ = sample;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_u16s_u8s(uint8_t *buffer_out, const uint16_t *buffer_in, size_t nframes) {
+    size_t nsamples = 2 * nframes;
+    for (; nsamples--;) {
+        uint8_t sample = (*buffer_in++) >> 8;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_s16m_u8s(uint8_t *buffer_out, const int16_t *buffer_in, size_t nframes) {
+    for (; nframes--;) {
+        uint8_t sample = (*buffer_in++ + 0x8000) >> 8;
+        *buffer_out++ = sample;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_convert_s16s_u8s(uint8_t *buffer_out, const int16_t *buffer_in, size_t nframes) {
+    size_t nsamples = 2 * nframes;
+    for (; nsamples--;) {
+        uint8_t sample = (*buffer_in++ + 0x8000) >> 8;
+        *buffer_out++ = sample;
+    }
+}
+
+void audiosample_must_match(audiosample_base_t *self, mp_obj_t other_in, bool allow_mono_to_stereo) {
+    const audiosample_base_t *other = audiosample_check(other_in);
+    audiosample_check_for_deinit(other);
+    #if !CIRCUITPY_AUDIOSPEED
+    if (other->sample_rate != self->sample_rate) {
+    #else
+    if (other->sample_rate != self->sample_rate && !mp_obj_is_type(other_in, &audiospeed_resampler_type)) {
+        #endif
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("The sample's %q does not match"), MP_QSTR_sample_rate);
+    }
+    if ((!allow_mono_to_stereo || (allow_mono_to_stereo && self->channel_count != 2)) && other->channel_count != self->channel_count) {
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("The sample's %q does not match"), MP_QSTR_channel_count);
+    }
+    if (other->bits_per_sample != self->bits_per_sample) {
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("The sample's %q does not match"), MP_QSTR_bits_per_sample);
+    }
+    if (other->samples_signed != self->samples_signed) {
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("The sample's %q does not match"), MP_QSTR_signedness);
+    }
+
+    #if CIRCUITPY_AUDIOSPEED
+    if (mp_obj_is_type(other_in, &audiospeed_resampler_type)) {
+        audiospeed_resampler_obj_t *other_resampler = MP_OBJ_TO_PTR(other_in);
+        audiospeed_resampler_set_sample_rate(other_resampler, self->sample_rate);
+    }
+    #endif
 }

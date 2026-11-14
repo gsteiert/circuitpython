@@ -24,7 +24,7 @@ SECTIONS
         . = ALIGN(4);
         KEEP(*(.isr_vector)) /* Startup code */
 
-        /* This first flash block is 16K annd the isr vectors only take up
+        /* This first flash block is 16K and the isr vectors only take up
            about 400 bytes. Micropython pads this with files, but this didn't
            work with the size of Circuitpython's ff object. */
 
@@ -35,6 +35,12 @@ SECTIONS
     .text :
     {
         . = ALIGN(4);
+        __property_getter_start = .;
+        *(.property_getter)
+        __property_getter_end = .;
+        __property_getset_start = .;
+        *(.property_getset)
+        __property_getset_end = .;
         *(.text*)          /* .text* sections (code) */
         *(.rodata*)        /* .rodata* sections (constants, strings, etc.) */
     /*  *(.glue_7)   */    /* glue arm to thumb code */
@@ -81,7 +87,9 @@ SECTIONS
         . = . + _minimum_heap_size;
         . = ALIGN(4);
     } >RAM
-    _ld_heap_end = ORIGIN(RAM) + LENGTH(RAM);
+    /* The stack sits at the top of RAM, so end the heap below it. The extra 1K matches
+       CIRCUITPY_EXCEPTION_STACK_SIZE, which port_stack_get_limit() counts as stack too. */
+    _ld_heap_end = ORIGIN(RAM) + LENGTH(RAM) - _ld_default_stack_size - 1K;
 
     /* this just checks there is enough RAM for the stack */
     .stack :
@@ -95,4 +103,9 @@ SECTIONS
 
 
     .ARM.attributes 0 : { *(.ARM.attributes) }
+
+    ASSERT((__property_getter_end - __property_getter_start) % 8 == 0,
+        "the .property_getter section must hold whole 8-byte objects")
+    ASSERT((__property_getset_end - __property_getset_start) % 12 == 0,
+        "the .property_getset section must hold whole 12-byte objects")
 }

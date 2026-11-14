@@ -3,8 +3,8 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
- * SPDX-FileCopyrightText: Copyright (c) 2014 Paul Sokolovsky
+ * Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2014 Paul Sokolovsky
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -44,13 +44,15 @@ void vstr_init(vstr_t *vstr, size_t alloc) {
     }
     vstr->alloc = alloc;
     vstr->len = 0;
-    vstr->buf = m_new(char, vstr->alloc);
+    // CIRCUITPY-CHANGE: Don't scan string data for pointers.
+    vstr->buf = m_malloc_without_collect(sizeof(char) * vstr->alloc);
     vstr->fixed_buf = false;
 }
 
 // Init the vstr so it allocs exactly enough ram to hold a null-terminated
 // string of the given length, and set the length.
 void vstr_init_len(vstr_t *vstr, size_t len) {
+    // CIRCUITPY-CHANGE: check for invalid length
     if (len == SIZE_MAX) {
         m_malloc_fail(len);
     }
@@ -107,7 +109,7 @@ char *vstr_extend(vstr_t *vstr, size_t size) {
     return p;
 }
 
-STATIC void vstr_ensure_extra(vstr_t *vstr, size_t size) {
+static void vstr_ensure_extra(vstr_t *vstr, size_t size) {
     if (vstr->len + size > vstr->alloc) {
         if (vstr->fixed_buf) {
             // We can't reallocate, and the caller is expecting the space to
@@ -186,31 +188,19 @@ void vstr_add_strn(vstr_t *vstr, const char *str, size_t len) {
     vstr->len += len;
 }
 
-STATIC char *vstr_ins_blank_bytes(vstr_t *vstr, size_t byte_pos, size_t byte_len) {
+char *vstr_ins_blank_bytes(vstr_t *vstr, size_t byte_pos, size_t byte_len) {
     size_t l = vstr->len;
     if (byte_pos > l) {
         byte_pos = l;
     }
-    if (byte_len > 0) {
-        // ensure room for the new bytes
-        vstr_ensure_extra(vstr, byte_len);
-        // copy up the string to make room for the new bytes
-        memmove(vstr->buf + byte_pos + byte_len, vstr->buf + byte_pos, l - byte_pos);
-        // increase the length
-        vstr->len += byte_len;
-    }
+    // ensure room for the new bytes
+    vstr_ensure_extra(vstr, byte_len);
+    // copy up the string to make room for the new bytes
+    memmove(vstr->buf + byte_pos + byte_len, vstr->buf + byte_pos, l - byte_pos);
+    // increase the length
+    vstr->len += byte_len;
+    // return a pointer to the location to insert new bytes at
     return vstr->buf + byte_pos;
-}
-
-void vstr_ins_byte(vstr_t *vstr, size_t byte_pos, byte b) {
-    char *s = vstr_ins_blank_bytes(vstr, byte_pos, 1);
-    *s = b;
-}
-
-void vstr_ins_char(vstr_t *vstr, size_t char_pos, unichar chr) {
-    // TODO UNICODE
-    char *s = vstr_ins_blank_bytes(vstr, char_pos, 1);
-    *s = chr;
 }
 
 void vstr_cut_head_bytes(vstr_t *vstr, size_t bytes_to_cut) {

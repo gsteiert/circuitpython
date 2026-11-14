@@ -1,121 +1,152 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Artyom Skrobov
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Artyom Skrobov
+//
+// SPDX-License-Identifier: MIT
 
 #include "py/runtime.h"
 #include "shared-bindings/synthio/MidiTrack.h"
+#include "shared-bindings/audiocore/__init__.h"
 
-#define LOUDNESS 0x4000  // 0.5
-#define BITS_PER_SAMPLE 16
-#define BYTES_PER_SAMPLE (BITS_PER_SAMPLE / 8)
-#define SILENCE 0x80
 
-STATIC uint8_t parse_note(const uint8_t *buffer, uint32_t len, uint32_t *pos) {
-    if (*pos + 1 >= len) {
-        mp_raise_ValueError_varg(translate("Error in MIDI stream at position %d"), *pos);
+static void record_midi_stream_error(synthio_miditrack_obj_t *self) {
+    // keep the first error; later ones are usually fallout from this one
+    if (self->error_location < 0) {
+        self->error_location = self->pos;
     }
-    uint8_t note = buffer[(*pos)++];
-    if (note > 127 || buffer[(*pos)++] > 127) {
-        mp_raise_ValueError_varg(translate("Error in MIDI stream at position %d"), *pos);
-    }
-    return note;
+    self->pos = self->track.len;
 }
 
-STATIC void terminate_span(synthio_miditrack_obj_t *self, uint16_t *dur, uint16_t *max_dur) {
-    if (*dur) {
-        self->track[self->total_spans - 1].dur = *dur;
-        if (*dur > *max_dur) {
-            *max_dur = *dur;
+// Check that `count` more bytes are available, ending the track if not.
+static bool need_bytes(synthio_miditrack_obj_t *self, size_t count) {
+    if (count > self->track.len - self->pos) {
+        record_midi_stream_error(self);
+        return false;
+    }
+    return true;
+}
+
+// A duration can be longer than span.dur (a uint16_t) can hold, so the
+// remainder is kept in `pending` and handed over a chunk at a time.
+static void set_remaining(synthio_miditrack_obj_t *self, uint32_t samples) {
+    uint16_t chunk = samples > UINT16_MAX ? UINT16_MAX : (uint16_t)samples;
+    self->synth.span.dur = chunk;
+    self->pending = samples - chunk;
+}
+
+// Returns the note in the low 8 bits and the velocity in the next 8, or -1
+// if the pair could not be read.
+static int parse_note(synthio_miditrack_obj_t *self) {
+    uint8_t *buffer = self->track.buf;
+    if (!need_bytes(self, 2)) {
+        return -1;
+    }
+    uint8_t note = buffer[self->pos++];
+    uint8_t velocity = buffer[self->pos++];
+    if (note > 127 || velocity > 127) {
+        record_midi_stream_error(self);
+        return -1;
+    }
+    return note | (velocity << 8);
+}
+
+// MIDI variable-length quantity: up to 4 bytes of 7 bits each.
+static uint32_t decode_varint(synthio_miditrack_obj_t *self) {
+    uint8_t *buffer = self->track.buf;
+    uint32_t value = 0;
+    for (size_t i = 0; i < 4; i++) {
+        if (!need_bytes(self, 1)) {
+            return 0;
         }
-        *dur = 0;
-    } else {
-        self->total_spans--;
-    }
-}
-
-STATIC void add_span(synthio_miditrack_obj_t *self, uint8_t note1, uint8_t note2) {
-    synthio_midi_span_t span = { 0, {note1, note2} };
-    self->track = m_realloc(self->track,
-        (self->total_spans + 1) * sizeof(synthio_midi_span_t));
-    self->track[self->total_spans++] = span;
-}
-
-void common_hal_synthio_miditrack_construct(synthio_miditrack_obj_t *self,
-    const uint8_t *buffer, uint32_t len, uint32_t tempo, uint32_t sample_rate) {
-
-    synthio_midi_span_t initial = { 0, {SILENCE, SILENCE} };
-    self->sample_rate = sample_rate;
-    self->track = m_malloc(sizeof(synthio_midi_span_t), false);
-    self->next_span = 0;
-    self->total_spans = 1;
-    *self->track = initial;
-
-    uint16_t dur = 0, max_dur = 0;
-    uint32_t pos = 0;
-    while (pos < len) {
-        uint8_t c;
-        uint32_t delta = 0;
-        do {
-            c = buffer[pos++];
-            delta <<= 7;
-            delta |= c & 0x7f;
-        } while ((c & 0x80) && (pos < len));
-
-        if (c & 0x80) {
-            mp_raise_ValueError_varg(translate("Error in MIDI stream at position %d"), pos);
+        uint8_t c = buffer[self->pos++];
+        value = (value << 7) | (c & 0x7f);
+        if (!(c & 0x80)) {
+            return value;
         }
+    }
+    // a fifth continuation byte cannot be part of a valid quantity
+    record_midi_stream_error(self);
+    return 0;
+}
 
-        dur += delta * sample_rate / tempo;
+static void decode_duration(synthio_miditrack_obj_t *self) {
+    uint32_t delta = decode_varint(self);
+    uint64_t samples = (uint64_t)delta * self->synth.base.sample_rate / self->tempo;
+    set_remaining(self, samples > UINT32_MAX ? UINT32_MAX : (uint32_t)samples);
+}
 
-        switch (buffer[pos++] >> 4) {
-            case 8: { // Note Off
-                uint8_t note = parse_note(buffer, len, &pos);
-
-                // Ignore if not a note which is playing
-                synthio_midi_span_t last_span = self->track[self->total_spans - 1];
-                if (last_span.note[0] == note || last_span.note[1] == note) {
-                    terminate_span(self, &dur, &max_dur);
-                    if (last_span.note[0] == note) {
-                        add_span(self, last_span.note[1], SILENCE);
-                    } else {
-                        add_span(self, last_span.note[0], SILENCE);
-                    }
+// Meta (0xFF) and system exclusive (0xF0/0xF7) events both carry an explicit
+// length, so they can be skipped exactly rather than guessed at.
+static void decode_system_event(synthio_miditrack_obj_t *self, uint8_t status) {
+    uint8_t *buffer = self->track.buf;
+    if (status == 0xFF) {
+        if (!need_bytes(self, 1)) {
+            return;
+        }
+        uint8_t type = buffer[self->pos++];
+        uint32_t length = decode_varint(self);
+        if (!need_bytes(self, length)) {
+            return;
+        }
+        if (type == 0x2F) { // End of Track
+            self->pos = self->track.len;
+            return;
+        }
+        if (type == 0x51 && length == 3 && self->ticks_per_beat != 0) { // Set Tempo
+            uint32_t us_per_beat = (buffer[self->pos] << 16) |
+                (buffer[self->pos + 1] << 8) | buffer[self->pos + 2];
+            if (us_per_beat != 0) {
+                uint32_t ticks = (uint32_t)(((uint64_t)self->ticks_per_beat * 1000000) / us_per_beat);
+                if (ticks != 0) {
+                    self->tempo = ticks;
                 }
+            }
+        }
+        self->pos += length;
+    } else if (status == 0xF0 || status == 0xF7) {
+        uint32_t length = decode_varint(self);
+        if (!need_bytes(self, length)) {
+            return;
+        }
+        self->pos += length;
+    } else {
+        // system common and real-time bytes have no meaning in a file
+        record_midi_stream_error(self);
+    }
+}
+
+// invariant: pointing at a MIDI message
+static void decode_until_pause(synthio_miditrack_obj_t *self) {
+    uint8_t *buffer = self->track.buf;
+    size_t len = self->track.len;
+    do {
+        if (self->pos >= len) {
+            break;
+        }
+        uint8_t status = buffer[self->pos];
+        if (status & 0x80) {
+            self->pos++;
+            // a channel message arms running status; a system one cancels it
+            self->running_status = (status < 0xF0) ? status : 0;
+        } else {
+            // running status: the status byte is omitted and the previous
+            // channel message is implied
+            status = self->running_status;
+            if (status == 0) {
+                record_midi_stream_error(self);
                 break;
             }
-            case 9: { // Note On
-                uint8_t note = parse_note(buffer, len, &pos);
-
-                // Ignore if two notes are already playing
-                synthio_midi_span_t last_span = self->track[self->total_spans - 1];
-                if (last_span.note[1] == SILENCE) {
-                    terminate_span(self, &dur, &max_dur);
-                    if (last_span.note[0] == SILENCE) {
-                        add_span(self, note, SILENCE);
+        }
+        switch (status >> 4) {
+            case 8:   // Note Off
+            case 9: { // Note On, but a velocity of zero means Note Off
+                int parsed = parse_note(self);
+                if (parsed >= 0) {
+                    mp_obj_t note = MP_OBJ_NEW_SMALL_INT(parsed & 0xff);
+                    if ((status >> 4) == 9 && (parsed >> 8) != 0) {
+                        synthio_span_change_note(&self->synth, SYNTHIO_SILENCE, note);
                     } else {
-                        add_span(self, last_span.note[0], note);
+                        synthio_span_change_note(&self->synth, note, SYNTHIO_SILENCE);
                     }
                 }
                 break;
@@ -123,90 +154,97 @@ void common_hal_synthio_miditrack_construct(synthio_miditrack_obj_t *self,
             case 10:
             case 11:
             case 14: // two data bytes to ignore
-                parse_note(buffer, len, &pos);
+                parse_note(self);
                 break;
             case 12:
             case 13: // one data byte to ignore
-                if (pos >= len || buffer[pos++] > 127) {
-                    mp_raise_ValueError_varg(translate("Error in MIDI stream at position %d"), pos);
+                if (need_bytes(self, 1) && buffer[self->pos++] > 127) {
+                    record_midi_stream_error(self);
                 }
                 break;
-            case 15: // the full syntax is too complicated, just assume it's "End of Track" event
-                pos = len;
+            default: // 15: meta or system exclusive
+                decode_system_event(self, status);
                 break;
-            default: // invalid event
-                mp_raise_ValueError_varg(translate("Error in MIDI stream at position %d"), pos);
         }
-    }
-    terminate_span(self, &dur, &max_dur);
+        if (self->pos < len) {
+            decode_duration(self);
+        }
+    } while (self->pos < len && self->synth.span.dur == 0 && self->pending == 0);
+}
 
-    self->buffer_length = max_dur * BYTES_PER_SAMPLE;
-    self->buffer = m_malloc(self->buffer_length, false);
+static void start_parse(synthio_miditrack_obj_t *self) {
+    self->pos = 0;
+    self->error_location = -1;
+    self->pending = 0;
+    self->running_status = 0;
+    // a tempo map applies from the top of the track, so rewind it too
+    self->tempo = self->base_tempo;
+    decode_duration(self);
+    if (self->synth.span.dur == 0 && self->pending == 0) {
+        // the usual case: the file starts with some MIDI event, not a delay
+        decode_until_pause(self);
+    }
+}
+
+void common_hal_synthio_miditrack_construct(synthio_miditrack_obj_t *self,
+    const uint8_t *buffer, uint32_t len, uint32_t tempo, uint32_t ticks_per_beat,
+    uint32_t sample_rate, mp_obj_t waveform_obj, mp_obj_t filter_obj,
+    mp_obj_t envelope_obj) {
+
+    self->tempo = self->base_tempo = tempo;
+    self->ticks_per_beat = ticks_per_beat;
+    self->track.buf = (void *)buffer;
+    self->track.len = len;
+
+    synthio_synth_init(&self->synth, sample_rate, 1, waveform_obj, envelope_obj);
+
+    start_parse(self);
 }
 
 void common_hal_synthio_miditrack_deinit(synthio_miditrack_obj_t *self) {
-    m_free(self->buffer);
-    self->buffer = NULL;
-    m_free(self->track);
-    self->track = NULL;
-}
-bool common_hal_synthio_miditrack_deinited(synthio_miditrack_obj_t *self) {
-    return self->buffer == NULL;
+    synthio_synth_deinit(&self->synth);
 }
 
-uint32_t common_hal_synthio_miditrack_get_sample_rate(synthio_miditrack_obj_t *self) {
-    return self->sample_rate;
+mp_int_t common_hal_synthio_miditrack_get_error_location(synthio_miditrack_obj_t *self) {
+    return self->error_location;
 }
-uint8_t common_hal_synthio_miditrack_get_bits_per_sample(synthio_miditrack_obj_t *self) {
-    return BITS_PER_SAMPLE;
+
+mp_int_t common_hal_synthio_miditrack_get_tempo(synthio_miditrack_obj_t *self) {
+    return self->tempo;
 }
-uint8_t common_hal_synthio_miditrack_get_channel_count(synthio_miditrack_obj_t *self) {
-    return 1;
+
+void common_hal_synthio_miditrack_set_tempo(synthio_miditrack_obj_t *self, mp_int_t value) {
+    mp_int_t val = mp_arg_validate_int_min(value, 1, MP_QSTR_tempo);
+    uint64_t remaining = (uint64_t)self->synth.span.dur + self->pending;
+    remaining = remaining * self->tempo / val;
+    set_remaining(self, remaining > UINT32_MAX ? UINT32_MAX : (uint32_t)remaining);
+    // becomes the new baseline, so that looping does not undo it
+    self->tempo = self->base_tempo = val;
 }
 
 void synthio_miditrack_reset_buffer(synthio_miditrack_obj_t *self,
     bool single_channel_output, uint8_t channel) {
-
-    self->next_span = 0;
+    synthio_synth_reset_buffer(&self->synth, single_channel_output, channel);
+    start_parse(self);
 }
-
-STATIC const uint16_t notes[] = {8372, 8870, 9397, 9956, 10548, 11175, 11840,
-                                 12544, 13290, 14080, 14917, 15804}; // 9th octave
 
 audioio_get_buffer_result_t synthio_miditrack_get_buffer(synthio_miditrack_obj_t *self,
     bool single_channel_output, uint8_t channel, uint8_t **buffer, uint32_t *buffer_length) {
-
-    if (self->next_span >= self->total_spans) {
+    if (audiosample_deinited(&self->synth.base)) {
         *buffer_length = 0;
-        return GET_BUFFER_DONE;
+        return GET_BUFFER_ERROR;
     }
 
-    synthio_midi_span_t span = self->track[self->next_span++];
-    *buffer_length = span.dur * BYTES_PER_SAMPLE;
-    uint8_t octave1 = span.note[0] / 12; // 0..10
-    uint8_t octave2 = span.note[1] / 12; // 0..10
-    int32_t base_freq1 = notes[span.note[0] % 12];
-    int32_t base_freq2 = notes[span.note[1] % 12];
-    int32_t sample_rate = self->sample_rate;
-
-    for (uint16_t i = 0; i < span.dur; i++) {
-        int16_t semiperiod1 = span.note[0] == SILENCE ? 0 :
-            ((base_freq1 * i * 2) / sample_rate) >> (10 - octave1);
-        int16_t semiperiod2 = span.note[1] == SILENCE ? semiperiod1 :
-            ((base_freq2 * i * 2) / sample_rate) >> (10 - octave2);
-        self->buffer[i] = ((semiperiod1 % 2 + semiperiod2 % 2) - 1) * LOUDNESS;
+    synthio_synth_synthesize(&self->synth, buffer, buffer_length, single_channel_output ? 0 : channel);
+    if (self->synth.span.dur == 0) {
+        if (self->pending != 0) {
+            // still inside a gap too long for a single span
+            set_remaining(self, self->pending);
+        } else if (self->pos == self->track.len) {
+            return GET_BUFFER_DONE;
+        } else {
+            decode_until_pause(self);
+        }
     }
-    *buffer = (uint8_t *)self->buffer;
-
-    return self->next_span >= self->total_spans ?
-           GET_BUFFER_DONE : GET_BUFFER_MORE_DATA;
-}
-
-void synthio_miditrack_get_buffer_structure(synthio_miditrack_obj_t *self, bool single_channel_output,
-    bool *single_buffer, bool *samples_signed, uint32_t *max_buffer_length, uint8_t *spacing) {
-
-    *single_buffer = true;
-    *samples_signed = true;
-    *max_buffer_length = self->buffer_length;
-    *spacing = 1;
+    return GET_BUFFER_MORE_DATA;
 }

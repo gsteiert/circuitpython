@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,6 +29,7 @@
 #include "py/mpconfig.h"
 
 #if MICROPY_PY_BUILTINS_FLOAT
+#define MP_FLOAT_REPR_PREC (99) // magic `prec` value for optimal `repr` behaviour
 int mp_format_float(mp_float_t f, char *buf, size_t bufSize, char fmt, int prec, char sign);
 #endif
 

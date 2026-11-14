@@ -1,0 +1,140 @@
+// board.I2C() is on SCL/SDA (P2.10/P2.11), the pins that circuitpython.toml
+// names SCL and SDA.
+
+// Enable P2's GPIO controller so its pads get pin objects. The SoC dtsi
+// leaves every port disabled and the board enables only the LED and button
+// ports.
+&gpio2 {
+	status = "okay";
+};
+
+/* The flash layout comes from the mcuboot fork's generated
+ * nrf54h20dk-partitions.dtsi: slot0 is expanded to 1.3 MB, the OTA slot1
+ * lives on external flash and the cpurad slots are absorbed, so no
+ * partition fix-ups are needed here.
+ */
+
+// Enable free serial peripheral instances so CircuitPython can mux them to
+// arbitrary pins at runtime. On this SoC the i2c/spi/uart nodes with the same
+// instance number are the same peripheral block (e.g. i2c130/spi130/uart130
+// all sit at 0x9a5000), so each instance is enabled in exactly one mode. All
+// signals are disconnected and the devices are marked zephyr,deferred-init so
+// nothing is claimed at boot; iobroker initializes and routes a device when a
+// busio object is constructed and de-initializes it on release.
+//
+// See "nRF serial instances" in internal-modules/iobroker/README.md for how
+// the instances are shared and allocated.
+//
+// Instance 130 is i2c130, which the upstream board fixes to P2.10/P2.11.
+// Instances 120,
+// 135 and 136 are left alone: uart120 and uart135 are the console UARTs of
+// the (not built here) FLPR and PPR cores, and uart136 is the app console.
+// The DMA region is required on this SoC: the serial drivers only access
+// memory the peripheral's EasyDMA is allowed to reach.
+
+&pinctrl {
+	i2c130_dyn_default: i2c130_dyn_default {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(TWIM_SDA)>,
+				<NRF_PSEL_DISCONNECTED(TWIM_SCL)>;
+		};
+	};
+
+	i2c130_dyn_sleep: i2c130_dyn_sleep {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(TWIM_SDA)>,
+				<NRF_PSEL_DISCONNECTED(TWIM_SCL)>;
+		};
+	};
+
+	i2c131_dyn_default: i2c131_dyn_default {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(TWIM_SDA)>,
+				<NRF_PSEL_DISCONNECTED(TWIM_SCL)>;
+		};
+	};
+
+	i2c131_dyn_sleep: i2c131_dyn_sleep {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(TWIM_SDA)>,
+				<NRF_PSEL_DISCONNECTED(TWIM_SCL)>;
+		};
+	};
+
+	spi132_dyn_default: spi132_dyn_default {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(SPIM_SCK)>,
+				<NRF_PSEL_DISCONNECTED(SPIM_MOSI)>,
+				<NRF_PSEL_DISCONNECTED(SPIM_MISO)>;
+		};
+	};
+
+	spi132_dyn_sleep: spi132_dyn_sleep {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(SPIM_SCK)>,
+				<NRF_PSEL_DISCONNECTED(SPIM_MOSI)>,
+				<NRF_PSEL_DISCONNECTED(SPIM_MISO)>;
+		};
+	};
+
+	uart137_dyn_default: uart137_dyn_default {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(UART_TX)>,
+				<NRF_PSEL_DISCONNECTED(UART_RX)>;
+		};
+	};
+
+	uart137_dyn_sleep: uart137_dyn_sleep {
+		group1 {
+			psels = <NRF_PSEL_DISCONNECTED(UART_TX)>,
+				<NRF_PSEL_DISCONNECTED(UART_RX)>;
+		};
+	};
+};
+
+&i2c130 {
+	status = "okay";
+	zephyr,deferred-init;
+	pinctrl-0 = <&i2c130_dyn_default>;
+	pinctrl-1 = <&i2c130_dyn_sleep>;
+	pinctrl-names = "default", "sleep";
+	zephyr,concat-buf-size = <256>;
+	memory-regions = <&cpuapp_dma_region>;
+};
+
+&i2c131 {
+	status = "okay";
+	zephyr,deferred-init;
+	pinctrl-0 = <&i2c131_dyn_default>;
+	pinctrl-1 = <&i2c131_dyn_sleep>;
+	pinctrl-names = "default", "sleep";
+	zephyr,concat-buf-size = <256>;
+	memory-regions = <&cpuapp_dma_region>;
+};
+
+&spi132 {
+	status = "okay";
+	zephyr,deferred-init;
+	pinctrl-0 = <&spi132_dyn_default>;
+	pinctrl-1 = <&spi132_dyn_sleep>;
+	pinctrl-names = "default", "sleep";
+	memory-regions = <&cpuapp_dma_region>;
+};
+
+&uart137 {
+	status = "okay";
+	zephyr,deferred-init;
+	current-speed = <115200>;
+	pinctrl-0 = <&uart137_dyn_default>;
+	pinctrl-1 = <&uart137_dyn_sleep>;
+	pinctrl-names = "default", "sleep";
+	memory-regions = <&cpuapp_dma_region>;
+};
+
+// Enable the hardware watchdog for the watchdog module. The Zephyr board dts
+// aliases watchdog0 to wdt010, but the SoC dtsi leaves it disabled.
+&wdt010 {
+	status = "okay";
+};
+
+#include "../../../app.overlay"

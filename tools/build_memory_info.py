@@ -7,65 +7,150 @@
 
 import re
 import sys
+import json
 
-# Handle size constants with K or M suffixes (allowed in .ld but not in Python).
-K_PATTERN = re.compile(r"([0-9]+)[kK]")
-K_REPLACE = r"(\1*1024)"
+from elftools.elf.elffile import ELFFile
 
-M_PATTERN = re.compile(r"([0-9]+)[mM]")
-M_REPLACE = r"(\1*1024*1024)"
+
+# A linker map lists every region with the lengths already resolved:
+#     Name             Origin             Length             Attributes
+#     FLASH_FIRMWARE   0x10000000         0x0017f000         xr
+MAP_REGION = re.compile(r"^(\w+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+\S*$", re.MULTILINE)
+
+argv = sys.argv[1:]
+flash_names = ["FLASH_FIRMWARE", "FLASH"]
+if "--region" in argv:
+    i = argv.index("--region")
+    flash_names = argv[i + 1].split(",")
+    del argv[i : i + 2]
+
+# The ELF says where each segment loads, so the firmware region's usage can exclude
+# segments that load into other regions (nordic's FLASH_ISR, for example).
+if "--elf" not in argv:
+    sys.exit("usage: build_memory_info.py <map> <build dir> --elf <elf> [--region NAME,...]")
+i = argv.index("--elf")
+elf = argv[i + 1]
+del argv[i : i + 2]
+
+
+def regions_from_map(contents):
+    """Region origins and sizes from the Memory Configuration table of a linker map."""
+    start = contents.find("Memory Configuration")
+    if start < 0:
+        return None
+    end = contents.find("Linker script and memory map", start)
+    table = contents[start : end if end > 0 else len(contents)]
+    regions = {}
+    for name, origin, length in MAP_REGION.findall(table):
+        if name not in ("Name", "Origin", "Length"):
+            regions[name] = (int(origin, 16), int(length, 16))
+    return regions or None
+
+
+# The linker map lists the regions with every size the script computed resolved.
+try:
+    with open(argv[0], "r") as f:
+        contents = f.read()
+except FileNotFoundError:
+    print()
+    print(f"No {argv[0]} to read the flash region from.")
+    print()
+    sys.exit(0)
+regions = regions_from_map(contents) or {}
+
+firmware_region = None
+flash_origin = 0
+for name in flash_names:
+    if name in regions:
+        flash_origin, firmware_region = regions[name]
+        break
+
+
+def flash_end_in_region(path, start, length):
+    """Highest address a loadable ELF segment fills in the region, or None if none do.
+
+    Measuring to the end, not summing segment sizes, counts alignment gaps between
+    segments, which are as unusable as the segments themselves.
+    """
+    end = None
+    with open(path, "rb") as f:
+        for segment in ELFFile(f).iter_segments():
+            if segment["p_type"] != "PT_LOAD" or segment["p_filesz"] == 0:
+                continue
+            if start <= segment["p_paddr"] < start + length:
+                segment_end = segment["p_paddr"] + segment["p_filesz"]
+                end = segment_end if end is None else max(end, segment_end)
+    return end
+
+
+def ram_used_by_region(path, regions):
+    """Bytes the RAM-resident ELF segments occupy in each region once running.
+
+    A segment runs from RAM if it is copied there from flash or has zero-initialized
+    memory. Its flags can't say: Zephyr marks its flash text segment writable. It
+    counts against the smallest region holding its run address: nordic's APP_RAM,
+    not the RAM region that APP_RAM sits inside.
+    """
+    used = {}
+    with open(path, "rb") as f:
+        for segment in ELFFile(f).iter_segments():
+            if segment["p_type"] != "PT_LOAD" or segment["p_memsz"] == 0:
+                continue
+            in_ram = (
+                segment["p_vaddr"] != segment["p_paddr"]
+                or segment["p_memsz"] > segment["p_filesz"]
+            )
+            if not in_ram:
+                continue
+            address = segment["p_vaddr"]
+            holding = [
+                (length, name)
+                for name, (origin, length) in regions.items()
+                if origin <= address < origin + length
+            ]
+            if holding:
+                _, name = min(holding)
+                used[name] = used.get(name, 0) + segment["p_memsz"]
+    return used
+
+
+# Not knowing the size is not worth failing a build over: the tools that read
+# firmware.size.json fall back to assuming there is no headroom.
+if firmware_region is None:
+    print()
+    print(
+        "No {} region in {}. Regions found: {}.".format(
+            " or ".join(flash_names), argv[0], ", ".join(sorted(regions)) or "none"
+        )
+    )
+    print()
+    sys.exit(0)
+
+flash_end = flash_end_in_region(elf, flash_origin, firmware_region)
+if flash_end is None:
+    print()
+    print(f"Nothing in {elf} loads into the {name} region.")
+    print()
+    sys.exit(0)
+used_flash = flash_end - flash_origin
+free_flash = firmware_region - used_flash
+
+with open(f"{argv[1]}/firmware.size.json", "w") as f:
+    json.dump({"used_flash": used_flash, "firmware_region": firmware_region}, f)
 
 print()
-
-text = 0
-data = 0
-bss = 0
-# stdin is the linker output.
-for line in sys.stdin:
-    # Uncomment to see linker output.
-    # print(line)
-    line = line.strip()
-    if not line.startswith("text"):
-        text, data, bss = map(int, line.split()[:3])
-
-regions = {}
-# This file is the linker script.
-with open(sys.argv[1], "r") as f:
-    for line in f:
-        line = line.strip()
-        if line.startswith(("FLASH_FIRMWARE", "RAM")):
-            regions[line.split()[0]] = line.split("=")[-1]
-
-for region in regions:
-    space = regions[region]
-    if "/*" in space:
-        space = space.split("/*")[0]
-    space = K_PATTERN.sub(K_REPLACE, space)
-    space = M_PATTERN.sub(M_REPLACE, space)
-    regions[region] = int(eval(space))
-
-firmware_region = regions["FLASH_FIRMWARE"]
-ram_region = regions["RAM"]
-
-used_flash = data + text
-free_flash = firmware_region - used_flash
-used_ram = data + bss
-free_ram = ram_region - used_ram
 print(
     "{} bytes used, {} bytes free in flash firmware space out of {} bytes ({}kB).".format(
         used_flash, free_flash, firmware_region, firmware_region / 1024
     )
 )
-print(
-    "{} bytes used, {} bytes free in ram for stack and heap out of {} bytes ({}kB).".format(
-        used_ram, free_ram, ram_region, ram_region / 1024
+ram_used = ram_used_by_region(elf, regions)
+for ram_name in sorted(ram_used, key=lambda n: regions[n][0]):
+    _, ram_region = regions[ram_name]
+    used_ram = ram_used[ram_name]
+    print(
+        "{} bytes used, {} bytes free in {} out of {} bytes ({}kB).".format(
+            used_ram, ram_region - used_ram, ram_name, ram_region, ram_region / 1024
+        )
     )
-)
 print()
-
-# Check that we have free flash space. GCC doesn't fail when the text + data
-# sections don't fit in FLASH. It only counts data in RAM.
-if free_flash < 0:
-    print("Too little flash!!!")
-    print()
-    sys.exit(-1)

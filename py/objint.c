@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -30,19 +30,17 @@
 
 #include "py/parsenum.h"
 #include "py/smallint.h"
-#include "py/objint.h"
+#include "py/objint_impl.h"
 #include "py/objstr.h"
 #include "py/runtime.h"
 #include "py/binary.h"
-
-#include "supervisor/shared/translate.h"
 
 #if MICROPY_PY_BUILTINS_FLOAT
 #include <math.h>
 #endif
 
 // This dispatcher function is expected to be independent of the implementation of long int
-STATIC mp_obj_t mp_obj_int_make_new(const mp_obj_type_t *type_in, size_t n_args, size_t n_kw, const mp_obj_t *args) {
+static mp_obj_t mp_obj_int_make_new(const mp_obj_type_t *type_in, size_t n_args, size_t n_kw, const mp_obj_t *args) {
     (void)type_in;
     mp_arg_check_num(n_args, n_kw, 0, 2, false);
 
@@ -50,22 +48,22 @@ STATIC mp_obj_t mp_obj_int_make_new(const mp_obj_type_t *type_in, size_t n_args,
         case 0:
             return MP_OBJ_NEW_SMALL_INT(0);
 
-        case 1:
-            if (mp_obj_is_int(args[0])) {
-                // already an int (small or long), just return it
-                return args[0];
-            } else if (mp_obj_is_str_or_bytes(args[0])) {
-                // a string, parse it
-                size_t l;
-                const char *s = mp_obj_str_get_data(args[0], &l);
-                return mp_parse_num_integer(s, l, 0, NULL);
+        case 1: {
+            mp_buffer_info_t bufinfo;
+            mp_obj_t o = mp_unary_op(MP_UNARY_OP_INT_MAYBE, args[0]);
+            if (o != MP_OBJ_NULL) {
+                return o;
+            } else if (mp_get_buffer(args[0], &bufinfo, MP_BUFFER_READ)) {
+                // a textual representation, parse it
+                return mp_parse_num_integer(bufinfo.buf, bufinfo.len, 10, NULL);
             #if MICROPY_PY_BUILTINS_FLOAT
             } else if (mp_obj_is_float(args[0])) {
                 return mp_obj_new_int_from_float(mp_obj_float_get(args[0]));
             #endif
             } else {
-                return mp_unary_op(MP_UNARY_OP_INT, args[0]);
+                mp_raise_TypeError_int_conversion(args[0]);
             }
+        }
 
         case 2:
         default: {
@@ -85,7 +83,7 @@ typedef enum {
     MP_FP_CLASS_OVERFLOW
 } mp_fp_as_int_class_t;
 
-STATIC mp_fp_as_int_class_t mp_classify_fp_as_int(mp_float_t val) {
+static mp_fp_as_int_class_t mp_classify_fp_as_int(mp_float_t val) {
     union {
         mp_float_t f;
         #if MICROPY_FLOAT_IMPL == MICROPY_FLOAT_IMPL_FLOAT
@@ -101,8 +99,8 @@ STATIC mp_fp_as_int_class_t mp_classify_fp_as_int(mp_float_t val) {
     #elif MICROPY_FLOAT_IMPL == MICROPY_FLOAT_IMPL_DOUBLE
     e = u.i[MP_ENDIANNESS_LITTLE];
     #endif
-#define MP_FLOAT_SIGN_SHIFT_I32 ((MP_FLOAT_FRAC_BITS + MP_FLOAT_EXP_BITS) % 32)
-#define MP_FLOAT_EXP_SHIFT_I32 (MP_FLOAT_FRAC_BITS % 32)
+    #define MP_FLOAT_SIGN_SHIFT_I32 ((MP_FLOAT_FRAC_BITS + MP_FLOAT_EXP_BITS) % 32)
+    #define MP_FLOAT_EXP_SHIFT_I32 (MP_FLOAT_FRAC_BITS % 32)
 
     if (e & (1U << MP_FLOAT_SIGN_SHIFT_I32)) {
         #if MICROPY_FLOAT_IMPL == MICROPY_FLOAT_IMPL_DOUBLE
@@ -119,9 +117,15 @@ STATIC mp_fp_as_int_class_t mp_classify_fp_as_int(mp_float_t val) {
     }
     // 8 * sizeof(uintptr_t) counts the number of bits for a small int
     // TODO provide a way to configure this properly
+    #if MICROPY_OBJ_REPR == MICROPY_OBJ_REPR_B
+    if (e <= ((8 * sizeof(uintptr_t) + MP_FLOAT_EXP_BIAS - 4) << MP_FLOAT_EXP_SHIFT_I32)) {
+        return MP_FP_CLASS_FIT_SMALLINT;
+    }
+    #else
     if (e <= ((8 * sizeof(uintptr_t) + MP_FLOAT_EXP_BIAS - 3) << MP_FLOAT_EXP_SHIFT_I32)) {
         return MP_FP_CLASS_FIT_SMALLINT;
     }
+    #endif
     #if MICROPY_LONGINT_IMPL == MICROPY_LONGINT_IMPL_LONGLONG
     if (e <= (((sizeof(long long) * MP_BITS_PER_BYTE) + MP_FLOAT_EXP_BIAS - 2) << MP_FLOAT_EXP_SHIFT_I32)) {
         return MP_FP_CLASS_FIT_LONGINT;
@@ -142,9 +146,11 @@ mp_obj_t mp_obj_new_int_from_float(mp_float_t val) {
     if (u.p.exp == ((1 << MP_FLOAT_EXP_BITS) - 1)) {
         // ...then number is Inf (positive or negative) if fraction is 0, else NaN.
         if (u.p.frc == 0) {
-            mp_raise_OverflowError_varg(MP_ERROR_TEXT("can't convert %q to %q"), MP_QSTR_inf, MP_QSTR_int);
+            // CIRCUITPY-CHANGE
+            mp_raise_msg_varg(&mp_type_OverflowError, MP_ERROR_TEXT("can't convert %s to int"), "inf");
         } else {
-            mp_raise_ValueError_varg(MP_ERROR_TEXT("can't convert %q to %q"), MP_QSTR_NaN, MP_QSTR_int);
+            // CIRCUITPY-CHANGE
+            mp_raise_ValueError_varg(MP_ERROR_TEXT("can't convert %s to int"), "NaN");
         }
     } else {
         mp_fp_as_int_class_t icl = mp_classify_fp_as_int(val);
@@ -195,23 +201,23 @@ void mp_obj_int_print(const mp_print_t *print, mp_obj_t self_in, mp_print_kind_t
     }
 }
 
-STATIC const uint8_t log_base2_floor[] = {
+static const uint8_t log_base2_floor[] = {
     0, 1, 1, 2,
     2, 2, 2, 3,
     3, 3, 3, 3,
     3, 3, 3, 4,
     /* if needed, these are the values for higher bases
-    4, 4, 4, 4,
-    4, 4, 4, 4,
-    4, 4, 4, 4,
-    4, 4, 4, 5
+       4, 4, 4, 4,
+       4, 4, 4, 4,
+       4, 4, 4, 4,
+       4, 4, 4, 5
     */
 };
 
 size_t mp_int_format_size(size_t num_bits, int base, const char *prefix, char comma) {
     assert(2 <= base && base <= 16);
     size_t num_digits = num_bits / log_base2_floor[base - 1] + 1;
-    size_t num_commas = comma ? num_digits / 3 : 0;
+    size_t num_commas = comma ? (base == 10 ? num_digits / 3 : num_digits / 4): 0;
     size_t prefix_len = prefix ? strlen(prefix) : 0;
     return num_digits + num_commas + prefix_len + 2; // +1 for sign, +1 for null byte
 }
@@ -234,7 +240,7 @@ char *mp_obj_int_formatted(char **buf, size_t *buf_size, size_t *fmt_size, mp_co
         // A small int; get the integer value to format.
         num = MP_OBJ_SMALL_INT_VALUE(self_in);
     } else {
-        assert(mp_obj_is_type(self_in, &mp_type_int));
+        assert(mp_obj_is_exact_type(self_in, &mp_type_int));
         // Not a small int.
         #if MICROPY_LONGINT_IMPL == MICROPY_LONGINT_IMPL_LONGLONG
         const mp_obj_int_t *self = self_in;
@@ -249,10 +255,11 @@ char *mp_obj_int_formatted(char **buf, size_t *buf_size, size_t *fmt_size, mp_co
 
     char sign = '\0';
     if (num < 0) {
-        num = -num;
+        num = -(fmt_uint_t)num;
         sign = '-';
     }
 
+    int n_comma = (base == 10) ? 3 : 4;
     size_t needed_size = mp_int_format_size(sizeof(fmt_int_t) * 8, base, prefix, comma);
     if (needed_size > *buf_size) {
         *buf = m_new(char, needed_size);
@@ -277,7 +284,7 @@ char *mp_obj_int_formatted(char **buf, size_t *buf_size, size_t *fmt_size, mp_co
                 c += '0';
             }
             *(--b) = c;
-            if (comma && num != 0 && b > str && (last_comma - b) == 3) {
+            if (comma && num != 0 && b > str && (last_comma - b) == n_comma) {
                 *(--b) = comma;
                 last_comma = b;
             }
@@ -302,73 +309,9 @@ char *mp_obj_int_formatted(char **buf, size_t *buf_size, size_t *fmt_size, mp_co
     return b;
 }
 
-#if MICROPY_LONGINT_IMPL != MICROPY_LONGINT_IMPL_NONE
-
-void mp_obj_int_buffer_overflow_check(mp_obj_t self_in, size_t nbytes, bool is_signed) {
-    if (is_signed) {
-        // self must be < 2**(bits - 1)
-        mp_obj_t edge = mp_binary_op(MP_BINARY_OP_INPLACE_LSHIFT,
-            mp_obj_new_int(1),
-            mp_obj_new_int(nbytes * 8 - 1));
-
-        if (mp_binary_op(MP_BINARY_OP_LESS, self_in, edge) == mp_const_true) {
-            // and >= -2**(bits - 1)
-            edge = mp_unary_op(MP_UNARY_OP_NEGATIVE, edge);
-            if (mp_binary_op(MP_BINARY_OP_MORE_EQUAL, self_in, edge) == mp_const_true) {
-                return;
-            }
-        }
-    } else {
-        // self must be >= 0
-        if (mp_obj_int_sign(self_in) >= 0) {
-            // and < 2**(bits)
-            mp_obj_t edge = mp_binary_op(MP_BINARY_OP_INPLACE_LSHIFT,
-                mp_obj_new_int(1),
-                mp_obj_new_int(nbytes * 8));
-
-            if (mp_binary_op(MP_BINARY_OP_LESS, self_in, edge) == mp_const_true) {
-                return;
-            }
-        }
-    }
-
-    mp_raise_OverflowError_varg(MP_ERROR_TEXT("value must fit in %d byte(s)"), nbytes);
-}
-
-#endif // MICROPY_LONGINT_IMPL != MICROPY_LONGINT_IMPL_NONE
-
+// CIRCUITPY-CHANGE: also called from py/binary.c, so not static here.
 void mp_small_int_buffer_overflow_check(mp_int_t val, size_t nbytes, bool is_signed) {
-    // Fast path for zero.
-    if (val == 0) {
-        return;
-    }
-
-    // Trying to store negative values in unsigned bytes falls through to failure.
-    if (is_signed || val >= 0) {
-
-        if (nbytes >= sizeof(val)) {
-            // All non-negative N bit signed integers fit in an unsigned N bit integer.
-            // This case prevents shifting too far below.
-            return;
-        }
-
-        if (is_signed) {
-            mp_int_t edge = ((mp_int_t)1 << (nbytes * 8 - 1));
-            if (-edge <= val && val < edge) {
-                return;
-            }
-            // Out of range, fall through to failure.
-        } else {
-            // Unsigned. We already know val >= 0.
-            mp_int_t edge = ((mp_int_t)1 << (nbytes * 8));
-            if (val < edge) {
-                return;
-            }
-        }
-        // Fall through to failure.
-    }
-
-    mp_raise_OverflowError_varg(MP_ERROR_TEXT("value must fit in %d byte(s)"), nbytes);
+    mp_obj_small_int_buffer_overflow_check(val, nbytes, is_signed);
 }
 
 #if MICROPY_LONGINT_IMPL == MICROPY_LONGINT_IMPL_NONE
@@ -396,7 +339,8 @@ mp_obj_t mp_obj_int_binary_op(mp_binary_op_t op, mp_obj_t lhs_in, mp_obj_t rhs_i
 
 // This is called only with strings whose value doesn't fit in SMALL_INT
 mp_obj_t mp_obj_new_int_from_str_len(const char **str, size_t len, bool neg, unsigned int base) {
-    mp_raise_msg(&mp_type_OverflowError, MP_ERROR_TEXT("long int not supported in this build"));
+    // CIRCUITPY-CHANGE: different error message
+    mp_raise_msg(&mp_type_OverflowError, MP_ERROR_TEXT("No long integer support"));
     return mp_const_none;
 }
 
@@ -438,6 +382,10 @@ mp_int_t mp_obj_int_get_checked(mp_const_obj_t self_in) {
     return MP_OBJ_SMALL_INT_VALUE(self_in);
 }
 
+void mp_obj_int_to_bytes(mp_obj_t self_in, size_t buf_len, byte *buf, bool big_endian, bool is_signed, bool overflow_check) {
+    mp_obj_small_int_to_bytes(MP_OBJ_SMALL_INT_VALUE(self_in), buf_len, buf, big_endian, is_signed, overflow_check);
+}
+
 #endif // MICROPY_LONGINT_IMPL == MICROPY_LONGINT_IMPL_NONE
 
 // This dispatcher function is expected to be independent of the implementation of long int
@@ -447,7 +395,7 @@ mp_obj_t mp_obj_int_binary_op_extra_cases(mp_binary_op_t op, mp_obj_t lhs_in, mp
         // false acts as 0
         return mp_binary_op(op, lhs_in, MP_OBJ_NEW_SMALL_INT(0));
     } else if (rhs_in == mp_const_true) {
-        // true acts as 0
+        // true acts as 1
         return mp_binary_op(op, lhs_in, MP_OBJ_NEW_SMALL_INT(1));
     } else if (op == MP_BINARY_OP_MULTIPLY) {
         if (mp_obj_is_str_or_bytes(rhs_in) || mp_obj_is_type(rhs_in, &mp_type_tuple) || mp_obj_is_type(rhs_in, &mp_type_list)) {
@@ -458,8 +406,9 @@ mp_obj_t mp_obj_int_binary_op_extra_cases(mp_binary_op_t op, mp_obj_t lhs_in, mp
     return MP_OBJ_NULL; // op not supported
 }
 
+// CIRCUITPY-CHANGE
 #if MICROPY_CPYTHON_COMPAT
-STATIC mp_obj_t int_bit_length(mp_obj_t self_in) {
+static mp_obj_t int_bit_length(mp_obj_t self_in) {
     #if MICROPY_LONGINT_IMPL != MICROPY_LONGINT_IMPL_NONE
     if (!mp_obj_is_small_int(self_in)) {
         return mp_obj_int_bit_length_impl(self_in);
@@ -479,20 +428,36 @@ STATIC mp_obj_t int_bit_length(mp_obj_t self_in) {
 MP_DEFINE_CONST_FUN_OBJ_1(int_bit_length_obj, int_bit_length);
 #endif
 
+// CIRCUITPY-CHANGE: more functionality
 // this is a classmethod
-STATIC mp_obj_t int_from_bytes(size_t n_args, const mp_obj_t *args) {
+static mp_obj_t int_from_bytes(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     // TODO: Support signed param (assumes signed=False at the moment)
-    (void)n_args;
+
+    enum { ARG_bytes, ARG_byteorder, ARG_signed };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_bytes, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = NULL} },
+        // CIRCUITPY-CHANGE: not required and given a default value.
+        { MP_QSTR_byteorder, MP_ARG_OBJ, {.u_obj = MP_OBJ_NEW_QSTR(MP_QSTR_big)} },
+        { MP_QSTR_signed, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    if (args[ARG_signed].u_bool) {
+        mp_raise_NotImplementedError_varg(MP_ERROR_TEXT("%q=%q"), MP_QSTR_signed, MP_QSTR_True);
+    }
 
     // get the buffer info
     mp_buffer_info_t bufinfo;
-    mp_get_buffer_raise(args[1], &bufinfo, MP_BUFFER_READ);
+    mp_get_buffer_raise(args[ARG_bytes].u_obj, &bufinfo, MP_BUFFER_READ);
 
     const byte *buf = (const byte *)bufinfo.buf;
     int delta = 1;
-    if (args[2] == MP_OBJ_NEW_QSTR(MP_QSTR_little)) {
+    if (args[ARG_byteorder].u_obj == MP_OBJ_NEW_QSTR(MP_QSTR_little)) {
         buf += bufinfo.len - 1;
         delta = -1;
+    } else if (args[ARG_byteorder].u_obj != MP_OBJ_NEW_QSTR(MP_QSTR_big)) {
+        mp_arg_error_invalid(MP_QSTR_byteorder);
     }
 
     mp_uint_t value = 0;
@@ -501,7 +466,7 @@ STATIC mp_obj_t int_from_bytes(size_t n_args, const mp_obj_t *args) {
         #if MICROPY_LONGINT_IMPL != MICROPY_LONGINT_IMPL_NONE
         if (value > (MP_SMALL_INT_MAX >> 8)) {
             // Result will overflow a small-int so construct a big-int
-            return mp_obj_int_from_bytes_impl(args[2] != MP_OBJ_NEW_QSTR(MP_QSTR_little), bufinfo.len, bufinfo.buf);
+            return mp_obj_int_from_bytes_impl(args[ARG_byteorder].u_obj != MP_OBJ_NEW_QSTR(MP_QSTR_little), bufinfo.len, bufinfo.buf);
         }
         #endif
         value = (value << 8) | *buf;
@@ -509,56 +474,42 @@ STATIC mp_obj_t int_from_bytes(size_t n_args, const mp_obj_t *args) {
     return mp_obj_new_int_from_uint(value);
 }
 
-STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(int_from_bytes_fun_obj, 3, 4, int_from_bytes);
-STATIC MP_DEFINE_CONST_CLASSMETHOD_OBJ(int_from_bytes_obj, MP_ROM_PTR(&int_from_bytes_fun_obj));
+// CIRCUITPY-CHANGE: only two required args.
+static MP_DEFINE_CONST_FUN_OBJ_KW(int_from_bytes_fun_obj, 2, int_from_bytes);
+static MP_DEFINE_CONST_CLASSMETHOD_OBJ(int_from_bytes_obj, MP_ROM_PTR(&int_from_bytes_fun_obj));
 
-STATIC mp_obj_t int_to_bytes(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+static mp_obj_t int_to_bytes(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_length, ARG_byteorder, ARG_signed };
     static const mp_arg_t allowed_args[] = {
-        { MP_QSTR_length,    MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
-        { MP_QSTR_byteorder, MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
+        { MP_QSTR_length,    MP_ARG_INT, { .u_int = 1 } },
+        { MP_QSTR_byteorder, MP_ARG_OBJ, { .u_rom_obj = MP_ROM_QSTR(MP_QSTR_big) } },
         { MP_QSTR_signed,    MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
-    mp_int_t len = args[ARG_length].u_int;
-    if (len < 0) {
+    mp_obj_t self = pos_args[0];
+
+    mp_int_t dlen = args[ARG_length].u_int;
+    if (dlen < 0) {
         mp_raise_ValueError(NULL);
     }
 
-    mp_obj_t self = pos_args[0];
+    vstr_t vstr;
+    vstr_init_len(&vstr, dlen);
+    byte *data = (byte *)vstr.buf;
+
     bool big_endian = args[ARG_byteorder].u_obj != MP_OBJ_NEW_QSTR(MP_QSTR_little);
     bool signed_ = args[ARG_signed].u_bool;
 
-    vstr_t vstr;
-    vstr_init_len(&vstr, len);
-    byte *data = (byte *)vstr.buf;
-    memset(data, 0, len);
+    mp_obj_int_to_bytes(self, dlen, data, big_endian, signed_, true);
 
-    #if MICROPY_LONGINT_IMPL != MICROPY_LONGINT_IMPL_NONE
-    if (!mp_obj_is_small_int(self)) {
-        mp_obj_int_buffer_overflow_check(self, len, signed_);
-        mp_obj_int_to_bytes_impl(self, big_endian, len, data);
-    } else
-    #endif
-    {
-        mp_int_t val = MP_OBJ_SMALL_INT_VALUE(self);
-        // Small int checking is separate, to be fast.
-        mp_small_int_buffer_overflow_check(val, len, signed_);
-        size_t l = MIN((size_t)len, sizeof(val));
-        if (val < 0) {
-            // Sign extend negative numbers.
-            memset(data, -1, len);
-        }
-        mp_binary_set_int(l, big_endian, data + (big_endian ? (len - l) : 0), val);
-    }
-
-    return mp_obj_new_str_from_vstr(&mp_type_bytes, &vstr);
+    return mp_obj_new_bytes_from_vstr(&vstr);
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_KW(int_to_bytes_obj, 3, int_to_bytes);
+static MP_DEFINE_CONST_FUN_OBJ_KW(int_to_bytes_obj, 1, int_to_bytes);
 
-STATIC const mp_rom_map_elem_t int_locals_dict_table[] = {
+static const mp_rom_map_elem_t int_locals_dict_table[] = {
+    // CIRCUITPY-CHANGE
     #if MICROPY_CPYTHON_COMPAT
     { MP_ROM_QSTR(MP_QSTR_bit_length), MP_ROM_PTR(&int_bit_length_obj) },
     #endif
@@ -566,17 +517,16 @@ STATIC const mp_rom_map_elem_t int_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_to_bytes), MP_ROM_PTR(&int_to_bytes_obj) },
 };
 
-STATIC MP_DEFINE_CONST_DICT(int_locals_dict, int_locals_dict_table);
+static MP_DEFINE_CONST_DICT(int_locals_dict, int_locals_dict_table);
 
-const mp_obj_type_t mp_type_int = {
-    { &mp_type_type },
-    .name = MP_QSTR_int,
-    .flags = MP_TYPE_FLAG_EXTENDED,
-    .print = mp_obj_int_print,
-    .make_new = mp_obj_int_make_new,
-    .locals_dict = (mp_obj_dict_t *)&int_locals_dict,
-    MP_TYPE_EXTENDED_FIELDS(
-        .unary_op = mp_obj_int_unary_op,
-        .binary_op = mp_obj_int_binary_op,
-        ),
-};
+// CIRCUITPY-CHANGE: Diagnose json.dump on invalid types
+MP_DEFINE_CONST_OBJ_TYPE(
+    mp_type_int,
+    MP_QSTR_int,
+    MP_TYPE_FLAG_PRINT_JSON,
+    make_new, mp_obj_int_make_new,
+    print, mp_obj_int_print,
+    unary_op, mp_obj_int_unary_op,
+    binary_op, mp_obj_int_binary_op,
+    locals_dict, &int_locals_dict
+    );

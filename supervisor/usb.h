@@ -1,31 +1,10 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 hathach for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 hathach for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
-#ifndef MICROPY_INCLUDED_SUPERVISOR_USB_H
-#define MICROPY_INCLUDED_SUPERVISOR_USB_H
+#pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -41,7 +20,7 @@ void usb_background(void);
 void usb_background_schedule(void);
 
 // Ports must call this from their particular USB IRQ handler
-void usb_irq_handler(void);
+void usb_irq_handler(int instance);
 
 // Only inits the USB peripheral clocks and pins. The peripheral will be initialized by
 // TinyUSB.
@@ -58,10 +37,20 @@ typedef struct {
     size_t num_out_endpoints;
 } descriptor_counts_t;
 
+typedef struct {
+    uint16_t vid;
+    uint16_t pid;
+    char manufacturer_name[128];
+    char product_name[128];
+} usb_identification_t;
+
 // Shared implementation.
 bool usb_enabled(void);
 void usb_add_interface_string(uint8_t interface_string_index, const char str[]);
-void usb_build_descriptors(void);
+// Add custom_name, or if it is NULL, USB_INTERFACE_NAME, a space, and default_suffix.
+void usb_add_interface_name(uint8_t interface_string_index, const char *custom_name, const char *default_suffix);
+bool usb_build_descriptors(const usb_identification_t *identification);
+bool usb_connected(void);
 void usb_disconnect(void);
 void usb_init(void);
 void usb_set_defaults(void);
@@ -74,15 +63,32 @@ void usb_setup_with_vm(void);
 
 
 // Propagate plug/unplug events to the MSC logic.
-#if CIRCUITPY_USB_MSC
+#if CIRCUITPY_USB_DEVICE && CIRCUITPY_USB_MSC
+size_t usb_msc_descriptor_length(void);
+size_t usb_msc_add_descriptor(uint8_t *descriptor_buf, descriptor_counts_t *descriptor_counts, uint8_t *current_interface_string);
 void usb_msc_mount(void);
 void usb_msc_umount(void);
-bool usb_msc_ejected(void);
+// Release the USB MSC lock on CIRCUITPY (LUN 0) if USB MSC holds it, so that
+// Python, workflows, and storage.remount() can lock it again.
+// Does nothing if USB MSC does not hold the lock. Does not raise or allocate.
+void usb_msc_release_circuitpy_lock(void);
 
-// Locking MSC prevents presenting the drive on plug-in when in use by something
-// else (likely BLE.)
-bool usb_msc_lock(void);
-void usb_msc_unlock(void);
+#include "extmod/vfs_fat.h"
+void usb_msc_remount(fs_user_mount_t *fs_mount);
+// Whether USB MSC holds the blockdev lock on this mount because it reported
+// the drive writable to the host. Does not raise or allocate.
+bool usb_msc_holds_lock(fs_user_mount_t *vfs);
 #endif
 
-#endif // MICROPY_INCLUDED_SUPERVISOR_USB_H
+#if CIRCUITPY_USB_KEYBOARD_WORKFLOW
+void usb_keyboard_init(void);
+uint32_t usb_keyboard_chars_available(void);
+char usb_keyboard_read_char(void);
+
+void usb_keyboard_status(void);
+
+bool usb_keyboard_in_use(uint8_t dev_addr, uint8_t interface);
+void usb_keyboard_detach(uint8_t dev_addr, uint8_t interface);
+void usb_keyboard_attach(uint8_t dev_addr, uint8_t interface);
+void usb_keymap_set(const uint8_t *buf, size_t len);
+#endif

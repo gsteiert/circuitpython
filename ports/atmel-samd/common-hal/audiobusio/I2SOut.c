@@ -1,33 +1,58 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include <stdint.h>
 #include <string.h>
 
 #include "mpconfigport.h"
+
+#include "i2s_shared.h"
+#include "samd/clocks.h"
+
+#ifdef SAMD21
+#include "hpl/pm/hpl_pm_base.h"
+#endif
+
+// Shared I2S reference count. See i2s_shared.h.
+static uint8_t i2s_user_count = 0;
+
+void i2s_acquire(void) {
+    i2s_user_count++;
+}
+
+void i2s_release(void) {
+    i2s_user_count--;
+    if (i2s_user_count == 0) {
+        // Fully power the I2S peripheral down; undo what turn_on_i2s() did.
+        // Disable it first, so the next user finds ENABLE == 0 and resets it,
+        // instead of starting from the last user's configuration.
+        // The I2S can't disable without a clock on its clock units: the
+        // ENABLE sync never finishes. Its users have disconnected theirs, so
+        // connect one for now: the 2MHz GCLK5 on SAMD51, GCLK0 on SAMD21.
+        #ifdef SAM_D5X_E5X
+        const uint8_t sync_gclk = 5;
+        #else
+        const uint8_t sync_gclk = 0;
+        #endif
+        connect_gclk_to_peripheral(sync_gclk, I2S_GCLK_ID_0);
+        connect_gclk_to_peripheral(sync_gclk, I2S_GCLK_ID_1);
+        if (I2S->CTRLA.bit.ENABLE == 1) {
+            I2S->CTRLA.bit.ENABLE = 0;
+            while (I2S->SYNCBUSY.bit.ENABLE == 1) {
+            }
+        }
+        disconnect_gclk_from_peripheral(sync_gclk, I2S_GCLK_ID_0);
+        disconnect_gclk_from_peripheral(sync_gclk, I2S_GCLK_ID_1);
+        #ifdef SAM_D5X_E5X
+        MCLK->APBDMASK.reg &= ~MCLK_APBDMASK_I2S;
+        #else
+        _pm_disable_bus_clock(PM_BUS_APBC, I2S);
+        #endif
+    }
+}
 
 // Some boards don't implement I2SOut, so suppress any routines from here.
 #if CIRCUITPY_AUDIOBUSIO_I2SOUT
@@ -40,7 +65,6 @@
 #include "shared-bindings/audiobusio/I2SOut.h"
 #include "shared-bindings/audiocore/RawSample.h"
 #include "shared-bindings/microcontroller/Pin.h"
-#include "supervisor/shared/translate.h"
 
 #include "atmel_start_pins.h"
 #include "hal/include/hal_gpio.h"
@@ -55,6 +79,7 @@
 #include "samd/dma.h"
 #include "samd/events.h"
 #include "samd/i2s.h"
+#include "i2s_shared.h"
 #include "samd/pins.h"
 #include "samd/timers.h"
 
@@ -68,37 +93,17 @@
 #define SERCTRL(name) I2S_TXCTRL_##name
 #endif
 
-void i2sout_reset(void) {
-    // Make sure the I2S peripheral is running so we can see if the resources we need are free.
-    #ifdef SAM_D5X_E5X
-    // Connect the clock units to the 2MHz clock. It can't disable without it.
-    connect_gclk_to_peripheral(5, I2S_GCLK_ID_0);
-    connect_gclk_to_peripheral(5, I2S_GCLK_ID_1);
-    #endif
-    if (I2S->CTRLA.bit.ENABLE == 1) {
-        I2S->CTRLA.bit.ENABLE = 0;
-        while (I2S->SYNCBUSY.bit.ENABLE == 1) {
-        }
-    }
-
-    // Make sure the I2S peripheral is running so we can see if the resources we need are free.
-    #ifdef SAM_D5X_E5X
-    // Connect the clock units to the 2MHz clock by default. They can't reset without it.
-    disconnect_gclk_from_peripheral(5, I2S_GCLK_ID_0);
-    disconnect_gclk_from_peripheral(5, I2S_GCLK_ID_1);
-
-    hri_mclk_clear_APBDMASK_I2S_bit(MCLK);
-    #endif
-
-    #ifdef SAMD21
-    _pm_disable_bus_clock(PM_BUS_APBC, I2S);
-    #endif
-}
-
 // Caller validates that pins are free.
 void common_hal_audiobusio_i2sout_construct(audiobusio_i2sout_obj_t *self,
     const mcu_pin_obj_t *bit_clock, const mcu_pin_obj_t *word_select,
-    const mcu_pin_obj_t *data, bool left_justified) {
+    const mcu_pin_obj_t *data, const mcu_pin_obj_t *main_clock, bool left_justified,
+    bool external_clock) {
+    if (external_clock) {
+        mp_raise_NotImplementedError_varg(MP_ERROR_TEXT("%q"), MP_QSTR_external_clock);
+    }
+    if (main_clock != NULL) {
+        mp_raise_NotImplementedError_varg(MP_ERROR_TEXT("%q"), MP_QSTR_main_clock);
+    }
     uint8_t serializer = 0xff;
     uint8_t bc_clock_unit = 0xff;
     uint8_t ws_clock_unit = 0xff;
@@ -151,22 +156,23 @@ void common_hal_audiobusio_i2sout_construct(audiobusio_i2sout_obj_t *self,
     }
     #endif
     if (bc_clock_unit == 0xff) {
-        mp_raise_ValueError_varg(translate("Invalid %q pin"), MP_QSTR_bit_clock);
+        raise_ValueError_invalid_pin_name(MP_QSTR_clock);
     }
     if (ws_clock_unit == 0xff) {
-        mp_raise_ValueError_varg(translate("Invalid %q pin"), MP_QSTR_word_select);
+        raise_ValueError_invalid_pin_name(MP_QSTR_word_select);
     }
     if (bc_clock_unit != ws_clock_unit) {
-        mp_raise_ValueError(translate("Bit clock and word select must share a clock unit"));
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("%q and %q must share a clock unit"), MP_QSTR_bit_clock, MP_QSTR_word_select);
     }
     if (serializer == 0xff) {
-        mp_raise_ValueError_varg(translate("Invalid %q pin"), MP_QSTR_data);
+        raise_ValueError_invalid_pin_name(MP_QSTR_data);
     }
     self->clock_unit = ws_clock_unit;
     self->serializer = serializer;
 
+    // Check the shared I2S peripheral before refcounting it, so a raise here
+    // doesn't leak the reference.
     turn_on_i2s();
-
     if (I2S->CTRLA.bit.ENABLE == 0) {
         I2S->CTRLA.bit.SWRST = 1;
         while (I2S->CTRLA.bit.SWRST == 1) {
@@ -174,15 +180,18 @@ void common_hal_audiobusio_i2sout_construct(audiobusio_i2sout_obj_t *self,
     } else {
         #ifdef SAMD21
         if ((I2S->CTRLA.vec.SEREN & (1 << serializer)) != 0) {
-            mp_raise_RuntimeError(translate("Serializer in use"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("Serializer in use"));
         }
         #endif
         #ifdef SAM_D5X_E5X
         if (I2S->CTRLA.bit.TXEN == 1) {
-            mp_raise_RuntimeError(translate("Serializer in use"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("Serializer in use"));
         }
         #endif
     }
+    i2s_acquire();
+
+    self->gclk = 0xff;
 
     #ifdef SAM_D5X_E5X
     #define GPIO_I2S_FUNCTION GPIO_PIN_FUNCTION_J
@@ -217,33 +226,49 @@ void common_hal_audiobusio_i2sout_deinit(audiobusio_i2sout_obj_t *self) {
         return;
     }
 
+    // Stop the DMA channel, serializer and clock unit, and release the GCLK.
+    // A GCLK is held from play() until stop(). Don't touch the serializer or
+    // clock unit otherwise: their enable bits sync on that GCLK, so with it
+    // disconnected the SYNCBUSY wait never ends.
+    if (self->gclk != 0xff) {
+        common_hal_audiobusio_i2sout_stop(self);
+    }
+
     reset_pin_number(self->bit_clock->number);
     self->bit_clock = NULL;
     reset_pin_number(self->word_select->number);
     self->word_select = NULL;
     reset_pin_number(self->data->number);
+    self->data = NULL;
+
+    // Fully power the I2S peripheral down if we were its last user.
+    i2s_release();
 }
 
 void common_hal_audiobusio_i2sout_play(audiobusio_i2sout_obj_t *self,
     mp_obj_t sample, bool loop) {
-    if (common_hal_audiobusio_i2sout_get_playing(self)) {
+    // Stop if playing, or if a GCLK is still held from a play() that raised
+    // after taking it. Otherwise this play() would overwrite self->gclk and leak it.
+    if (common_hal_audiobusio_i2sout_get_playing(self) || self->gclk != 0xff) {
         common_hal_audiobusio_i2sout_stop(self);
     }
+
+    audiosample_check(sample);
+
     #ifdef SAMD21
     if ((I2S->CTRLA.vec.CKEN & (1 << self->clock_unit)) == 1) {
-        mp_raise_RuntimeError(translate("Clock unit in use"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Clock unit in use"));
     }
     #endif
-    uint8_t bits_per_sample = audiosample_bits_per_sample(sample);
+    uint8_t bits_per_sample = audiosample_get_bits_per_sample(sample);
     // We always output stereo so output twice as many bits.
     uint16_t bits_per_sample_output = bits_per_sample * 2;
-    uint16_t divisor = 48000000 / (bits_per_sample_output * audiosample_sample_rate(sample));
+    uint16_t divisor = 48000000 / (bits_per_sample_output * audiosample_get_sample_rate(sample));
     // Find a free GCLK to generate the MCLK signal.
     uint8_t gclk = find_free_gclk(divisor);
     if (gclk > GCLK_GEN_NUM) {
-        mp_raise_RuntimeError(translate("Unable to find free GCLK"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("No free GCLKs"));
     }
-    self->gclk = gclk;
 
     uint32_t clkctrl = I2S_CLKCTRL_MCKSEL_GCLK |
         I2S_CLKCTRL_NBSLOTS(1) |
@@ -253,9 +278,9 @@ void common_hal_audiobusio_i2sout_play(audiobusio_i2sout_obj_t *self,
     } else {
         clkctrl |= I2S_CLKCTRL_FSOUTINV | I2S_CLKCTRL_BITDELAY_I2S;
     }
-    uint8_t channel_count = audiosample_channel_count(sample);
+    uint8_t channel_count = audiosample_get_channel_count(sample);
     if (channel_count > 2) {
-        mp_raise_ValueError(translate("Too many channels in sample."));
+        mp_raise_ValueError(MP_ERROR_TEXT("Too many channels in sample"));
     }
     #ifdef SAMD21
     uint32_t serctrl = (self->clock_unit << I2S_SERCTRL_CLKSEL_Pos) | SERCTRL(SERMODE_TX) | I2S_SERCTRL_TXSAME_SAME | I2S_SERCTRL_EXTEND_MSBIT | I2S_SERCTRL_TXDEFAULT_ONE | I2S_SERCTRL_SLOTADJ_LEFT;
@@ -263,7 +288,7 @@ void common_hal_audiobusio_i2sout_play(audiobusio_i2sout_obj_t *self,
     #ifdef SAM_D5X_E5X
     uint32_t serctrl = (self->clock_unit << I2S_RXCTRL_CLKSEL_Pos) | I2S_TXCTRL_TXSAME_SAME;
     #endif
-    if (audiosample_channel_count(sample) == 1) {
+    if (audiosample_get_channel_count(sample) == 1) {
         serctrl |= SERCTRL(MONO_MONO);
     } else {
         serctrl |= SERCTRL(MONO_STEREO);
@@ -288,6 +313,8 @@ void common_hal_audiobusio_i2sout_play(audiobusio_i2sout_obj_t *self,
     #endif
 
     // The DFLL is always a 48MHz clock
+    // Hold the GCLK only once it's running: deinit() calls stop() while one is held.
+    self->gclk = gclk;
     enable_clock_generator(self->gclk, CLOCK_48MHZ, divisor);
     connect_gclk_to_peripheral(self->gclk, I2S_GCLK_ID_0 + self->clock_unit);
 
@@ -306,10 +333,10 @@ void common_hal_audiobusio_i2sout_play(audiobusio_i2sout_obj_t *self,
 
     if (result == AUDIO_DMA_DMA_BUSY) {
         common_hal_audiobusio_i2sout_stop(self);
-        mp_raise_RuntimeError(translate("No DMA channel found"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("No DMA channel found"));
     } else if (result == AUDIO_DMA_MEMORY_ERROR) {
         common_hal_audiobusio_i2sout_stop(self);
-        mp_raise_RuntimeError(translate("Unable to allocate buffers for signed conversion"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Unable to allocate buffers for signed conversion"));
     }
 
     I2S->INTFLAG.reg = I2S_INTFLAG_TXUR0 | I2S_INTFLAG_TXUR1;
@@ -378,12 +405,17 @@ void common_hal_audiobusio_i2sout_stop(audiobusio_i2sout_obj_t *self) {
         }
     }
     #endif
-    disconnect_gclk_from_peripheral(self->gclk, I2S_GCLK_ID_0 + self->clock_unit);
-    disable_clock_generator(self->gclk);
+    // Release the GCLK once and forget it, so a later stop() or deinit()
+    // doesn't disable a generator that another object now owns.
+    if (self->gclk != 0xff) {
+        disconnect_gclk_from_peripheral(self->gclk, I2S_GCLK_ID_0 + self->clock_unit);
+        disable_clock_generator(self->gclk);
+        self->gclk = 0xff;
 
-    #ifdef SAM_D5X_E5X
-    connect_gclk_to_peripheral(5, I2S_GCLK_ID_0 + self->clock_unit);
-    #endif
+        #ifdef SAM_D5X_E5X
+        connect_gclk_to_peripheral(5, I2S_GCLK_ID_0 + self->clock_unit);
+        #endif
+    }
 
     self->playing = false;
 }

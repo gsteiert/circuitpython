@@ -1,45 +1,54 @@
 """
 Process raw qstr file and output qstr data with length, hash and data bytes.
 
-This script works with Python 2.7, 3.3 and 3.4.
-
-For documentation about the format of compressed translated strings, see
-supervisor/shared/translate.h
+This script works with Python 3.3+.
 """
 
-from __future__ import print_function
-
-import bisect
 import re
 import sys
 
-import collections
-import gettext
-import os.path
+bytes_cons = bytes
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(errors="backslashreplace")
-
-py = os.path.dirname(sys.argv[0])
-top = os.path.dirname(py)
-
-sys.path.append(os.path.join(top, "tools/huffman"))
-
-import huffman
-
-# Python 2/3 compatibility:
-#   - iterating through bytes is different
-#   - codepoint2name lives in a different module
-import platform
-
-if platform.python_version_tuple()[0] == "2":
-    bytes_cons = lambda val, enc=None: bytearray(val)
-    from htmlentitydefs import codepoint2name
-elif platform.python_version_tuple()[0] == "3":
-    bytes_cons = bytes
-    from html.entities import codepoint2name
-# end compatibility code
+# fmt: off
+codepoint2name = {
+    198: "AElig", 193: "Aacute", 194: "Acirc", 192: "Agrave", 913: "Alpha", 197: "Aring", 195: "Atilde",
+    196: "Auml", 914: "Beta", 199: "Ccedil", 935: "Chi", 8225: "Dagger", 916: "Delta", 208: "ETH",
+    201: "Eacute", 202: "Ecirc", 200: "Egrave", 917: "Epsilon", 919: "Eta", 203: "Euml", 915: "Gamma",
+    205: "Iacute", 206: "Icirc", 204: "Igrave", 921: "Iota", 207: "Iuml", 922: "Kappa", 923: "Lambda",
+    924: "Mu", 209: "Ntilde", 925: "Nu", 338: "OElig", 211: "Oacute", 212: "Ocirc", 210: "Ograve",
+    937: "Omega", 927: "Omicron", 216: "Oslash", 213: "Otilde", 214: "Ouml", 934: "Phi", 928: "Pi",
+    8243: "Prime", 936: "Psi", 929: "Rho", 352: "Scaron", 931: "Sigma", 222: "THORN", 932: "Tau",
+    920: "Theta", 218: "Uacute", 219: "Ucirc", 217: "Ugrave", 933: "Upsilon", 220: "Uuml", 926: "Xi",
+    221: "Yacute", 376: "Yuml", 918: "Zeta", 225: "aacute", 226: "acirc", 180: "acute", 230: "aelig",
+    224: "agrave", 8501: "alefsym", 945: "alpha", 38: "amp", 8743: "and", 8736: "ang", 229: "aring",
+    8776: "asymp", 227: "atilde", 228: "auml", 8222: "bdquo", 946: "beta", 166: "brvbar", 8226: "bull",
+    8745: "cap", 231: "ccedil", 184: "cedil", 162: "cent", 967: "chi", 710: "circ", 9827: "clubs",
+    8773: "cong", 169: "copy", 8629: "crarr", 8746: "cup", 164: "curren", 8659: "dArr", 8224: "dagger",
+    8595: "darr", 176: "deg", 948: "delta", 9830: "diams", 247: "divide", 233: "eacute", 234: "ecirc",
+    232: "egrave", 8709: "empty", 8195: "emsp", 8194: "ensp", 949: "epsilon", 8801: "equiv", 951: "eta",
+    240: "eth", 235: "euml", 8364: "euro", 8707: "exist", 402: "fnof", 8704: "forall", 189: "frac12",
+    188: "frac14", 190: "frac34", 8260: "frasl", 947: "gamma", 8805: "ge", 62: "gt", 8660: "hArr",
+    8596: "harr", 9829: "hearts", 8230: "hellip", 237: "iacute", 238: "icirc", 161: "iexcl", 236: "igrave",
+    8465: "image", 8734: "infin", 8747: "int", 953: "iota", 191: "iquest", 8712: "isin", 239: "iuml",
+    954: "kappa", 8656: "lArr", 955: "lambda", 9001: "lang", 171: "laquo", 8592: "larr", 8968: "lceil",
+    8220: "ldquo", 8804: "le", 8970: "lfloor", 8727: "lowast", 9674: "loz", 8206: "lrm", 8249: "lsaquo",
+    8216: "lsquo", 60: "lt", 175: "macr", 8212: "mdash", 181: "micro", 183: "middot", 8722: "minus",
+    956: "mu", 8711: "nabla", 160: "nbsp", 8211: "ndash", 8800: "ne", 8715: "ni", 172: "not", 8713: "notin",  # codespell:ignore notin
+    8836: "nsub", 241: "ntilde", 957: "nu", 243: "oacute", 244: "ocirc", 339: "oelig", 242: "ograve",
+    8254: "oline", 969: "omega", 959: "omicron", 8853: "oplus", 8744: "or", 170: "ordf", 186: "ordm",
+    248: "oslash", 245: "otilde", 8855: "otimes", 246: "ouml", 182: "para", 8706: "part", 8240: "permil",
+    8869: "perp", 966: "phi", 960: "pi", 982: "piv", 177: "plusmn", 163: "pound", 8242: "prime",
+    8719: "prod", 8733: "prop", 968: "psi", 34: "quot", 8658: "rArr", 8730: "radic", 9002: "rang",
+    187: "raquo", 8594: "rarr", 8969: "rceil", 8221: "rdquo", 8476: "real", 174: "reg", 8971: "rfloor",
+    961: "rho", 8207: "rlm", 8250: "rsaquo", 8217: "rsquo", 8218: "sbquo", 353: "scaron", 8901: "sdot",
+    167: "sect", 173: "shy", 963: "sigma", 962: "sigmaf", 8764: "sim", 9824: "spades", 8834: "sub",
+    8838: "sube", 8721: "sum", 8835: "sup", 185: "sup1", 178: "sup2", 179: "sup3", 8839: "supe",
+    223: "szlig", 964: "tau", 8756: "there4", 952: "theta", 977: "thetasym", 8201: "thinsp", 254: "thorn",
+    732: "tilde", 215: "times", 8482: "trade", 8657: "uArr", 250: "uacute", 8593: "uarr", 251: "ucirc",
+    249: "ugrave", 168: "uml", 978: "upsih", 965: "upsilon", 252: "uuml", 8472: "weierp", 958: "xi",
+    253: "yacute", 165: "yen", 255: "yuml", 950: "zeta", 8205: "zwj", 8204: "zwnj"
+}
+# fmt: on
 
 codepoint2name[ord("-")] = "hyphen"
 
@@ -71,20 +80,9 @@ codepoint2name[ord("^")] = "caret"
 codepoint2name[ord("|")] = "pipe"
 codepoint2name[ord("~")] = "tilde"
 
-C_ESCAPES = {
-    "\a": "\\a",
-    "\b": "\\b",
-    "\f": "\\f",
-    "\n": "\\n",
-    "\r": "\\r",
-    "\t": "\\t",
-    "\v": "\\v",
-    "'": "\\'",
-    '"': '\\"',
-}
+# static qstrs, these must maintain a specific order for .mpy compatibility
+# See QSTR_LAST_STATIC at the top of py/persistentcode.c
 
-# static qstrs, should be sorted
-# These are qstrs that are always included and always have the same number. It allows mpy files to omit them.
 static_qstr_list = [
     "",
     "__dir__",  # Put __dir__ after empty qstr for builtin dir() to work
@@ -253,362 +251,115 @@ static_qstr_list = [
     "zip",
 ]
 
+# Additional QSTRs that must have index <255 because they are stored as `byte` values.
+# These are not part of the .mpy compatibility list, but we place them in the
+# fixed unsorted pool (i.e. QDEF0) to ensure their indices are small.
+unsorted_qstr_list = {
+    # From py/objtype.c: used in the `mp_binary_op_method_name` and `mp_unary_op_method_name` tables.
+    "__bool__",
+    "__pos__",
+    "__neg__",
+    "__invert__",
+    "__abs__",
+    "__float__",
+    "__complex__",
+    "__sizeof__",
+    "__lt__",
+    "__gt__",
+    "__eq__",
+    "__le__",
+    "__ge__",
+    "__ne__",
+    "__contains__",
+    "__iadd__",
+    "__isub__",
+    "__imul__",
+    "__imatmul__",
+    "__ifloordiv__",
+    "__itruediv__",
+    "__imod__",
+    "__ipow__",
+    "__ior__",
+    "__ixor__",
+    "__iand__",
+    "__ilshift__",
+    "__irshift__",
+    "__add__",
+    "__sub__",
+    "__mul__",
+    "__matmul__",
+    "__floordiv__",
+    "__truediv__",
+    "__mod__",
+    "__divmod__",
+    "__pow__",
+    "__or__",
+    "__xor__",
+    "__and__",
+    "__lshift__",
+    "__rshift__",
+    "__radd__",
+    "__rsub__",
+    "__rmul__",
+    "__rmatmul__",
+    "__rfloordiv__",
+    "__rtruediv__",
+    "__rmod__",
+    "__rpow__",
+    "__ror__",
+    "__rxor__",
+    "__rand__",
+    "__rlshift__",
+    "__rrshift__",
+    "__get__",
+    "__set__",
+    "__delete__",
+    # From py/scope.c: used in `scope_simple_name_table` table.
+    # Note: "<module>" is already in `static_qstr_list`.
+    "<lambda>",
+    "<listcomp>",
+    "<dictcomp>",
+    "<setcomp>",
+    "<genexpr>",
+}
+
+# Matches any string that needs no escaping (alphanum + _ only)
+RE_NO_ESCAPE = re.compile(r"^[a-zA-Z0-9_]$")
+
+
 # this must match the equivalent function in qstr.c
 def compute_hash(qstr, bytes_hash):
     hash = 5381
     for b in qstr:
         hash = (hash * 33) ^ b
     # Make sure that valid hash is never zero, zero means "hash not computed"
-    return (hash & ((1 << (8 * bytes_hash)) - 1)) or 1
-
-
-def translate(translation_file, i18ns):
-    with open(translation_file, "rb") as f:
-        table = gettext.GNUTranslations(f)
-
-        translations = []
-        for original in i18ns:
-            unescaped = original
-            for s in C_ESCAPES:
-                unescaped = unescaped.replace(C_ESCAPES[s], s)
-            translation = table.gettext(unescaped)
-            # Add in carriage returns to work in terminals
-            translation = translation.replace("\n", "\r\n")
-            translations.append((original, translation))
-        return translations
-
-
-class TextSplitter:
-    def __init__(self, words):
-        words = sorted(words, key=lambda x: len(x), reverse=True)
-        self.words = set(words)
-        if words:
-            pat = "|".join(re.escape(w) for w in words) + "|."
-        else:
-            pat = "."
-        self.pat = re.compile(pat, flags=re.DOTALL)
-
-    def iter_words(self, text):
-        s = []
-        words = self.words
-        for m in self.pat.finditer(text):
-            t = m.group(0)
-            if t in words:
-                if s:
-                    yield (False, "".join(s))
-                    s = []
-                yield (True, t)
-            else:
-                s.append(t)
-        if s:
-            yield (False, "".join(s))
-
-    def iter(self, text):
-        for m in self.pat.finditer(text):
-            yield m.group(0)
-
-
-def iter_substrings(s, minlen, maxlen):
-    len_s = len(s)
-    maxlen = min(len_s, maxlen)
-    for n in range(minlen, maxlen + 1):
-        for begin in range(0, len_s - n + 1):
-            yield s[begin : begin + n]
-
-
-def compute_huffman_coding(translations, compression_filename):
-    texts = [t[1] for t in translations]
-    words = []
-
-    start_unused = 0x80
-    end_unused = 0xFF
-    max_ord = 0
-    for text in texts:
-        for c in text:
-            ord_c = ord(c)
-            max_ord = max(ord_c, max_ord)
-            if 0x80 <= ord_c < 0xFF:
-                end_unused = min(ord_c, end_unused)
-    max_words = end_unused - 0x80
-
-    bits_per_codepoint = 16 if max_ord > 255 else 8
-    values_type = "uint16_t" if max_ord > 255 else "uint8_t"
-    while len(words) < max_words:
-        # Until the dictionary is filled to capacity, use a heuristic to find
-        # the best "word" (2- to 11-gram) to add to it.
-        #
-        # The TextSplitter allows us to avoid considering parts of the text
-        # that are already covered by a previously chosen word, for example
-        # if "the" is in words then not only will "the" not be considered
-        # again, neither will "there" or "wither", since they have "the"
-        # as substrings.
-        extractor = TextSplitter(words)
-        counter = collections.Counter()
-        for t in texts:
-            for atom in extractor.iter(t):
-                counter[atom] += 1
-        cb = huffman.codebook(counter.items())
-        lengths = sorted(dict((v, len(cb[k])) for k, v in counter.items()).items())
-
-        def bit_length(s):
-            return sum(len(cb[c]) for c in s)
-
-        def est_len(occ):
-            idx = bisect.bisect_left(lengths, (occ, 0))
-            return lengths[idx][1] + 1
-
-        # The cost of adding a dictionary word is just its storage size
-        # while its savings is close to the difference between the original
-        # huffman bit-length of the string and the estimated bit-length
-        # of the dictionary word, times the number of times the word appears.
-        #
-        # The savings is not strictly accurate because including a word into
-        # the Huffman tree bumps up the encoding lengths of all words in the
-        # same subtree.  In the extreme case when the new word is so frequent
-        # that it gets a one-bit encoding, all other words will cost an extra
-        # bit each. This is empirically modeled by the constant factor added to
-        # cost, but the specific value used isn't "proven" to be correct.
-        #
-        # Another source of inaccuracy is that compressed strings end up
-        # on byte boundaries, not bit boundaries, so saving 1 bit somewhere
-        # might not save a byte.
-        #
-        # In fact, when this change was first made, some translations (luckily,
-        # ones on boards not at all close to full) wasted up to 40 bytes,
-        # while the most constrained boards typically gained 100 bytes or
-        # more.
-        #
-        # The difference between the two is the estimated net savings, in bits.
-        def est_net_savings(s, occ):
-            savings = occ * (bit_length(s) - est_len(occ))
-            cost = len(s) * bits_per_codepoint + 24
-            return savings - cost
-
-        counter = collections.Counter()
-        for t in texts:
-            for (found, word) in extractor.iter_words(t):
-                if not found:
-                    for substr in iter_substrings(word, minlen=2, maxlen=11):
-                        counter[substr] += 1
-
-        # Score the candidates we found.  This is a semi-empirical formula that
-        # attempts to model the number of bits saved as closely as possible.
-        #
-        # It attempts to compute the codeword lengths of the original word
-        # to the codeword length the dictionary entry would get, times
-        # the number of occurrences, less the ovehead of the entries in the
-        # words[] array.
-
-        scores = sorted(
-            ((s, -est_net_savings(s, occ)) for (s, occ) in counter.items()), key=lambda x: x[1]
-        )
-
-        # Pick the one with the highest score.  The score must be negative.
-        if not scores or scores[0][-1] >= 0:
-            break
-
-        word = scores[0][0]
-        words.append(word)
-
-    words.sort(key=len)
-    extractor = TextSplitter(words)
-    counter = collections.Counter()
-    for t in texts:
-        for atom in extractor.iter(t):
-            counter[atom] += 1
-    cb = huffman.codebook(counter.items())
-
-    word_start = start_unused
-    word_end = word_start + len(words) - 1
-    print("// # words", len(words))
-    print("// words", words)
-
-    values = []
-    length_count = {}
-    renumbered = 0
-    last_length = None
-    canonical = {}
-    for atom, code in sorted(cb.items(), key=lambda x: (len(x[1]), x[0])):
-        values.append(atom)
-        length = len(code)
-        if length not in length_count:
-            length_count[length] = 0
-        length_count[length] += 1
-        if last_length:
-            renumbered <<= length - last_length
-        canonical[atom] = "{0:0{width}b}".format(renumbered, width=length)
-        # print(f"atom={repr(atom)} code={code}", file=sys.stderr)
-        if len(atom) > 1:
-            o = words.index(atom) + 0x80
-            s = "".join(C_ESCAPES.get(ch1, ch1) for ch1 in atom)
-        else:
-            s = C_ESCAPES.get(atom, atom)
-            o = ord(atom)
-        print("//", o, s, counter[atom], canonical[atom], renumbered)
-        renumbered += 1
-        last_length = length
-    lengths = bytearray()
-    print("// length count", length_count)
-
-    for i in range(1, max(length_count) + 2):
-        lengths.append(length_count.get(i, 0))
-    print("// values", values, "lengths", len(lengths), lengths)
-
-    print("//", values, lengths)
-    values = [(atom if len(atom) == 1 else chr(0x80 + words.index(atom))) for atom in values]
-    max_translation_encoded_length = max(
-        len(translation.encode("utf-8")) for (original, translation) in translations
-    )
-
-    maxlen = len(words[-1])
-    minlen = len(words[0])
-    wlencount = [len([None for w in words if len(w) == l]) for l in range(minlen, maxlen + 1)]
-
-    with open(compression_filename, "w") as f:
-        f.write("typedef {} mchar_t;".format(values_type))
-        f.write("const uint8_t lengths[] = {{ {} }};\n".format(", ".join(map(str, lengths))))
-        f.write(
-            "const mchar_t values[] = {{ {} }};\n".format(", ".join(str(ord(u)) for u in values))
-        )
-        f.write(
-            "#define compress_max_length_bits ({})\n".format(
-                max_translation_encoded_length.bit_length()
-            )
-        )
-        f.write(
-            "const mchar_t words[] = {{ {} }};\n".format(
-                ", ".join(str(ord(c)) for w in words for c in w)
-            )
-        )
-        f.write(
-            "const uint8_t wlencount[] = {{ {} }};\n".format(", ".join(str(p) for p in wlencount))
-        )
-        f.write("#define word_start {}\n".format(word_start))
-        f.write("#define word_end {}\n".format(word_end))
-        f.write("#define minlen {}\n".format(minlen))
-        f.write("#define maxlen {}\n".format(maxlen))
-
-    return (values, lengths, words, canonical, extractor)
-
-
-def decompress(encoding_table, encoded, encoded_length_bits):
-    (values, lengths, words, _, _) = encoding_table
-    dec = []
-    this_byte = 0
-    this_bit = 7
-    b = encoded[this_byte]
-    bits = 0
-    for i in range(encoded_length_bits):
-        bits <<= 1
-        if 0x80 & b:
-            bits |= 1
-
-        b <<= 1
-        if this_bit == 0:
-            this_bit = 7
-            this_byte += 1
-            if this_byte < len(encoded):
-                b = encoded[this_byte]
-        else:
-            this_bit -= 1
-    length = bits
-
-    i = 0
-    while i < length:
-        bits = 0
-        bit_length = 0
-        max_code = lengths[0]
-        searched_length = lengths[0]
-        while True:
-            bits <<= 1
-            if 0x80 & b:
-                bits |= 1
-
-            b <<= 1
-            bit_length += 1
-            if this_bit == 0:
-                this_bit = 7
-                this_byte += 1
-                if this_byte < len(encoded):
-                    b = encoded[this_byte]
-            else:
-                this_bit -= 1
-            if max_code > 0 and bits < max_code:
-                # print('{0:0{width}b}'.format(bits, width=bit_length))
-                break
-            max_code = (max_code << 1) + lengths[bit_length]
-            searched_length += lengths[bit_length]
-
-        v = values[searched_length + bits - max_code]
-        if v >= chr(0x80) and v < chr(0x80 + len(words)):
-            v = words[ord(v) - 0x80]
-        i += len(v.encode("utf-8"))
-        dec.append(v)
-    return "".join(dec)
-
-
-def compress(encoding_table, decompressed, encoded_length_bits, len_translation_encoded):
-    if not isinstance(decompressed, str):
-        raise TypeError()
-    (_, _, _, canonical, extractor) = encoding_table
-
-    enc = bytearray(len(decompressed) * 3)
-    current_bit = 7
-    current_byte = 0
-
-    bits = encoded_length_bits + 1
-    for i in range(bits - 1, 0, -1):
-        if len_translation_encoded & (1 << (i - 1)):
-            enc[current_byte] |= 1 << current_bit
-        if current_bit == 0:
-            current_bit = 7
-            current_byte += 1
-        else:
-            current_bit -= 1
-
-    for atom in extractor.iter(decompressed):
-        for b in canonical[atom]:
-            if b == "1":
-                enc[current_byte] |= 1 << current_bit
-            if current_bit == 0:
-                current_bit = 7
-                current_byte += 1
-            else:
-                current_bit -= 1
-
-    if current_bit != 7:
-        current_byte += 1
-    return enc[:current_byte]
+    # if bytes_hash is zero, assume a 16-bit mask (to match qstr.c)
+    return (hash & ((1 << (8 * (bytes_hash or 2))) - 1)) or 1
 
 
 def qstr_escape(qst):
-    def esc_char(m):
-        c = ord(m.group(0))
+    def esc_char(c):
+        if RE_NO_ESCAPE.match(c):
+            return c
+        c = ord(c)
         try:
             name = codepoint2name[c]
         except KeyError:
             name = "0x%02x" % c
         return "_" + name + "_"
 
-    return re.sub(r"[^A-Za-z0-9_]", esc_char, qst)
+    return "".join(map(esc_char, qst))
 
 
-def parse_input_headers(infiles):
+static_qstr_list_ident = list(map(qstr_escape, static_qstr_list))
+
+
+# CIRCUITPY-CHANGE: add translations handling
+def parse_input_headers_with_translations(infiles):
     qcfgs = {}
     qstrs = {}
-    i18ns = set()
-
-    # add static qstrs
-    for qstr in static_qstr_list:
-        # work out the corresponding qstr name
-        ident = qstr_escape(qstr)
-
-        # don't add duplicates
-        assert ident not in qstrs
-
-        # add the qstr to the list, with order number to retain original order in file
-        order = len(qstrs) - 300000
-        qstrs[ident] = (order, ident, qstr)
+    # CIRCUITPY-CHANGE: add translations
+    translations = set()
 
     # read the qstrs in from the input files
     for infile in infiles:
@@ -626,9 +377,10 @@ def parse_input_headers(infiles):
                     qcfgs[match.group(1)] = value
                     continue
 
+                # CIRCUITPY-CHANGE
                 match = re.match(r'^TRANSLATE\("(.*)"\)$', line)
                 if match:
-                    i18ns.add(match.group(1))
+                    translations.add(match.group(1))
                     continue
 
                 # is this a QSTR line?
@@ -649,52 +401,61 @@ def parse_input_headers(infiles):
                 ident = qstr_escape(qstr)
 
                 # don't add duplicates
+                if ident in static_qstr_list_ident:
+                    continue
                 if ident in qstrs:
                     continue
 
-                # add the qstr to the list, with order number to retain original order in file
-                order = len(qstrs)
-                # but put special method names like __add__ at the top of list, so
-                # that their id's fit into a byte
-                if ident == "":
-                    # Sort empty qstr above all still
-                    order = -200000
-                elif ident == "__dir__":
-                    # Put __dir__ after empty qstr for builtin dir() to work
-                    order = -190000
-                elif ident.startswith("__"):
-                    order -= 100000
-                qstrs[ident] = (order, ident, qstr)
+                qstrs[ident] = (ident, qstr)
 
-    if not qcfgs and qstrs:
-        sys.stderr.write("ERROR: Empty preprocessor output - check for errors above\n")
-        sys.exit(1)
+    if not qcfgs:
+        # CIRCUITPY-CHANGE: These values are hardcoded for CircuitPython so
+        # don't error if they are missing.
+        qcfgs = {}
+        qcfgs["BYTES_IN_LEN"] = 1
+        qcfgs["BYTES_IN_HASH"] = 1
 
-    return qcfgs, qstrs, i18ns
+    # CIRCUITPY-CHANGE
+    return qcfgs, qstrs, translations
 
 
-def escape_bytes(qstr):
+# CIRCUITPY-CHANGE: Used externally by mpy-tool.py. Don't pass back translations.
+def parse_input_headers(infiles):
+    qcfgs, qstrs, translations = parse_input_headers_with_translations(infiles)
+    return (qcfgs, qstrs)
+
+
+def escape_bytes(qstr, qbytes):
     if all(32 <= ord(c) <= 126 and c != "\\" and c != '"' for c in qstr):
         # qstr is all printable ASCII so render it as-is (for easier debugging)
         return qstr
     else:
         # qstr contains non-printable codes so render entire thing as hex pairs
-        qbytes = bytes_cons(qstr, "utf8")
         return "".join(("\\x%02x" % b) for b in qbytes)
 
 
-def make_bytes(cfg_bytes_len, cfg_bytes_hash, qstr):
+# CIRCUITPY-CHANGE: the ROM pools store their strings in one NUL-separated blob per
+# pool, addressed by 16-bit offsets. Each QDEF line carries the string's offset within
+# its pool's blob as the fourth field. The blob is assembled by the C preprocessor
+# concatenating the QDEF string literals in file order, so the offsets here must be
+# the running total of (len + 1) in emission order for each pool.
+QSTR_BLOB_MAX = 1 << 16
+
+
+def make_bytes(cfg_bytes_len, cfg_bytes_hash, qstr, offset):
     qbytes = bytes_cons(qstr, "utf8")
     qlen = len(qbytes)
     qhash = compute_hash(qbytes, cfg_bytes_hash)
     if qlen >= (1 << (8 * cfg_bytes_len)):
         print("qstr is too long:", qstr)
         assert False
-    qdata = escape_bytes(qstr)
-    return '%d, %d, "%s"' % (qhash, qlen, qdata)
+    qdata = escape_bytes(qstr, qbytes)
+    # CIRCUITPY-CHANGE: emit the blob offset; the caller advances it by qlen + 1
+    return '%d, %d, %d, "%s"' % (qhash, qlen, offset, qdata), qlen + 1
 
 
-def print_qstr_data(encoding_table, qcfgs, qstrs, i18ns):
+# CIRCUITPY-CHANGE: add translations
+def print_qstr_data(qcfgs, qstrs, translations):
     # get config variables
     cfg_bytes_len = int(qcfgs["BYTES_IN_LEN"])
     cfg_bytes_hash = int(qcfgs["BYTES_IN_HASH"])
@@ -703,84 +464,59 @@ def print_qstr_data(encoding_table, qcfgs, qstrs, i18ns):
     print("// This file was automatically generated by makeqstrdata.py")
     print("")
 
+    # CIRCUITPY-CHANGE: running blob offset for each ROM pool
+    offsets = [0, 0]
+
     # add NULL qstr with no hash or data
-    print('QDEF(MP_QSTRnull, 0, 0, "")')
+    # CIRCUITPY-CHANGE: offset field; the null qstr occupies one NUL byte of the blob
+    print('QDEF0(MP_QSTRnull, 0, 0, 0, "")')
+    offsets[0] += 1
 
+    # add static qstrs to the first unsorted pool
+    for qstr in static_qstr_list:
+        # CIRCUITPY-CHANGE: pass and advance the blob offset
+        qbytes, size = make_bytes(cfg_bytes_len, cfg_bytes_hash, qstr, offsets[0])
+        offsets[0] += size
+        print("QDEF0(MP_QSTR_%s, %s)" % (qstr_escape(qstr), qbytes))
+
+    # CIRCUITPY-CHANGE: track total qstr size
     total_qstr_size = 0
-    total_qstr_compressed_size = 0
-    # go through each qstr and print it out
-    for order, ident, qstr in sorted(qstrs.values(), key=lambda x: x[0]):
-        qbytes = make_bytes(cfg_bytes_len, cfg_bytes_hash, qstr)
-        print("QDEF(MP_QSTR_%s, %s)" % (ident, qbytes))
 
+    # add remaining qstrs to the sorted (by value) pool (unless they're in
+    # unsorted_qstr_list, in which case add them to the unsorted pool)
+    for ident, qstr in sorted(qstrs.values(), key=lambda x: x[1]):
+        pool = 0 if qstr in unsorted_qstr_list else 1
+        # CIRCUITPY-CHANGE: pass and advance the blob offset
+        qbytes, size = make_bytes(cfg_bytes_len, cfg_bytes_hash, qstr, offsets[pool])
+        offsets[pool] += size
+        print("QDEF%d(MP_QSTR_%s, %s)" % (pool, ident, qbytes))
+
+        # CIRCUITPY-CHANGE: track total qstr size
         total_qstr_size += len(qstr)
 
-    total_text_size = 0
-    total_text_compressed_size = 0
-    max_translation_encoded_length = max(
-        len(translation.encode("utf-8")) for original, translation in i18ns
+    # CIRCUITPY-CHANGE: offsets are stored as uint16_t (qstr_offset_t in py/qstr.h),
+    # including the trailing end-of-blob entry
+    for pool, total in enumerate(offsets):
+        if total >= QSTR_BLOB_MAX:
+            print("qstr blob for pool %d is too large: %d bytes" % (pool, total), file=sys.stderr)
+            assert False
+
+    # CIRCUITPY-CHANGE: translations
+    print(
+        "// Enumerate translated texts but don't actually include translations. Instead, the linker will link them in."
     )
-    encoded_length_bits = max_translation_encoded_length.bit_length()
-    for original, translation in i18ns:
-        translation_encoded = translation.encode("utf-8")
-        compressed = compress(
-            encoding_table, translation, encoded_length_bits, len(translation_encoded)
-        )
-        total_text_compressed_size += len(compressed)
-        decompressed = decompress(encoding_table, compressed, encoded_length_bits)
-        assert decompressed == translation
-        for c in C_ESCAPES:
-            decompressed = decompressed.replace(c, C_ESCAPES[c])
-        print(
-            'TRANSLATION("{}", {}) // {}'.format(
-                original, ", ".join(["{:d}".format(x) for x in compressed]), decompressed
-            )
-        )
-        total_text_size += len(translation.encode("utf-8"))
+    for i, original in enumerate(sorted(translations)):
+        print('TRANSLATION("{}", {})'.format(original, i))
 
     print()
     print("// {} bytes worth of qstr".format(total_qstr_size))
-    print("// {} bytes worth of translations".format(total_text_size))
-    print("// {} bytes worth of translations compressed".format(total_text_compressed_size))
-    print("// {} bytes saved".format(total_text_size - total_text_compressed_size))
 
 
-def print_qstr_enums(qstrs):
-    # print out the starter of the generated C header file
-    print("// This file was automatically generated by makeqstrdata.py")
-    print("")
-
-    # add NULL qstr with no hash or data
-    print("QENUM(MP_QSTRnull)")
-
-    # go through each qstr and print it out
-    for order, ident, qstr in sorted(qstrs.values(), key=lambda x: x[0]):
-        print("QENUM(MP_QSTR_%s)" % (ident,))
+def do_work(infiles):
+    # CIRCUITPY-CHANGE: include translations
+    qcfgs, qstrs, translations = parse_input_headers_with_translations(infiles)
+    print_qstr_data(qcfgs, qstrs, translations)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Process QSTR definitions into headers for compilation"
-    )
-    parser.add_argument(
-        "infiles", metavar="N", type=str, nargs="+", help="an integer for the accumulator"
-    )
-    parser.add_argument(
-        "--translation", default=None, type=str, help="translations for i18n() items"
-    )
-    parser.add_argument(
-        "--compression_filename", default=None, type=str, help="header for compression info"
-    )
-
-    args = parser.parse_args()
-
-    qcfgs, qstrs, i18ns = parse_input_headers(args.infiles)
-    if args.translation:
-        i18ns = sorted(i18ns)
-        translations = translate(args.translation, i18ns)
-        encoding_table = compute_huffman_coding(translations, args.compression_filename)
-        print_qstr_data(encoding_table, qcfgs, qstrs, translations)
-    else:
-        print_qstr_enums(qstrs)
+    do_work(sys.argv[1:])

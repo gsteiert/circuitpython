@@ -1,0 +1,17 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+/* Partition layout is owned by the mcuboot fork (dts/native/nrf5340bsim.dtsi)
+ * and applied to this image by sysbuild. This overlay only adds board/app config. */
+
+/ {
+	chosen {
+		zephyr,sram = &sram0;
+	};
+};
+
+&sram0 {
+	compatible = "zephyr,memory-region", "mmio-sram";
+	zephyr,memory-region = "SRAM";
+};
+
+/* Note: bsim doesn't have USB, so we don't include app.overlay */

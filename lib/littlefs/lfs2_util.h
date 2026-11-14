@@ -1,11 +1,15 @@
 /*
  * lfs2 utility functions
  *
+ * Copyright (c) 2022, The littlefs authors.
  * Copyright (c) 2017, Arm Limited. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  */
 #ifndef LFS2_UTIL_H
 #define LFS2_UTIL_H
+
+#define LFS2_STRINGIZE(x) LFS2_STRINGIZE2(x)
+#define LFS2_STRINGIZE2(x) #x
 
 // Users can override lfs2_util.h with their own configuration by defining
 // LFS2_CONFIG as a header file to include (-DLFS2_CONFIG=lfs2_config.h).
@@ -14,10 +18,25 @@
 // provided by the config file. To start, I would suggest copying lfs2_util.h
 // and modifying as needed.
 #ifdef LFS2_CONFIG
-#define LFS2_STRINGIZE(x) LFS2_STRINGIZE2(x)
-#define LFS2_STRINGIZE2(x) #x
 #include LFS2_STRINGIZE(LFS2_CONFIG)
 #else
+
+// Alternatively, users can provide a header file which defines
+// macros and other things consumed by littlefs.
+//
+// For example, provide my_defines.h, which contains
+// something like:
+//
+// #include <stddef.h>
+// extern void *my_malloc(size_t sz);
+// #define LFS2_MALLOC(sz) my_malloc(sz)
+//
+// And build littlefs with the header by defining LFS2_DEFINES.
+// (-DLFS2_DEFINES=my_defines.h)
+
+#ifdef LFS2_DEFINES
+#include LFS2_STRINGIZE(LFS2_DEFINES)
+#endif
 
 // System includes
 #include <stdint.h>
@@ -49,6 +68,7 @@ extern "C"
 // code footprint
 
 // Logging functions
+#ifndef LFS2_TRACE
 #ifdef LFS2_YES_TRACE
 #define LFS2_TRACE_(fmt, ...) \
     printf("%s:%d:trace: " fmt "%s\n", __FILE__, __LINE__, __VA_ARGS__)
@@ -56,7 +76,9 @@ extern "C"
 #else
 #define LFS2_TRACE(...)
 #endif
+#endif
 
+#ifndef LFS2_DEBUG
 #ifndef LFS2_NO_DEBUG
 #define LFS2_DEBUG_(fmt, ...) \
     printf("%s:%d:debug: " fmt "%s\n", __FILE__, __LINE__, __VA_ARGS__)
@@ -64,7 +86,9 @@ extern "C"
 #else
 #define LFS2_DEBUG(...)
 #endif
+#endif
 
+#ifndef LFS2_WARN
 #ifndef LFS2_NO_WARN
 #define LFS2_WARN_(fmt, ...) \
     printf("%s:%d:warn: " fmt "%s\n", __FILE__, __LINE__, __VA_ARGS__)
@@ -72,7 +96,9 @@ extern "C"
 #else
 #define LFS2_WARN(...)
 #endif
+#endif
 
+#ifndef LFS2_ERROR
 #ifndef LFS2_NO_ERROR
 #define LFS2_ERROR_(fmt, ...) \
     printf("%s:%d:error: " fmt "%s\n", __FILE__, __LINE__, __VA_ARGS__)
@@ -80,12 +106,15 @@ extern "C"
 #else
 #define LFS2_ERROR(...)
 #endif
+#endif
 
 // Runtime assertions
+#ifndef LFS2_ASSERT
 #ifndef LFS2_NO_ASSERT
 #define LFS2_ASSERT(test) assert(test)
 #else
 #define LFS2_ASSERT(test)
+#endif
 #endif
 
 
@@ -156,10 +185,9 @@ static inline int lfs2_scmp(uint32_t a, uint32_t b) {
 
 // Convert between 32-bit little-endian and native order
 static inline uint32_t lfs2_fromle32(uint32_t a) {
-#if !defined(LFS2_NO_INTRINSICS) && ( \
-    (defined(  BYTE_ORDER  ) && defined(  ORDER_LITTLE_ENDIAN  ) &&   BYTE_ORDER   ==   ORDER_LITTLE_ENDIAN  ) || \
+#if (defined(  BYTE_ORDER  ) && defined(  ORDER_LITTLE_ENDIAN  ) &&   BYTE_ORDER   ==   ORDER_LITTLE_ENDIAN  ) || \
     (defined(__BYTE_ORDER  ) && defined(__ORDER_LITTLE_ENDIAN  ) && __BYTE_ORDER   == __ORDER_LITTLE_ENDIAN  ) || \
-    (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
+    (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
     return a;
 #elif !defined(LFS2_NO_INTRINSICS) && ( \
     (defined(  BYTE_ORDER  ) && defined(  ORDER_BIG_ENDIAN  ) &&   BYTE_ORDER   ==   ORDER_BIG_ENDIAN  ) || \
@@ -167,10 +195,10 @@ static inline uint32_t lfs2_fromle32(uint32_t a) {
     (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__))
     return __builtin_bswap32(a);
 #else
-    return (((uint8_t*)&a)[0] <<  0) |
-           (((uint8_t*)&a)[1] <<  8) |
-           (((uint8_t*)&a)[2] << 16) |
-           (((uint8_t*)&a)[3] << 24);
+    return ((uint32_t)((uint8_t*)&a)[0] <<  0) |
+           ((uint32_t)((uint8_t*)&a)[1] <<  8) |
+           ((uint32_t)((uint8_t*)&a)[2] << 16) |
+           ((uint32_t)((uint8_t*)&a)[3] << 24);
 #endif
 }
 
@@ -185,16 +213,15 @@ static inline uint32_t lfs2_frombe32(uint32_t a) {
     (defined(__BYTE_ORDER  ) && defined(__ORDER_LITTLE_ENDIAN  ) && __BYTE_ORDER   == __ORDER_LITTLE_ENDIAN  ) || \
     (defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
     return __builtin_bswap32(a);
-#elif !defined(LFS2_NO_INTRINSICS) && ( \
-    (defined(  BYTE_ORDER  ) && defined(  ORDER_BIG_ENDIAN  ) &&   BYTE_ORDER   ==   ORDER_BIG_ENDIAN  ) || \
+#elif (defined(  BYTE_ORDER  ) && defined(  ORDER_BIG_ENDIAN  ) &&   BYTE_ORDER   ==   ORDER_BIG_ENDIAN  ) || \
     (defined(__BYTE_ORDER  ) && defined(__ORDER_BIG_ENDIAN  ) && __BYTE_ORDER   == __ORDER_BIG_ENDIAN  ) || \
-    (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__))
+    (defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
     return a;
 #else
-    return (((uint8_t*)&a)[0] << 24) |
-           (((uint8_t*)&a)[1] << 16) |
-           (((uint8_t*)&a)[2] <<  8) |
-           (((uint8_t*)&a)[3] <<  0);
+    return ((uint32_t)((uint8_t*)&a)[0] << 24) |
+           ((uint32_t)((uint8_t*)&a)[1] << 16) |
+           ((uint32_t)((uint8_t*)&a)[2] <<  8) |
+           ((uint32_t)((uint8_t*)&a)[3] <<  0);
 #endif
 }
 
@@ -203,12 +230,22 @@ static inline uint32_t lfs2_tobe32(uint32_t a) {
 }
 
 // Calculate CRC-32 with polynomial = 0x04c11db7
+#ifdef LFS2_CRC
+static inline uint32_t lfs2_crc(uint32_t crc, const void *buffer, size_t size) {
+    return LFS2_CRC(crc, buffer, size);
+}
+#else
 uint32_t lfs2_crc(uint32_t crc, const void *buffer, size_t size);
+#endif
 
 // Allocate memory, only used if buffers are not provided to littlefs
-// Note, memory must be 64-bit aligned
+//
+// littlefs current has no alignment requirements, as it only allocates
+// byte-level buffers.
 static inline void *lfs2_malloc(size_t size) {
-#ifndef LFS2_NO_MALLOC
+#if defined(LFS2_MALLOC)
+    return LFS2_MALLOC(size);
+#elif !defined(LFS2_NO_MALLOC)
     return malloc(size);
 #else
     (void)size;
@@ -218,7 +255,9 @@ static inline void *lfs2_malloc(size_t size) {
 
 // Deallocate memory, only used if buffers are not provided to littlefs
 static inline void lfs2_free(void *p) {
-#ifndef LFS2_NO_MALLOC
+#if defined(LFS2_FREE)
+    LFS2_FREE(p);
+#elif !defined(LFS2_NO_MALLOC)
     free(p);
 #else
     (void)p;

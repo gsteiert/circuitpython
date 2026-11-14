@@ -7,22 +7,22 @@ variety of errors that can happen, what they mean and how to fix them.
 File system issues
 ------------------
 
-If your host computer starts complaining that your ``CIRCUITPY`` drive is corrupted
+If your host computer starts complaining that your **CIRCUITPY** drive is corrupted
 or files cannot be overwritten or deleted, then you will have to erase it completely.
-When CircuitPython restarts it will create a fresh empty ``CIRCUITPY`` filesystem.
+When CircuitPython restarts it will create a fresh empty **CIRCUITPY** filesystem.
 
-Corruption often happens on Windows when the ``CIRCUITPY`` disk is not safely ejected
+Corruption often happens on Windows when the **CIRCUITPY** disk is not safely ejected
 before being reset by the button or being disconnected from USB. This can also
 happen on Linux and Mac OSX but it's less likely.
 
-.. caution:: To erase and re-create ``CIRCUITPY`` (for example, to correct a corrupted filesystem),
+.. caution:: To erase and re-create **CIRCUITPY** (for example, to correct a corrupted filesystem),
     follow one of the procedures below. It's important to note that **any files stored on the**
-    ``CIRCUITPY`` **drive will be erased. Back up your code if possible before continuing!**
+    **CIRCUITPY** **drive will be erased. Back up your code if possible before continuing!**
 
 REPL Erase Method
 ^^^^^^^^^^^^^^^^^
 This is the recommended method of erasing your board. If you are having trouble accessing the
-``CIRCUITPY`` drive or the REPL, consider first putting your board into
+**CIRCUITPY** drive or the REPL, consider first putting your board into
 `safe mode <https://learn.adafruit.com/welcome-to-circuitpython/troubleshooting#safe-mode-3105351-22>`_.
 
 **To erase any board if you have access to the REPL:**
@@ -30,7 +30,7 @@ This is the recommended method of erasing your board. If you are having trouble 
 #. Connect to the CircuitPython REPL using a terminal program.
 #. Type ``import storage`` into the REPL.
 #. Then, type ``storage.erase_filesystem()`` into the REPL.
-#. The ``CIRCUITPY`` drive will be erased and the board will restart with an empty ``CIRCUITPY`` drive.
+#. The **CIRCUITPY** drive will be erased and the board will restart with an empty **CIRCUITPY** drive.
 
 Erase File Method
 ^^^^^^^^^^^^^^^^^
@@ -56,3 +56,20 @@ all available in the
 `Adafruit bundle <https://github.com/adafruit/Adafruit_CircuitPython_Bundle/releases/latest>`_
 and the `Community bundle <https://github.com/adafruit/CircuitPython_Community_Bundle/releases/latest>`_.
 Make sure to download a version with 7.0.0 or higher in the filename.
+
+The error can also come from a ``.mpy`` file that contains native code for a different
+kind of chip. On boards that can run native code, ``import foo`` looks for ``foo.py``,
+then ``foo.<arch>.mpy``, then ``foo.mpy``, where ``<arch>`` is
+``microcontroller.cpu.architecture``, for example ``foo.armv7emsp.mpy``. A
+``foo.<arch>.mpy`` built for another architecture or CircuitPython version raises this
+error instead of falling back to ``foo.mpy``.
+
+SyntaxError: invalid micropython decorator
+------------------------------------------
+
+CircuitPython cannot compile ``@micropython.native`` or ``@micropython.viper`` functions from a
+``.py`` file on the board. Add ``optional=True``, for example ``@micropython.viper(optional=True)``,
+to run the function as ordinary bytecode instead. ``mpy-cross`` does the same when it is run
+without ``-march``. Viper code that uses ``ptr8``, ``uint`` or other viper-only types raises
+``NameError`` when it runs as bytecode, so it needs a native ``.mpy`` file on a board that can
+load one.

@@ -1,6 +1,12 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
+
 #include "shared-bindings/board/__init__.h"
 
-STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
+static const mp_rom_map_elem_t board_module_globals_table[] = {
     CIRCUITPYTHON_BOARD_DICT_STANDARD_ITEMS
 
 
@@ -29,7 +35,6 @@ STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_D8), MP_ROM_PTR(&pin_PA07) },
     { MP_ROM_QSTR(MP_QSTR_D9), MP_ROM_PTR(&pin_PA05) },
     { MP_ROM_QSTR(MP_QSTR_D10), MP_ROM_PTR(&pin_PA06) },
-    { MP_ROM_QSTR(MP_QSTR_D13), MP_ROM_PTR(&pin_PA17) },
 
     // UART pins
     { MP_ROM_QSTR(MP_QSTR_TX), MP_ROM_PTR(&pin_PB08) },
@@ -44,9 +49,14 @@ STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_SCL), MP_ROM_PTR(&pin_PA09) },
     { MP_ROM_QSTR(MP_QSTR_SDA), MP_ROM_PTR(&pin_PA08) },
 
-    // LED pins
-    { MP_ROM_QSTR(MP_QSTR_LED),   MP_ROM_PTR(&pin_PA17) }, // status
-    { MP_ROM_QSTR(MP_QSTR_BLUE_LED),   MP_ROM_PTR(&pin_PA17) },
+    { MP_ROM_QSTR(MP_QSTR_LED_INVERTED),   MP_ROM_PTR(&pin_PA17) },
+    { MP_ROM_QSTR(MP_QSTR_YELLOW_LED_INVERTED),   MP_ROM_PTR(&pin_PA17) },
+
+    { MP_ROM_QSTR(MP_QSTR_RX_LED_INVERTED),   MP_ROM_PTR(&pin_PA18) },
+    { MP_ROM_QSTR(MP_QSTR_BLUE_LED1_INVERTED),   MP_ROM_PTR(&pin_PA18) },
+
+    { MP_ROM_QSTR(MP_QSTR_TX_LED_INVERTED),   MP_ROM_PTR(&pin_PA19) },
+    { MP_ROM_QSTR(MP_QSTR_BLUE_LED2_INVERTED),   MP_ROM_PTR(&pin_PA19) },
 
     // Comm objects
     { MP_ROM_QSTR(MP_QSTR_I2C), MP_ROM_PTR(&board_i2c_obj) },

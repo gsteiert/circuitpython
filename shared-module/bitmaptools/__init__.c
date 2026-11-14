@@ -1,29 +1,10 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Kevin Matocha
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Kevin Matocha, Jose David Montoya
+//
+// SPDX-License-Identifier: MIT
 
+#include "shared/runtime/interrupt_char.h"
 #include "shared-bindings/bitmaptools/__init__.h"
 #include "shared-bindings/displayio/Bitmap.h"
 #include "shared-bindings/displayio/Palette.h"
@@ -38,6 +19,148 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+
+#define BITMAP_DEBUG(...) (void)0
+// #define BITMAP_DEBUG(...) mp_printf(&mp_plat_print, __VA_ARGS__)
+
+#if CIRCUITPY_BITMAPTOOLS_FAST_ROTOZOOM
+#include "shared-module/bitmaptools/__init__.h"
+
+// Fixed-point path for rotozoom.
+//
+// The generic loop walks the source in mp_float_t and truncates to pick each source
+// pixel. A 16.16 fixed-point walk picks the same pixels when every one of those float
+// operations is exact: no rotation (u depends only on x, v only on y), and the steps and
+// start points are multiples of 2^-k with every intermediate value below 2^(24-k).
+
+#define ROTOZOOM_FRACTION_BITS 16
+
+// Store f * 2^16 in *fixed if that is an integer with |value| < 2^31. Returns false
+// otherwise (NaN and inf included).
+static bool rotozoom_to_fixed(mp_float_t f, int32_t *fixed) {
+    // Exact: scaling by a power of two.
+    mp_float_t scaled = f * MICROPY_FLOAT_CONST(65536.0);
+    if (!(scaled > MICROPY_FLOAT_CONST(-2147483648.0) && scaled < MICROPY_FLOAT_CONST(2147483648.0))) {
+        return false;
+    }
+    int32_t value = (int32_t)scaled;
+    if ((mp_float_t)value < scaled || (mp_float_t)value > scaled) {
+        return false;
+    }
+    *fixed = value;
+    return true;
+}
+
+MP_WEAK void bitmaptools_rotozoom_row(void *dest_pixels, const void *source_row,
+    uint32_t u, uint32_t du, int count, uint8_t bits_per_value,
+    uint32_t skip_index, bool skip_index_none) {
+    if (bits_per_value == 16) {
+        uint16_t *dest = dest_pixels;
+        const uint16_t *source = source_row;
+        for (int i = 0; i < count; i++, u += du) {
+            uint16_t pixel = source[u >> ROTOZOOM_FRACTION_BITS];
+            if (skip_index_none || pixel != skip_index) {
+                dest[i] = pixel;
+            }
+        }
+    } else {
+        uint8_t *dest = dest_pixels;
+        const uint8_t *source = source_row;
+        for (int i = 0; i < count; i++, u += du) {
+            uint8_t pixel = source[u >> ROTOZOOM_FRACTION_BITS];
+            if (skip_index_none || pixel != skip_index) {
+                dest[i] = pixel;
+            }
+        }
+    }
+}
+
+// Returns true when it has written every pixel the generic loop would write, and false,
+// with nothing written, when the walk would not be exact.
+static bool rotozoom_fixed_point(displayio_bitmap_t *dest,
+    int16_t minx, int16_t miny, int16_t maxx, int16_t maxy,
+    displayio_bitmap_t *source,
+    int16_t source_clip0_x, int16_t source_clip0_y,
+    int16_t source_clip1_x, int16_t source_clip1_y,
+    mp_float_t duRow, mp_float_t dvRow, mp_float_t duCol, mp_float_t dvCol,
+    mp_float_t startu, mp_float_t startv,
+    uint32_t skip_index, bool skip_index_none) {
+
+    // No rotation: u must not change down a column and v must not change along a row.
+    // Range tests because -Wfloat-equal forbids ==; NaN fails them.
+    if (!(duCol >= 0 && duCol <= 0) || !(dvRow >= 0 && dvRow <= 0)
+        || !(duRow > 0) || !(dvCol > 0)) {
+        return false;
+    }
+    uint8_t bits_per_value = source->bits_per_value;
+    if (bits_per_value != dest->bits_per_value || (bits_per_value != 8 && bits_per_value != 16)) {
+        return false;
+    }
+    if (minx > maxx || miny > maxy) {
+        return false;
+    }
+
+    int32_t u_step, v_step, u_start, v_start;
+    if (!rotozoom_to_fixed(duRow, &u_step) || !rotozoom_to_fixed(dvCol, &v_step)
+        || !rotozoom_to_fixed(startu, &u_start) || !rotozoom_to_fixed(startv, &v_start)) {
+        return false;
+    }
+
+    // Every value the generic loop computes is a multiple of 2^-fraction_bits, so it is
+    // exact while below 2^(24 - fraction_bits), which is 2^(40 - fraction_bits) in 16.16
+    // units. u and v are linear in x and y, so the end points bound them. The generic
+    // loop computes u = startu + minx * duRow, then adds duRow up to maxx + 1; v likewise
+    // down the rows. The lowest set bit of the four values sets fraction_bits, and
+    // u_step > 0, so the OR is not zero.
+    uint32_t all_bits = (uint32_t)(u_step | v_step | u_start | v_start);
+    int fraction_bits = MAX(0, ROTOZOOM_FRACTION_BITS - __builtin_ctz(all_bits));
+    int64_t limit = (int64_t)1 << (40 - fraction_bits);
+    int64_t ends[] = {
+        (int64_t)minx * u_step, u_start + (int64_t)minx * u_step, u_start + ((int64_t)maxx + 1) * u_step,
+        (int64_t)miny * v_step, v_start + (int64_t)miny * v_step, v_start + ((int64_t)maxy + 1) * v_step,
+    };
+    for (size_t i = 0; i < MP_ARRAY_SIZE(ends); i++) {
+        if (ends[i] <= -limit || ends[i] >= limit) {
+            return false;
+        }
+    }
+
+    // u rises with x, so the columns that sample inside the source clip are one run, the
+    // same on every row. The clips are within the bitmap, so every sampled pixel is in
+    // bounds and u, v are >= 0 there.
+    int64_t clip_u_start = (int64_t)source_clip0_x << ROTOZOOM_FRACTION_BITS;
+    int64_t clip_u_end = (int64_t)source_clip1_x << ROTOZOOM_FRACTION_BITS;
+    int64_t clip_v_start = (int64_t)source_clip0_y << ROTOZOOM_FRACTION_BITS;
+    int64_t clip_v_end = (int64_t)source_clip1_y << ROTOZOOM_FRACTION_BITS;
+    int32_t x_first = minx;
+    while (x_first <= maxx && u_start + (int64_t)x_first * u_step < clip_u_start) {
+        x_first++;
+    }
+    int32_t x_last = maxx;
+    while (x_last >= x_first && u_start + (int64_t)x_last * u_step >= clip_u_end) {
+        x_last--;
+    }
+    if (x_first > x_last) {
+        // No column samples the source, so the generic loop writes nothing either.
+        return true;
+    }
+    // In [clip_u_start, clip_u_end), so below 2^31.
+    uint32_t u_first = (uint32_t)(u_start + (int64_t)x_first * u_step);
+    size_t bytes_per_value = bits_per_value / 8;
+
+    for (int32_t y = miny; y <= maxy; y++) {
+        int64_t v = v_start + (int64_t)y * v_step;
+        if (v < clip_v_start || v >= clip_v_end) {
+            continue;
+        }
+        const uint32_t *source_row = source->data + (v >> ROTOZOOM_FRACTION_BITS) * source->stride;
+        uint8_t *dest_pixels = (uint8_t *)(dest->data + y * dest->stride) + x_first * bytes_per_value;
+        bitmaptools_rotozoom_row(dest_pixels, source_row, u_first, u_step,
+            x_last - x_first + 1, bits_per_value, skip_index, skip_index_none);
+    }
+    return true;
+}
+#endif
 
 void common_hal_bitmaptools_rotozoom(displayio_bitmap_t *self, int16_t ox, int16_t oy,
     int16_t dest_clip0_x, int16_t dest_clip0_y,
@@ -99,7 +222,7 @@ void common_hal_bitmaptools_rotozoom(displayio_bitmap_t *self, int16_t ox, int16
     // #    */
 
 
-    int16_t x,y;
+    int16_t x, y;
 
     int16_t minx = dest_clip1_x;
     int16_t miny = dest_clip1_y;
@@ -202,6 +325,14 @@ void common_hal_bitmaptools_rotozoom(displayio_bitmap_t *self, int16_t ox, int16
     displayio_area_t dirty_area = {minx, miny, maxx + 1, maxy + 1, NULL};
     displayio_bitmap_set_dirty_area(self, &dirty_area);
 
+    #if CIRCUITPY_BITMAPTOOLS_FAST_ROTOZOOM
+    if (rotozoom_fixed_point(self, minx, miny, maxx, maxy, source,
+        source_clip0_x, source_clip0_y, source_clip1_x, source_clip1_y,
+        duRow, dvRow, duCol, dvCol, startu, startv, skip_index, skip_index_none)) {
+        return;
+    }
+    #endif
+
     for (y = miny; y <= maxy; y++) {
         mp_float_t u = rowu + minx * duRow;
         mp_float_t v = rowv + minx * dvRow;
@@ -217,6 +348,21 @@ void common_hal_bitmaptools_rotozoom(displayio_bitmap_t *self, int16_t ox, int16
         }
         rowu += duCol;
         rowv += dvCol;
+    }
+}
+
+void common_hal_bitmaptools_replace_color(displayio_bitmap_t *destination,
+    uint32_t old_color,
+    uint32_t new_color) {
+
+    int16_t x, y;
+    for (x = 0; x < destination->width; x++) {
+        for (y = 0; y < destination->height; y++) {
+            uint32_t pixel_val = common_hal_displayio_bitmap_get_pixel(destination, x, y);
+            if (pixel_val == old_color) {
+                displayio_bitmap_write_pixel(destination, x, y, new_color);
+            }
+        }
     }
 }
 
@@ -376,6 +522,10 @@ void common_hal_bitmaptools_boundary_fill(displayio_bitmap_t *destination,
         }
 
         mp_obj_list_get(fill_area, &list_length, &fill_points);
+        RUN_BACKGROUND_TASKS;
+        if (mp_hal_is_interrupted()) {
+            return;
+        }
     }
 
     // set dirty the area so displayio will draw
@@ -384,36 +534,10 @@ void common_hal_bitmaptools_boundary_fill(displayio_bitmap_t *destination,
 
 }
 
-void common_hal_bitmaptools_draw_line(displayio_bitmap_t *destination,
+static void draw_line(displayio_bitmap_t *destination,
     int16_t x0, int16_t y0,
     int16_t x1, int16_t y1,
     uint32_t value) {
-
-    //
-    // adapted from Adafruit_CircuitPython_Display_Shapes.Polygon._line
-    //
-
-    // update the dirty rectangle
-    int16_t xbb0, xbb1, ybb0, ybb1;
-    if (x0 < x1) {
-        xbb0 = x0;
-        xbb1 = x1 + 1;
-    } else {
-        xbb0 = x1;
-        xbb1 = x0 + 1;
-    }
-    if (y0 < y1) {
-        ybb0 = y0;
-        ybb1 = y1 + 1;
-    } else {
-        ybb0 = y1;
-        ybb1 = y0 + 1;
-    }
-    displayio_area_t area = { xbb0, ybb0, xbb1, ybb1, NULL };
-    displayio_area_t bitmap_area = { 0, 0, destination->width, destination->height, NULL };
-    displayio_area_compute_overlap(&area, &bitmap_area, &area);
-
-    displayio_bitmap_set_dirty_area(destination, &area);
 
     int16_t temp, x, y;
 
@@ -423,6 +547,8 @@ void common_hal_bitmaptools_draw_line(displayio_bitmap_t *destination,
             y0 = y1;
             y1 = temp;
         }
+        y0 = MAX(0, y0); // only draw inside bitmap
+        y1 = MIN(y1, destination->height - 1);
         for (y = y0; y < (y1 + 1); y++) { // write a horizontal line
             displayio_bitmap_write_pixel(destination, x0, y, value);
         }
@@ -432,6 +558,8 @@ void common_hal_bitmaptools_draw_line(displayio_bitmap_t *destination,
             x0 = x1;
             x1 = temp;
         }
+        x0 = MAX(0, x0); // only draw inside bitmap
+        x1 = MIN(x1, destination->width - 1);
         for (x = x0; x < (x1 + 1); x++) { // write a horizontal line
             displayio_bitmap_write_pixel(destination, x, y0, value);
         }
@@ -484,6 +612,84 @@ void common_hal_bitmaptools_draw_line(displayio_bitmap_t *destination,
     }
 }
 
+void common_hal_bitmaptools_draw_line(displayio_bitmap_t *destination,
+    int16_t x0, int16_t y0,
+    int16_t x1, int16_t y1,
+    uint32_t value) {
+
+    //
+    // adapted from Adafruit_CircuitPython_Display_Shapes.Polygon._line
+    //
+
+    // update the dirty rectangle
+    int16_t xbb0, xbb1, ybb0, ybb1;
+    if (x0 < x1) {
+        xbb0 = x0;
+        xbb1 = x1 + 1;
+    } else {
+        xbb0 = x1;
+        xbb1 = x0 + 1;
+    }
+    if (y0 < y1) {
+        ybb0 = y0;
+        ybb1 = y1 + 1;
+    } else {
+        ybb0 = y1;
+        ybb1 = y0 + 1;
+    }
+    displayio_area_t area = { xbb0, ybb0, xbb1, ybb1, NULL };
+    displayio_area_t bitmap_area = { 0, 0, destination->width, destination->height, NULL };
+    displayio_area_compute_overlap(&area, &bitmap_area, &area);
+
+    displayio_bitmap_set_dirty_area(destination, &area);
+
+    draw_line(destination, x0, y0, x1, y1, value);
+}
+
+static int32_t ith(void *data, size_t i, int element_size) {
+    switch (element_size) {
+        default:
+        case 1:
+            return *((int8_t *)data + i);
+        case 2:
+            return *((int16_t *)data + i);
+        case 4:
+            return *((int32_t *)data + i);
+    }
+}
+
+void common_hal_bitmaptools_draw_polygon(displayio_bitmap_t *destination, void *xs, void *ys, size_t points_len, int point_size, uint32_t value, bool close) {
+    int16_t x0, y0, xmin, xmax, ymin, ymax, xprev, yprev, x, y;
+    x0 = ith(xs, 0, point_size);
+    xmin = x0;
+    xmax = x0;
+    xprev = x0;
+    y0 = ith(ys, 0, point_size);
+    ymin = y0;
+    ymax = y0;
+    yprev = y0;
+
+    for (size_t i = 1; i < points_len; i++) {
+        x = ith(xs, i, point_size);
+        y = ith(ys, i, point_size);
+        draw_line(destination, xprev, yprev, x, y, value);
+        xprev = x;
+        yprev = y;
+        xmin = MIN(xmin, x);
+        xmax = MAX(xmax, x);
+        ymin = MIN(ymin, y);
+        ymax = MAX(ymax, y);
+    }
+    if (close) {
+        draw_line(destination, xprev, yprev, x0, y0, value);
+    }
+
+    displayio_area_t area = { xmin, ymin, xmax + 1, ymax + 1, NULL };
+    displayio_area_t bitmap_area = { 0, 0, destination->width, destination->height, NULL };
+    displayio_area_compute_overlap(&area, &bitmap_area, &area);
+    displayio_bitmap_set_dirty_area(destination, &area);
+}
+
 void common_hal_bitmaptools_arrayblit(displayio_bitmap_t *self, void *data, int element_size, int x1, int y1, int x2, int y2, bool skip_specified, uint32_t skip_value) {
     uint32_t mask = (1 << common_hal_displayio_bitmap_get_bits_per_value(self)) - 1;
 
@@ -517,7 +723,7 @@ void common_hal_bitmaptools_arrayblit(displayio_bitmap_t *self, void *data, int 
 void common_hal_bitmaptools_readinto(displayio_bitmap_t *self, mp_obj_t *file, int element_size, int bits_per_pixel, bool reverse_pixels_in_element, bool swap_bytes, bool reverse_rows) {
     uint32_t mask = (1 << common_hal_displayio_bitmap_get_bits_per_value(self)) - 1;
 
-    const mp_stream_p_t *file_proto = mp_get_stream_raise(file, MP_STREAM_OP_READ);
+    mp_get_stream_raise(file, MP_STREAM_OP_READ);
 
     displayio_area_t a = {0, 0, self->width, self->height, NULL};
     displayio_bitmap_set_dirty_area(self, &a);
@@ -534,8 +740,9 @@ void common_hal_bitmaptools_readinto(displayio_bitmap_t *self, mp_obj_t *file, i
         const int y_draw = reverse_rows ? (self->height) - 1 - y : y;
 
 
+        // A stream such as a socket can return part of a row, so read until the row is complete.
         int error = 0;
-        mp_uint_t bytes_read = file_proto->read(file, rowdata32, rowsize, &error);
+        mp_uint_t bytes_read = mp_stream_read_exactly(file, rowdata32, rowsize, &error);
         if (error) {
             mp_raise_OSError(error);
         }
@@ -641,7 +848,7 @@ enum {
     SWAP_RB = 1 << 1,
 };
 
-STATIC void fill_row(displayio_bitmap_t *bitmap, int swap, int16_t *luminance_data, int y, int mx) {
+static void fill_row(displayio_bitmap_t *bitmap, int swap, int16_t *luminance_data, int y, int mx) {
     if (y >= bitmap->height) {
         return;
     }
@@ -688,10 +895,10 @@ STATIC void fill_row(displayio_bitmap_t *bitmap, int swap, int16_t *luminance_da
 
 static void write_pixels(displayio_bitmap_t *bitmap, int y, bool *data) {
     if (bitmap->bits_per_value == 1) {
-        uint32_t *pixel_data = (uint32_t *)(bitmap->data + bitmap->stride * y);
-        for (int i = 0; i < bitmap->stride; i++) {
-            uint32_t p = 0;
-            for (int j = 0; j < 32; i++) {
+        uint8_t *pixel_data = (uint8_t *)(bitmap->data + bitmap->stride * y);
+        for (int i = 0; i < (bitmap->width + 7) / 8; i++) {
+            uint8_t p = 0;
+            for (int j = 0; j < 8; j++) {
                 p = (p << 1);
                 if (*data++) {
                     p |= 1;
@@ -720,7 +927,7 @@ void common_hal_bitmaptools_dither(displayio_bitmap_t *dest_bitmap, displayio_bi
 
     bitmaptools_dither_algorithm_info_t *info = algorithms[algorithm];
     // rowdata holds 3 rows of data.  Each one is larger than the input
-    // bitmap's width, beacuse `mx` extra pixels are allocated at the start and
+    // bitmap's width, because `mx` extra pixels are allocated at the start and
     // end of the row so that no conditionals are needed when storing the error data.
     int16_t rowdata[(width + 2 * info->mx) * 3];
     int16_t *rows[3] = {
@@ -728,6 +935,7 @@ void common_hal_bitmaptools_dither(displayio_bitmap_t *dest_bitmap, displayio_bi
     };
     // out holds one output row of pixels, and is padded to be a multiple of 32 so that the 1bpp storage loop can be simplified
     bool out[(width + 31) / 32 * 32];
+    memset(out + width, 0, sizeof(out) - width);
 
     fill_row(source_bitmap, swap, rows[0], 0, info->mx);
     fill_row(source_bitmap, swap, rows[1], 1, info->mx);
@@ -797,30 +1005,75 @@ void common_hal_bitmaptools_dither(displayio_bitmap_t *dest_bitmap, displayio_bi
     displayio_bitmap_set_dirty_area(dest_bitmap, &a);
 }
 
-void common_hal_bitmaptools_alphablend(displayio_bitmap_t *dest, displayio_bitmap_t *source1, displayio_bitmap_t *source2, displayio_colorspace_t colorspace, mp_float_t factor1, mp_float_t factor2) {
+void common_hal_bitmaptools_alphablend(displayio_bitmap_t *dest, displayio_bitmap_t *source1, displayio_bitmap_t *source2, displayio_colorspace_t colorspace, mp_float_t factor1, mp_float_t factor2,
+    bitmaptools_blendmode_t blendmode, uint32_t skip_source1_index, bool skip_source1_index_none, uint32_t skip_source2_index, bool skip_source2_index_none,
+    displayio_bitmap_t *mask) {
     displayio_area_t a = {0, 0, dest->width, dest->height, NULL};
     displayio_bitmap_set_dirty_area(dest, &a);
 
-    int ifactor1 = (int)(factor1 * 256);
-    int ifactor2 = (int)(factor2 * 256);
+    int ifactor1_base = (int)(factor1 * 256);
+    int ifactor2_base = (int)(factor2 * 256);
+    int ifactor1 = ifactor1_base;
+    int ifactor2 = ifactor2_base;
+    bool blend_source1, blend_source2;
 
     if (colorspace == DISPLAYIO_COLORSPACE_L8) {
         for (int y = 0; y < dest->height; y++) {
             uint8_t *dptr = (uint8_t *)(dest->data + y * dest->stride);
             uint8_t *sptr1 = (uint8_t *)(source1->data + y * source1->stride);
             uint8_t *sptr2 = (uint8_t *)(source2->data + y * source2->stride);
+            uint8_t *mptr = mask ? (uint8_t *)(mask->data + y * mask->stride) : NULL;
+            int pixel;
             for (int x = 0; x < dest->width; x++) {
-                // This is round(l1*f1 + l2*f2) & clip to range in fixed-point
-                int pixel = (*sptr1++ *ifactor1 + *sptr2++ *ifactor2 + 128) / 256;
+                blend_source1 = skip_source1_index_none || *sptr1 != (uint8_t)skip_source1_index;
+                blend_source2 = skip_source2_index_none || *sptr2 != (uint8_t)skip_source2_index;
+                if (mptr) {
+                    uint8_t m = *mptr;
+                    // Scale source2's contribution by the mask (0..255)
+                    ifactor2 = (ifactor2_base * m + 127) / 255;
+                    if (m == 0) {
+                        // Mask says fully transparent: drop source2 entirely
+                        blend_source2 = false;
+                    }
+                }
+                if (blend_source1 && blend_source2) {
+                    // Premultiply by the alpha factor
+                    int sda = *sptr1++ *ifactor1;
+                    int sca = *sptr2++ *ifactor2;
+                    // Blend
+                    int blend;
+                    if (blendmode == BITMAPTOOLS_BLENDMODE_SCREEN) {
+                        blend = sca + sda - (sca * sda / 65536);
+                    } else {
+                        blend = sca + sda * (256 - ifactor2) / 256;
+                    }
+                    // Divide by the alpha factor
+                    int denom = ifactor1 + ifactor2 - ifactor1 * ifactor2 / 256;
+                    pixel = (denom > 0) ? (blend / denom) : 0;
+                } else if (blend_source1) {
+                    // Apply iFactor1 to source1 only
+                    pixel = *sptr1++ *ifactor1 / 256;
+                } else if (blend_source2) {
+                    // Apply iFactor2 to source1 only
+                    pixel = *sptr2++ *ifactor2 / 256;
+                } else {
+                    // Use the destination value
+                    pixel = *dptr;
+                }
                 *dptr++ = MIN(255, MAX(0, pixel));
+                if (mptr) {
+                    mptr++;
+                }
             }
         }
     } else {
         bool swap = (colorspace == DISPLAYIO_COLORSPACE_RGB565_SWAPPED) || (colorspace == DISPLAYIO_COLORSPACE_BGR565_SWAPPED);
+        uint16_t pixel;
         for (int y = 0; y < dest->height; y++) {
             uint16_t *dptr = (uint16_t *)(dest->data + y * dest->stride);
             uint16_t *sptr1 = (uint16_t *)(source1->data + y * source1->stride);
             uint16_t *sptr2 = (uint16_t *)(source2->data + y * source2->stride);
+            uint8_t *mptr = mask ? (uint8_t *)(mask->data + y * mask->stride) : NULL;
             for (int x = 0; x < dest->width; x++) {
                 int spix1 = *sptr1++;
                 int spix2 = *sptr2++;
@@ -833,26 +1086,262 @@ void common_hal_bitmaptools_alphablend(displayio_bitmap_t *dest, displayio_bitma
                 const int g_mask = 0x07e0;
                 const int b_mask = 0x001f; // (or r mask, if BGR)
 
-                // This is round(r1*f1 + r2*f2) & clip to range in fixed-point
-                // but avoiding shifting it down to start at bit 0
-                int r = ((spix1 & r_mask) * ifactor1
-                    + (spix2 & r_mask) * ifactor2 + r_mask / 2) / 256;
-                r = MIN(r_mask, MAX(0, r)) & r_mask;
+                blend_source1 = skip_source1_index_none || spix1 != (int)skip_source1_index;
+                blend_source2 = skip_source2_index_none || spix2 != (int)skip_source2_index;
 
-                // ditto
-                int g = ((spix1 & g_mask) * ifactor1
-                    + (spix2 & g_mask) * ifactor2 + g_mask / 2) / 256;
-                g = MIN(g_mask, MAX(0, g)) & g_mask;
-
-                int b = ((spix1 & b_mask) * ifactor1
-                    + (spix2 & b_mask) * ifactor2 + b_mask / 2) / 256;
-                b = MIN(b_mask, MAX(0, b)) & b_mask;
-
-                uint16_t pixel = r | g | b;
-                if (swap) {
-                    pixel = __builtin_bswap16(pixel);
+                if (mptr) {
+                    uint8_t m = *mptr++;
+                    ifactor2 = (ifactor2_base * m + 127) / 255;
+                    if (m == 0) {
+                        blend_source2 = false;
+                    }
                 }
+
+                if (blend_source1 && blend_source2) {
+                    // Blend based on the SVG alpha compositing specs
+                    // https://dev.w3.org/SVG/modules/compositing/master/#alphaCompositing
+
+                    int ifactor_blend = ifactor1 + ifactor2 - ifactor1 * ifactor2 / 256;
+                    if (ifactor_blend <= 0) {
+                        // Both factors are zero at this pixel; keep destination.
+                        dptr++;
+                        continue;
+                    }
+
+                    // Premultiply the colors by the alpha factor
+                    int red_dca = ((spix1 & r_mask) >> 8) * ifactor1;
+                    int grn_dca = ((spix1 & g_mask) >> 3) * ifactor1;
+                    int blu_dca = ((spix1 & b_mask) << 3) * ifactor1;
+
+                    int red_sca = ((spix2 & r_mask) >> 8) * ifactor2;
+                    int grn_sca = ((spix2 & g_mask) >> 3) * ifactor2;
+                    int blu_sca = ((spix2 & b_mask) << 3) * ifactor2;
+
+                    int red_blend, grn_blend, blu_blend;
+                    if (blendmode == BITMAPTOOLS_BLENDMODE_SCREEN) {
+                        // Perform a screen blend Sca + Dca - Sca × Dca
+                        red_blend = red_sca + red_dca - (red_sca * red_dca / 65536);
+                        grn_blend = grn_sca + grn_dca - (grn_sca * grn_dca / 65536);
+                        blu_blend = blu_sca + blu_dca - (blu_sca * blu_dca / 65536);
+                    } else {
+                        // Perform a normal (src-over) blend
+                        red_blend = red_sca + red_dca * (256 - ifactor2) / 256;
+                        grn_blend = grn_sca + grn_dca * (256 - ifactor2) / 256;
+                        blu_blend = blu_sca + blu_dca * (256 - ifactor2) / 256;
+                    }
+
+                    // Divide by the alpha factor
+                    int r = ((red_blend / ifactor_blend) << 8) & r_mask;
+                    int g = ((grn_blend / ifactor_blend) << 3) & g_mask;
+                    int b = ((blu_blend / ifactor_blend) >> 3) & b_mask;
+
+                    // Clamp to the appropriate range
+                    r = MIN(r_mask, MAX(0, r)) & r_mask;
+                    g = MIN(g_mask, MAX(0, g)) & g_mask;
+                    b = MIN(b_mask, MAX(0, b)) & b_mask;
+
+                    pixel = r | g | b;
+
+                    if (swap) {
+                        pixel = __builtin_bswap16(pixel);
+                    }
+                } else if (blend_source1) {
+                    // Apply iFactor1 to source1 only
+                    int r = (spix1 & r_mask) * ifactor1 / 256;
+                    int g = (spix1 & g_mask) * ifactor1 / 256;
+                    int b = (spix1 & b_mask) * ifactor1 / 256;
+                    pixel = r | g | b;
+                } else if (blend_source2) {
+                    // Apply iFactor2 to source1 only
+                    int r = (spix2 & r_mask) * ifactor2 / 256;
+                    int g = (spix2 & g_mask) * ifactor2 / 256;
+                    int b = (spix2 & b_mask) * ifactor2 / 256;
+                    pixel = r | g | b;
+                } else {
+                    // Use the destination value
+                    pixel = *dptr;
+                }
+
                 *dptr++ = pixel;
+            }
+        }
+    }
+}
+
+static void draw_circle(displayio_bitmap_t *destination,
+    int16_t x, int16_t y,
+    int16_t radius, uint32_t value) {
+
+    int16_t d, yb;
+
+    mp_arg_validate_int_range(x, SHRT_MIN, SHRT_MAX, MP_QSTR_x);
+    mp_arg_validate_int_range(y, SHRT_MIN, SHRT_MAX, MP_QSTR_y);
+
+    x = MIN(x, destination->width);
+    x = MAX(0, x);
+    y = MIN(y, destination->height);
+    y = MAX(0, y);
+
+    BITMAP_DEBUG("x, y, radius    (%4d, %4d, %4d)\n", x, y, radius);
+
+    yb = radius;
+    d = 3 - 2 * radius;
+
+    // Bresenham's circle algorithm
+    for (int xb = 0; xb <= yb; xb++) {
+        displayio_bitmap_write_pixel(destination, xb + x, yb + y, value);
+        displayio_bitmap_write_pixel(destination, -xb + x, -yb + y, value);
+        displayio_bitmap_write_pixel(destination, -xb + x, yb + y, value);
+        displayio_bitmap_write_pixel(destination, xb + x, -yb + y, value);
+        displayio_bitmap_write_pixel(destination, yb + x, xb + y, value);
+        displayio_bitmap_write_pixel(destination, -yb + x, xb + y, value);
+        displayio_bitmap_write_pixel(destination, -yb + x, -xb + y, value);
+        displayio_bitmap_write_pixel(destination, yb + x, -xb + y, value);
+        if (d <= 0) {
+            d = d + (4 * xb) + 6;
+        } else {
+            d = d + 4 * (xb - yb) + 10;
+            yb = yb - 1;
+        }
+    }
+}
+
+void common_hal_bitmaptools_draw_circle(displayio_bitmap_t *destination,
+    int16_t x, int16_t y,
+    int16_t radius,
+    uint32_t value) {
+
+
+    // update the dirty area
+    int16_t xbb0, xbb1, ybb0, ybb1;
+
+    xbb0 = x - radius;
+    xbb1 = x + radius + 1;
+    ybb0 = y - radius;
+    ybb1 = y + radius + 1;
+
+    displayio_area_t area = { xbb0, ybb0, xbb1, ybb1, NULL };
+    displayio_area_t bitmap_area = { 0, 0, destination->width, destination->height, NULL };
+    displayio_area_compute_overlap(&area, &bitmap_area, &area);
+
+    displayio_bitmap_set_dirty_area(destination, &area);
+
+    draw_circle(destination, x, y, radius, value);
+}
+
+// Copy whole rows with memmove when no per-pixel decisions are needed.
+static bool blit_rows_fast(displayio_bitmap_t *destination, displayio_bitmap_t *source,
+    int16_t x, int16_t y, int16_t x1, int16_t y1, int16_t x2, int16_t y2) {
+    uint8_t bits_per_value = source->bits_per_value;
+    if (bits_per_value != destination->bits_per_value || bits_per_value < 8) {
+        return false;
+    }
+    if (x1 < 0 || y1 < 0 || x2 > source->width || y2 > source->height) {
+        return false;
+    }
+    int sx = x1, sy = y1, dx = x, dy = y;
+    int w = x2 - x1, h = y2 - y1;
+    if (dx < 0) {
+        sx -= dx;
+        w += dx;
+        dx = 0;
+    }
+    if (dy < 0) {
+        sy -= dy;
+        h += dy;
+        dy = 0;
+    }
+    if (dx + w > destination->width) {
+        w = destination->width - dx;
+    }
+    if (dy + h > destination->height) {
+        h = destination->height - dy;
+    }
+    if (w <= 0 || h <= 0) {
+        return true;    // nothing lands in the destination
+    }
+    size_t bytes_per_value = bits_per_value / 8;
+    size_t row_bytes = (size_t)w * bytes_per_value;
+    // When a bitmap is blitted onto itself and the destination rows sit below the
+    // source rows, copy bottom-up so no source row is overwritten before it is read.
+    bool bottom_up = destination == source && dy > sy;
+    for (int j = 0; j < h; j++) {
+        int row = bottom_up ? h - 1 - j : j;
+        const uint8_t *src_row = (const uint8_t *)(source->data + (size_t)(sy + row) * source->stride) + (size_t)sx * bytes_per_value;
+        uint8_t *dst_row = (uint8_t *)(destination->data + (size_t)(dy + row) * destination->stride) + (size_t)dx * bytes_per_value;
+        memmove(dst_row, src_row, row_bytes);
+    }
+    return true;
+}
+
+void common_hal_bitmaptools_blit(displayio_bitmap_t *destination, displayio_bitmap_t *source, int16_t x, int16_t y,
+    int16_t x1, int16_t y1, int16_t x2, int16_t y2, uint32_t skip_source_index, bool skip_source_index_none, uint32_t skip_dest_index,
+    bool skip_dest_index_none) {
+
+    if (destination->read_only) {
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Read-only"));
+    }
+    // Copy region of "source" bitmap into "destination" bitmap at location x,y in the "destination"
+    // If skip_value is encountered in the source bitmap, it will not be copied.
+    // If skip_value is `None`, then all pixels are copied.
+    // This function assumes input checks were performed for pixel index entries.
+
+    // Update the dirty area
+    int16_t dirty_x_max = (x + (x2 - x1));
+    if (dirty_x_max > destination->width) {
+        dirty_x_max = destination->width;
+    }
+    int16_t dirty_y_max = y + (y2 - y1);
+    if (dirty_y_max > destination->height) {
+        dirty_y_max = destination->height;
+    }
+
+    displayio_area_t a = { x, y, dirty_x_max, dirty_y_max, NULL};
+    displayio_bitmap_set_dirty_area(destination, &a);
+
+    bool x_reverse = false;
+    bool y_reverse = false;
+
+    // Add reverse direction option to protect blitting of destination bitmap back into destination bitmap
+    if (x > x1) {
+        x_reverse = true;
+    }
+    if (y > y1) {
+        y_reverse = true;
+    }
+
+    if (skip_source_index_none && skip_dest_index_none &&
+        blit_rows_fast(destination, source, x, y, x1, y1, x2, y2)) {
+        return;
+    }
+
+    // simplest version - use internal functions for get/set pixels
+    for (int16_t i = 0; i < (x2 - x1); i++) {
+
+        const int xs_index = x_reverse ? ((x2) - i - 1) : x1 + i; // x-index into the source bitmap
+        const int xd_index = x_reverse ? ((x + (x2 - x1)) - i - 1) : x + i; // x-index into the destination bitmap
+
+        if ((xd_index >= 0) && (xd_index < destination->width)) {
+            for (int16_t j = 0; j < (y2 - y1); j++) {
+
+                const int ys_index = y_reverse ? ((y2) - j - 1) : y1 + j;  // y-index into the source bitmap
+                const int yd_index = y_reverse ? ((y + (y2 - y1)) - j - 1) : y + j; // y-index into the destination bitmap
+
+                if ((yd_index >= 0) && (yd_index < destination->height)) {
+                    uint32_t value = common_hal_displayio_bitmap_get_pixel(source, xs_index, ys_index);
+                    if (skip_dest_index_none) { // if skip_dest_index is none, then only check source skip
+                        if ((skip_source_index_none) || (value != skip_source_index)) {   // write if skip_value_none is True
+                            displayio_bitmap_write_pixel(destination, xd_index, yd_index, value);
+                        }
+                    } else { // check dest_value index against skip_dest_index and skip if they match
+                        uint32_t dest_value = common_hal_displayio_bitmap_get_pixel(destination, xd_index, yd_index);
+                        if (dest_value != skip_dest_index) {
+                            if ((skip_source_index_none) || (value != skip_source_index)) {   // write if skip_value_none is True
+                                displayio_bitmap_write_pixel(destination, xd_index, yd_index, value);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

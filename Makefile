@@ -40,20 +40,30 @@ ALLSPHINXOPTS   = -d $(BUILDDIR)/doctrees $(BASEOPTS)
 # the i18n builder cannot share the environment and doctrees with the others
 I18NSPHINXOPTS  = $(BASEOPTS)
 
-TRANSLATE_SOURCES = extmod lib main.c ports/atmel-samd ports/cxd56 ports/espressif ports/mimxrt10xx ports/nrf ports/raspberrypi ports/stm py shared-bindings shared-module supervisor
+TRANSLATE_SOURCES = extmod lib main.c ports/atmel-samd ports/analog ports/cxd56 ports/espressif ports/mimxrt10xx ports/nordic ports/raspberrypi ports/stm ports/zephyr-cp py shared-bindings shared-module supervisor
 # Paths to exclude from TRANSLATE_SOURCES
 # Each must be preceded by "-path"; if any wildcards, enclose in quotes.
 # Separate by "-o" (Find's "or" operand)
 TRANSLATE_SOURCES_EXC = -path "ports/*/build-*" \
 	-o -path "ports/*/build" \
+	-o -path ports/analog/msdk \
 	-o -path ports/atmel-samd/asf4 \
 	-o -path ports/cxd56/spresense-exported-sdk \
+	-o -path ports/espressif/esp-camera \
 	-o -path ports/espressif/esp-idf \
+	-o -path ports/espressif/esp-protocols \
 	-o -path ports/mimxrt10xx/sdk \
+	-o -path ports/nordic/bluetooth \
+	-o -path ports/nordic/nrfx \
+	-o -path ports/raspberrypi/lib \
 	-o -path ports/raspberrypi/sdk \
+	-o -path ports/stm/peripherals \
 	-o -path ports/stm/st_driver \
-	-o -path lib/tinyusb \
-	-o -path lib/lwip \
+	-o -path ports/zephyr-cp/bootloader \
+	-o -path ports/zephyr-cp/modules \
+	-o -path ports/zephyr-cp/tools \
+	-o -path ports/zephyr-cp/zephyr \
+	-o -path lib \
 	-o -path extmod/ulab/circuitpython \
 	-o -path extmod/ulab/micropython \
 
@@ -83,13 +93,20 @@ help:
 	@echo "  pseudoxml  to make pseudoxml-XML files for display purposes"
 	@echo "  linkcheck  to check all external links for integrity"
 	@echo "  doctest    to run all doctests embedded in the documentation (if enabled)"
+	@echo "  fetch-all-submodules	to fetch submodules for all ports (several GB)"
+	@echo "  remove-all-submodules	remove all submodules, including files and .git/ data"
+	@echo ""
+	@echo "To build one board you only need its own submodules, which is a much smaller"
+	@echo "download. From a port directory:"
+	@echo "  make fetch-board-submodules BOARD=<board>	submodules for one board"
+	@echo "  make fetch-port-submodules			submodules for every board of that port"
 
 clean:
 	rm -rf $(BUILDDIR)/*
 	rm -rf autoapi
 	rm -rf $(STUBDIR) $(DISTDIR) *.egg-info
 
-html: stubs
+html:
 	$(SPHINXBUILD) -b html $(ALLSPHINXOPTS) $(BUILDDIR)/html
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/html."
@@ -224,8 +241,11 @@ pseudoxml:
 .PHONY: all-source
 all-source:
 
+TRANSLATE_CHECK_SUBMODULES=if ! [ -f extmod/ulab/README.md ]; then $(PYTHON) tools/ci_fetch_deps.py translate; fi
+TRANSLATE_COMMAND=find $(TRANSLATE_SOURCES) -type d \( $(TRANSLATE_SOURCES_EXC) \) -prune -o -type f \( -iname "*.c" -o -iname "*.h" \) -print | (LC_ALL=C sort) | xgettext -x locale/synthetic.pot -f- -L C --sort-by-file --add-location=file --keyword=MP_ERROR_TEXT -o - | sed -e '/"POT-Creation-Date: /d'
 locale/circuitpython.pot: all-source
-	find $(TRANSLATE_SOURCES) -type d \( $(TRANSLATE_SOURCES_EXC) \) -prune -o -type f \( -iname "*.c" -o -iname "*.h" \) -print | (LC_ALL=C sort) | xgettext -f- -L C -s --add-location=file --keyword=translate --keyword=MP_ERROR_TEXT -o - | sed -e '/"POT-Creation-Date: /d' > $@
+	$(TRANSLATE_CHECK_SUBMODULES)
+	$(TRANSLATE_COMMAND) > $@
 
 # Historically, `make translate` updated the .pot file and ran msgmerge.
 # However, this was a frequent source of merge conflicts.  Weblate can perform
@@ -240,7 +260,7 @@ translate: locale/circuitpython.pot
 # needed we preserve a rule to do it.
 .PHONY: msgmerge
 msgmerge:
-	for po in $(shell ls locale/*.po); do msgmerge -U $$po -s --no-fuzzy-matching --add-location=file locale/circuitpython.pot; done
+	for po in $(shell ls locale/*.po); do msgmerge -U $$po --sort-by-file --no-fuzzy-matching --add-location=file locale/circuitpython.pot; done
 
 merge-translate:
 	git merge HEAD 1>&2 2> /dev/null; test $$? -eq 128
@@ -250,33 +270,42 @@ merge-translate:
 
 .PHONY: check-translate
 check-translate:
-	find $(TRANSLATE_SOURCES) -type d \( $(TRANSLATE_SOURCES_EXC) \) -prune -o -type f \( -iname "*.c" -o -iname "*.h" \) -print | (LC_ALL=C sort) | xgettext -f- -L C -s --add-location=file --keyword=translate --keyword=MP_ERROR_TEXT -o circuitpython.pot.tmp -p locale
+	$(TRANSLATE_CHECK_SUBMODULES)
+	$(TRANSLATE_COMMAND) > locale/circuitpython.pot.tmp
 	$(PYTHON) tools/check_translations.py locale/circuitpython.pot.tmp locale/circuitpython.pot; status=$$?; rm -f locale/circuitpython.pot.tmp; exit $$status
 
 .PHONY: stubs
 stubs:
-	@rm -rf circuitpython-stubs
-	@mkdir circuitpython-stubs
-	@$(PYTHON) tools/extract_pyi.py shared-bindings/ $(STUBDIR)
-	@$(PYTHON) tools/extract_pyi.py extmod/ulab/code/ $(STUBDIR)/ulab
-	@$(PYTHON) tools/extract_pyi.py ports/atmel-samd/bindings $(STUBDIR)
-	@$(PYTHON) tools/extract_pyi.py ports/espressif/bindings $(STUBDIR)
-	@$(PYTHON) tools/extract_pyi.py ports/raspberrypi/bindings $(STUBDIR)
-	@cp setup.py-stubs circuitpython-stubs/setup.py
-	@cp README.rst-stubs circuitpython-stubs/README.rst
-	@cp MANIFEST.in-stubs circuitpython-stubs/MANIFEST.in
-	@(cd circuitpython-stubs && $(PYTHON) setup.py -q sdist)
+	rm -rf circuitpython-stubs
+	mkdir circuitpython-stubs
+	$(PYTHON) tools/extract_pyi.py shared-bindings/ $(STUBDIR)
+	$(PYTHON) tools/extract_pyi.py extmod/ulab/code/ $(STUBDIR)/ulab
+	for d in ports/*/bindings; do \
+	    $(PYTHON) tools/extract_pyi.py "$$d" $(STUBDIR); done
+	sed -e "s,__version__,`python -msetuptools_scm`," < setup.py-stubs > circuitpython-stubs/setup.py
+	cp README.rst-stubs circuitpython-stubs/README.rst
+	cp MANIFEST.in-stubs circuitpython-stubs/MANIFEST.in
+	cp -r stubs/* circuitpython-stubs
+	$(PYTHON) tools/board_stubs/build_board_specific_stubs/board_stub_builder.py
+	cp -r tools/board_stubs/circuitpython_setboard circuitpython-stubs/circuitpython_setboard
+	$(PYTHON) -m build circuitpython-stubs
+	touch circuitpython-stubs/board/__init__.py
+	touch circuitpython-stubs/board_definitions/__init__.py
 
 .PHONY: check-stubs
 check-stubs: stubs
 	@(cd $(STUBDIR) && set -- */__init__.pyi && mypy "$${@%/*}")
 	@tools/test-stubs.sh
 
+.PHONY: update-frozen-libraries
 update-frozen-libraries:
 	@echo "Updating all frozen libraries to latest tagged version."
 	cd frozen; for library in *; do cd $$library; ../../tools/git-checkout-latest-tag.sh; cd ..; done
 
-one-of-each: samd21 litex mimxrt10xx nrf stm
+one-of-each: samd21 mimxrt10xx nordic stm
+
+analog:
+	$(MAKE) -C ports/analog/ BOARD=apard32690
 
 samd21:
 	$(MAKE) -C ports/atmel-samd BOARD=trinket_m0
@@ -287,19 +316,16 @@ samd51:
 espressif:
 	$(MAKE) -C ports/espressif BOARD=espressif_saola_1_wroom
 
-litex:
-	$(MAKE) -C ports/litex BOARD=fomu
-
 mimxrt10xx:
 	$(MAKE) -C ports/mimxrt10xx BOARD=feather_mimxrt1011
 
-nrf:
-	$(MAKE) -C ports/nrf BOARD=feather_nrf52840_express
+nordic:
+	$(MAKE) -C ports/nordic BOARD=feather_nrf52840_express
 
 stm:
 	$(MAKE) -C ports/stm BOARD=feather_stm32f405_express
 
-clean-one-of-each: clean-samd21 clean-samd51 clean-espressif clean-litex clean-mimxrt10xx clean-nrf clean-stm
+clean-one-of-each: clean-samd21 clean-samd51 clean-espressif clean-mimxrt10xx clean-nordic clean-stm
 
 clean-samd21:
 	$(MAKE) -C ports/atmel-samd BOARD=trinket_m0 clean
@@ -310,22 +336,44 @@ clean-samd51:
 clean-espressif:
 	$(MAKE) -C ports/espressif BOARD=espressif_saola_1_wroom clean
 
-clean-litex:
-	$(MAKE) -C ports/litex BOARD=fomu clean
-
 clean-mimxrt10xx:
 	$(MAKE) -C ports/mimxrt10xx BOARD=feather_mimxrt1011 clean
 
-clean-nrf:
-	$(MAKE) -C ports/nrf BOARD=feather_nrf52840_express clean
+clean-nordic:
+	$(MAKE) -C ports/nordic BOARD=feather_nrf52840_express clean
 
 clean-stm:
 	$(MAKE) -C ports/stm BOARD=feather_stm32f405_express clean
 
-.PHONY: fetch-submodules
-fetch-submodules:
-	# This update will fail because the commits we need aren't the latest on the
-	# branch. We can ignore that though because we fix it with the second command.
-	# (Only works for git servers that allow sha fetches.)
-	git submodule update --init -N --depth 1 || true
-	git submodule foreach 'git fetch --tags --depth 1 origin $$sha1 && git checkout -q $$sha1'
+extmod/ulab/README.md: fetch-translate-submodules
+
+.PHONY: fetch-translate-submodules
+fetch-translate-submodules:
+	$(PYTHON) tools/ci_fetch_deps.py translate
+
+.PHONY: fetch-all-submodules
+fetch-all-submodules:
+	$(PYTHON) tools/ci_fetch_deps.py all
+
+.PHONY: remove-all-submodules
+remove-all-submodules:
+	git submodule deinit -f --all
+	rm -rf .git/modules/*
+
+.PHONY: fetch-tags
+fetch-tags:
+	git fetch --tags --recurse-submodules=no --shallow-since="2023-02-01" https://github.com/adafruit/circuitpython HEAD
+
+.PHONY: coverage
+coverage:
+	make -j -C ports/unix VARIANT=coverage
+
+.PHONY: coverage-clean
+coverage-fresh:
+	make -C ports/unix VARIANT=coverage clean
+	make -j -C ports/unix VARIANT=coverage
+
+.PHONY: run-tests
+# If TESTS="abc.py def.py" is specified as an arg, run only those tests. Otherwise, run all tests.
+run-tests:
+	cd tests; MICROPY_MICROPYTHON=../ports/unix/build-coverage/micropython ./run-tests.py $(TESTS)

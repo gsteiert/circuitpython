@@ -1,37 +1,22 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 Dan Halbert for Adafruit Industries
- * Copyright (c) 2018 Artur Pacholec
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 Dan Halbert for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2018 Artur Pacholec
+//
+// SPDX-License-Identifier: MIT
 
 #include <string.h>
 
 #include "py/objproperty.h"
+#include "py/objstr.h"
 #include "py/runtime.h"
 #include "shared-bindings/_bleio/__init__.h"
 #include "shared-bindings/_bleio/Address.h"
 #include "shared-bindings/_bleio/Adapter.h"
+
+#if CIRCUITPY_SETTINGS_TOML
+#include "supervisor/shared/settings.h"
+#endif
 
 #define ADV_INTERVAL_MIN (0.02f)
 #define ADV_INTERVAL_MIN_STRING "0.02"
@@ -64,7 +49,9 @@
 //|     connections and also initiate connections."""
 //|
 
-//|     def __init__(self, *, uart: busio.UART, rts: digitalio.DigitalInOut, cts: digitalio.DigitalInOut) -> None:
+//|     def __init__(
+//|         self, *, uart: busio.UART, rts: digitalio.DigitalInOut, cts: digitalio.DigitalInOut
+//|     ) -> None:
 //|         """On boards that do not have native BLE, you can use an HCI co-processor.
 //|         Pass the uart and pins used to communicate with the co-processor, such as an Adafruit AirLift.
 //|         The co-processor must have been reset and put into BLE mode beforehand
@@ -81,7 +68,7 @@
 //|         """
 //|         ...
 //|
-STATIC mp_obj_t bleio_adapter_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
+static mp_obj_t bleio_adapter_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
     #if CIRCUITPY_BLEIO_HCI
     bleio_adapter_obj_t *self = common_hal_bleio_allocate_adapter_or_raise();
 
@@ -105,16 +92,14 @@ STATIC mp_obj_t bleio_adapter_make_new(const mp_obj_type_t *type, size_t n_args,
 
     return MP_OBJ_FROM_PTR(self);
     #else
-    mp_raise_NotImplementedError(translate("Cannot create a new Adapter; use _bleio.adapter;"));
+    mp_raise_NotImplementedError(MP_ERROR_TEXT("Cannot create a new Adapter; use _bleio.adapter;"));
     return mp_const_none;
     #endif // CIRCUITPY_BLEIO_HCI
 }
 
-//|
 //|     enabled: bool
 //|     """State of the BLE adapter."""
-//|
-STATIC mp_obj_t bleio_adapter_get_enabled(mp_obj_t self) {
+static mp_obj_t bleio_adapter_get_enabled(mp_obj_t self) {
     return mp_obj_new_bool(common_hal_bleio_adapter_get_enabled(self));
 }
 MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_get_enabled_obj, bleio_adapter_get_enabled);
@@ -126,67 +111,99 @@ static mp_obj_t bleio_adapter_set_enabled(mp_obj_t self, mp_obj_t value) {
 
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_2(bleio_adapter_set_enabled_obj, bleio_adapter_set_enabled);
+static MP_DEFINE_CONST_FUN_OBJ_2(bleio_adapter_set_enabled_obj, bleio_adapter_set_enabled);
 
-const mp_obj_property_t bleio_adapter_enabled_obj = {
-    .base.type = &mp_type_property,
-    .proxy = { (mp_obj_t)&bleio_adapter_get_enabled_obj,
-               (mp_obj_t)&bleio_adapter_set_enabled_obj,
-               MP_ROM_NONE },
-};
+MP_PROPERTY_GETSET(bleio_adapter_enabled_obj,
+    (mp_obj_t)&bleio_adapter_get_enabled_obj,
+    (mp_obj_t)&bleio_adapter_set_enabled_obj);
 
 //|     address: Address
 //|     """MAC address of the BLE adapter."""
-//|
-STATIC mp_obj_t bleio_adapter_get_address(mp_obj_t self) {
+static mp_obj_t bleio_adapter_get_address(mp_obj_t self) {
     return MP_OBJ_FROM_PTR(common_hal_bleio_adapter_get_address(self));
 
 }
 MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_get_address_obj, bleio_adapter_get_address);
 
-STATIC mp_obj_t bleio_adapter_set_address(mp_obj_t self, mp_obj_t new_address) {
+static mp_obj_t bleio_adapter_set_address(mp_obj_t self, mp_obj_t new_address) {
     if (!common_hal_bleio_adapter_set_address(self, new_address)) {
-        mp_raise_bleio_BluetoothError(translate("Could not set address"));
+        mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Could not set address"));
     }
     return mp_const_none;
 }
 MP_DEFINE_CONST_FUN_OBJ_2(bleio_adapter_set_address_obj, bleio_adapter_set_address);
 
-const mp_obj_property_t bleio_adapter_address_obj = {
-    .base.type = &mp_type_property,
-    .proxy = { (mp_obj_t)&bleio_adapter_get_address_obj,
-               (mp_obj_t)&bleio_adapter_set_address_obj,
-               MP_ROM_NONE },
-};
+MP_PROPERTY_GETSET(bleio_adapter_address_obj,
+    (mp_obj_t)&bleio_adapter_get_address_obj,
+    (mp_obj_t)&bleio_adapter_set_address_obj);
 
 //|     name: str
 //|     """name of the BLE adapter used once connected.
-//|     The name is "CIRCUITPY" + the last four hex digits of ``adapter.address``,
-//|     to make it easy to distinguish multiple CircuitPython boards."""
+//|     The default name is "CIRCUITPY" plus the last four hex digits of
+//|     ``adapter.address``, to make it easy to distinguish multiple
+//|     CircuitPython boards. Set ``CIRCUITPY_BLE_NAME`` in settings.toml to
+//|     override it. The default is re-applied each time the adapter is
+//|     enabled."""
 //|
-STATIC mp_obj_t bleio_adapter_get_name(mp_obj_t self) {
+static mp_obj_t _bleio_adapter_get_name(mp_obj_t self) {
     return MP_OBJ_FROM_PTR(common_hal_bleio_adapter_get_name(self));
 }
-MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_get_name_obj, bleio_adapter_get_name);
+MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_get_name_obj, _bleio_adapter_get_name);
 
 
-STATIC mp_obj_t bleio_adapter_set_name(mp_obj_t self, mp_obj_t new_name) {
+static mp_obj_t bleio_adapter_set_name(mp_obj_t self, mp_obj_t new_name) {
     common_hal_bleio_adapter_set_name(self, mp_obj_str_get_str(new_name));
     return mp_const_none;
 }
 MP_DEFINE_CONST_FUN_OBJ_2(bleio_adapter_set_name_obj, bleio_adapter_set_name);
 
-const mp_obj_property_t bleio_adapter_name_obj = {
-    .base.type = &mp_type_property,
-    .proxy = { (mp_obj_t)&bleio_adapter_get_name_obj,
-               (mp_obj_t)&bleio_adapter_set_name_obj,
-               MP_ROM_NONE },
-};
+MP_PROPERTY_GETSET(bleio_adapter_name_obj,
+    (mp_obj_t)&bleio_adapter_get_name_obj,
+    (mp_obj_t)&bleio_adapter_set_name_obj);
 
-//|     def start_advertising(self, data: ReadableBuffer, *,
-//|                           scan_response: Optional[ReadableBuffer] = None, connectable: bool = True,
-//|                           anonymous: bool = False, timeout: int = 0, interval: float = 0.1,
-//|                           tx_power: int = 0, directed_to: Optional[Address] = None) -> None:
+void bleio_adapter_reset_name(bleio_adapter_obj_t *self) {
+    #if CIRCUITPY_SETTINGS_TOML
+    // Let the user override the default name from settings.toml. Use the
+    // allocation-free settings_get_str (not os.getenv), because ports call
+    // this from common_hal_bleio_adapter_set_enabled() which can run before
+    // the VM/gc heap is initialized.
+    char ble_name[32];
+    settings_err_t result = settings_get_str("CIRCUITPY_BLE_NAME", ble_name, sizeof(ble_name));
+    if (result == SETTINGS_OK) {
+        common_hal_bleio_adapter_set_name(self, ble_name);
+        return;
+    }
+    #endif
+
+    // Default to "CIRCUITPY" plus the last four hex digits of the adapter
+    // address so multiple boards are distinguishable. The address bytes are
+    // little-endian, so address[0] is the least-significant byte. If the port
+    // cannot provide an address, fall back to the literal "CIRCUITPYxxxx".
+    char default_ble_name[] = "CIRCUITPYxxxx";
+    bleio_address_obj_t *address = common_hal_bleio_adapter_get_address(self);
+    if (address != NULL) {
+        uint8_t addr_bytes[NUM_BLEIO_ADDRESS_BYTES];
+        common_hal_bleio_address_get_bytes(address, addr_bytes);
+        default_ble_name[ 9] = nibble_to_hex_lower[addr_bytes[1] >> 4 & 0xf];
+        default_ble_name[10] = nibble_to_hex_lower[addr_bytes[1] & 0xf];
+        default_ble_name[11] = nibble_to_hex_lower[addr_bytes[0] >> 4 & 0xf];
+        default_ble_name[12] = nibble_to_hex_lower[addr_bytes[0] & 0xf];
+    }
+    common_hal_bleio_adapter_set_name(self, default_ble_name);
+}
+
+//|     def start_advertising(
+//|         self,
+//|         data: ReadableBuffer,
+//|         *,
+//|         scan_response: Optional[ReadableBuffer] = None,
+//|         connectable: bool = True,
+//|         anonymous: bool = False,
+//|         timeout: int = 0,
+//|         interval: float = 0.1,
+//|         tx_power: int = 0,
+//|         directed_to: Optional[Address] = None,
+//|     ) -> None:
 //|         """Starts advertising until `stop_advertising` is called or if connectable, another device
 //|         connects to us.
 //|
@@ -196,17 +213,17 @@ const mp_obj_property_t bleio_adapter_name_obj = {
 //|         .. note:: If you set ``anonymous=True``, then a timeout must be specified. If no timeout is
 //|            specified, then the maximum allowed timeout will be selected automatically.
 //|
-//|         :param ~_typing.ReadableBuffer data: advertising data packet bytes
-//|         :param ~_typing.ReadableBuffer scan_response: scan response data packet bytes. ``None`` if no scan response is needed.
+//|         :param ~circuitpython_typing.ReadableBuffer data: advertising data packet bytes
+//|         :param ~circuitpython_typing.ReadableBuffer scan_response: scan response data packet bytes. ``None`` if no scan response is needed.
 //|         :param bool connectable:  If `True` then other devices are allowed to connect to this peripheral.
 //|         :param bool anonymous:  If `True` then this device's MAC address is randomized before advertising.
 //|         :param int timeout:  If set, we will only advertise for this many seconds. Zero means no timeout.
 //|         :param float interval:  advertising interval, in seconds
-//|         :param tx_power int: transmitter power while advertising in dBm
-//|         :param directed_to Address: peer to advertise directly to"""
+//|         :param int tx_power: transmitter power while advertising in dBm
+//|         :param Address directed_to: peer to advertise directly to"""
 //|         ...
 //|
-STATIC mp_obj_t bleio_adapter_start_advertising(mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+static mp_obj_t bleio_adapter_start_advertising(mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     bleio_adapter_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
 
     enum { ARG_data, ARG_scan_response, ARG_connectable, ARG_anonymous, ARG_timeout, ARG_interval, ARG_tx_power, ARG_directed_to };
@@ -237,23 +254,23 @@ STATIC mp_obj_t bleio_adapter_start_advertising(mp_uint_t n_args, const mp_obj_t
         args[ARG_interval].u_obj = mp_obj_new_float(ADV_INTERVAL_DEFAULT);
     }
 
-    const mp_float_t interval = mp_obj_get_float(args[ARG_interval].u_obj);
+    const mp_float_t interval = mp_arg_validate_type_float(args[ARG_interval].u_obj, MP_QSTR_interval);
     if (interval < ADV_INTERVAL_MIN || interval > ADV_INTERVAL_MAX) {
-        mp_raise_ValueError_varg(translate("interval must be in range %s-%s"),
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("interval must be in range %s-%s"),
             ADV_INTERVAL_MIN_STRING, ADV_INTERVAL_MAX_STRING);
     }
 
     bool connectable = args[ARG_connectable].u_bool;
     bool anonymous = args[ARG_anonymous].u_bool;
-    uint32_t timeout = args[ARG_timeout].u_int;
+    const uint32_t timeout = (uint32_t)mp_arg_validate_int_min(args[ARG_timeout].u_int, 0, MP_QSTR_timeout);
     if (data_bufinfo.len > 31 && connectable && scan_response_bufinfo.len > 0) {
-        mp_raise_bleio_BluetoothError(translate("Cannot have scan responses for extended, connectable advertisements."));
+        mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Cannot have scan responses for extended, connectable advertisements."));
     }
 
     const bleio_address_obj_t *address = NULL;
     if (args[ARG_directed_to].u_obj != mp_const_none) {
         if (!connectable) {
-            mp_raise_bleio_BluetoothError(translate("Only connectable advertisements can be directed"));
+            mp_raise_bleio_BluetoothError(MP_ERROR_TEXT("Only connectable advertisements can be directed"));
         }
         address = mp_arg_validate_type(args[ARG_directed_to].u_obj, &bleio_address_type, MP_QSTR_directed_to);
     }
@@ -263,26 +280,37 @@ STATIC mp_obj_t bleio_adapter_start_advertising(mp_uint_t n_args, const mp_obj_t
 
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_KW(bleio_adapter_start_advertising_obj, 1, bleio_adapter_start_advertising);
+static MP_DEFINE_CONST_FUN_OBJ_KW(bleio_adapter_start_advertising_obj, 1, bleio_adapter_start_advertising);
 
 //|     def stop_advertising(self) -> None:
 //|         """Stop sending advertising packets."""
 //|         ...
 //|
-STATIC mp_obj_t bleio_adapter_stop_advertising(mp_obj_t self_in) {
+static mp_obj_t bleio_adapter_stop_advertising(mp_obj_t self_in) {
     bleio_adapter_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     common_hal_bleio_adapter_stop_advertising(self);
 
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_stop_advertising_obj, bleio_adapter_stop_advertising);
+static MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_stop_advertising_obj, bleio_adapter_stop_advertising);
 
-//|     def start_scan(self, prefixes: ReadableBuffer = b"", *, buffer_size: int = 512, extended: bool = False, timeout: Optional[float] = None, interval: float = 0.1, window: float = 0.1, minimum_rssi: int = -80, active: bool = True) -> Iterable[ScanEntry]:
+//|     def start_scan(
+//|         self,
+//|         prefixes: ReadableBuffer = b"",
+//|         *,
+//|         buffer_size: int = 512,
+//|         extended: bool = False,
+//|         timeout: Optional[float] = None,
+//|         interval: float = 0.1,
+//|         window: float = 0.1,
+//|         minimum_rssi: int = -80,
+//|         active: bool = True,
+//|     ) -> Iterable[ScanEntry]:
 //|         """Starts a BLE scan and returns an iterator of results. Advertisements and scan responses are
 //|         filtered and returned separately.
 //|
-//|         :param ~_typing.ReadableBuffer prefixes: Sequence of byte string prefixes to filter advertising packets
+//|         :param ~circuitpython_typing.ReadableBuffer prefixes: Sequence of byte string prefixes to filter advertising packets
 //|             with. A packet without an advertising structure that matches one of the prefixes is
 //|             ignored. Format is one byte for length (n) and n bytes of prefix and can be repeated.
 //|         :param int buffer_size: the maximum number of advertising bytes to buffer.
@@ -298,7 +326,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_stop_advertising_obj, bleio_adapt
 //|         :rtype: iterable"""
 //|         ...
 //|
-STATIC mp_obj_t bleio_adapter_start_scan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+static mp_obj_t bleio_adapter_start_scan(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     enum { ARG_prefixes, ARG_buffer_size, ARG_extended, ARG_timeout, ARG_interval, ARG_window, ARG_minimum_rssi, ARG_active };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_prefixes,  MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_obj = MP_OBJ_NULL} },
@@ -317,7 +345,7 @@ STATIC mp_obj_t bleio_adapter_start_scan(size_t n_args, const mp_obj_t *pos_args
 
     mp_float_t timeout = 0.0f;
     if (args[ARG_timeout].u_obj != mp_const_none) {
-        timeout = mp_obj_get_float(args[ARG_timeout].u_obj);
+        timeout = mp_arg_validate_obj_float_non_negative(args[ARG_timeout].u_obj, 0.0f, MP_QSTR_timeout);
     }
 
     if (args[ARG_interval].u_obj == MP_OBJ_NULL) {
@@ -328,97 +356,86 @@ STATIC mp_obj_t bleio_adapter_start_scan(size_t n_args, const mp_obj_t *pos_args
         args[ARG_window].u_obj = mp_obj_new_float(WINDOW_DEFAULT);
     }
 
-    const mp_float_t interval = mp_obj_get_float(args[ARG_interval].u_obj);
+    const mp_float_t interval = mp_arg_validate_type_float(args[ARG_interval].u_obj, MP_QSTR_interval);
     if (interval < INTERVAL_MIN || interval > INTERVAL_MAX) {
-        mp_raise_ValueError_varg(translate("interval must be in range %s-%s"), INTERVAL_MIN_STRING, INTERVAL_MAX_STRING);
+        mp_raise_ValueError_varg(MP_ERROR_TEXT("interval must be in range %s-%s"), INTERVAL_MIN_STRING, INTERVAL_MAX_STRING);
     }
 
     #pragma GCC diagnostic push
     #pragma GCC diagnostic ignored "-Wfloat-equal"
     if (timeout != 0.0f && timeout < interval) {
-        mp_raise_ValueError(translate("non-zero timeout must be >= interval"));
+        mp_raise_ValueError(MP_ERROR_TEXT("non-zero timeout must be >= interval"));
     }
     #pragma GCC diagnostic pop
 
-    const mp_float_t window = mp_obj_get_float(args[ARG_window].u_obj);
+    const mp_float_t window = mp_arg_validate_type_float(args[ARG_window].u_obj, MP_QSTR_window);
     if (window > interval) {
-        mp_raise_ValueError(translate("window must be <= interval"));
+        mp_raise_ValueError(MP_ERROR_TEXT("window must be <= interval"));
     }
 
     mp_buffer_info_t prefix_bufinfo;
     prefix_bufinfo.len = 0;
     if (args[ARG_prefixes].u_obj != MP_OBJ_NULL) {
         mp_get_buffer_raise(args[ARG_prefixes].u_obj, &prefix_bufinfo, MP_BUFFER_READ);
-        if (gc_nbytes(prefix_bufinfo.buf) == 0) {
-            mp_raise_ValueError(translate("Prefix buffer must be on the heap"));
+        // An empty buffer may not be on the heap, but that doesn't matter.
+        if (prefix_bufinfo.len > 0 && !gc_ptr_on_heap(prefix_bufinfo.buf)) {
+            mp_raise_ValueError(MP_ERROR_TEXT("Prefix buffer must be on the heap"));
         }
     }
 
-    return common_hal_bleio_adapter_start_scan(self, prefix_bufinfo.buf, prefix_bufinfo.len, args[ARG_extended].u_bool, args[ARG_buffer_size].u_int, timeout, interval, window, args[ARG_minimum_rssi].u_int, args[ARG_active].u_bool);
+    const mp_int_t buffer_size = mp_arg_validate_int_min(args[ARG_buffer_size].u_int, 1, MP_QSTR_buffer_size);
+
+    return common_hal_bleio_adapter_start_scan(self, prefix_bufinfo.buf, prefix_bufinfo.len, args[ARG_extended].u_bool, buffer_size, timeout, interval, window, args[ARG_minimum_rssi].u_int, args[ARG_active].u_bool);
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_KW(bleio_adapter_start_scan_obj, 1, bleio_adapter_start_scan);
+static MP_DEFINE_CONST_FUN_OBJ_KW(bleio_adapter_start_scan_obj, 1, bleio_adapter_start_scan);
 
 //|     def stop_scan(self) -> None:
 //|         """Stop the current scan."""
 //|         ...
 //|
-STATIC mp_obj_t bleio_adapter_stop_scan(mp_obj_t self_in) {
+static mp_obj_t bleio_adapter_stop_scan(mp_obj_t self_in) {
     bleio_adapter_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     common_hal_bleio_adapter_stop_scan(self);
 
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_stop_scan_obj, bleio_adapter_stop_scan);
+static MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_stop_scan_obj, bleio_adapter_stop_scan);
 
 //|     advertising: bool
 //|     """True when the adapter is currently advertising. (read-only)"""
-//|
-STATIC mp_obj_t bleio_adapter_get_advertising(mp_obj_t self) {
+static mp_obj_t bleio_adapter_get_advertising(mp_obj_t self) {
     return mp_obj_new_bool(common_hal_bleio_adapter_get_advertising(self));
 
 }
 MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_get_advertising_obj, bleio_adapter_get_advertising);
 
-const mp_obj_property_t bleio_adapter_advertising_obj = {
-    .base.type = &mp_type_property,
-    .proxy = { (mp_obj_t)&bleio_adapter_get_advertising_obj,
-               MP_ROM_NONE,
-               MP_ROM_NONE },
-};
+MP_PROPERTY_GETTER(bleio_adapter_advertising_obj,
+    (mp_obj_t)&bleio_adapter_get_advertising_obj);
 
 //|     connected: bool
 //|     """True when the adapter is connected to another device regardless of who initiated the
 //|     connection. (read-only)"""
-//|
-STATIC mp_obj_t bleio_adapter_get_connected(mp_obj_t self) {
+static mp_obj_t bleio_adapter_get_connected(mp_obj_t self) {
     return mp_obj_new_bool(common_hal_bleio_adapter_get_connected(self));
 
 }
 MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_get_connected_obj, bleio_adapter_get_connected);
 
-const mp_obj_property_t bleio_adapter_connected_obj = {
-    .base.type = &mp_type_property,
-    .proxy = { (mp_obj_t)&bleio_adapter_get_connected_obj,
-               MP_ROM_NONE,
-               MP_ROM_NONE },
-};
+MP_PROPERTY_GETTER(bleio_adapter_connected_obj,
+    (mp_obj_t)&bleio_adapter_get_connected_obj);
 
 //|     connections: Tuple[Connection]
 //|     """Tuple of active connections including those initiated through
 //|     :py:meth:`_bleio.Adapter.connect`. (read-only)"""
 //|
-STATIC mp_obj_t bleio_adapter_get_connections(mp_obj_t self) {
+static mp_obj_t bleio_adapter_get_connections(mp_obj_t self) {
     return common_hal_bleio_adapter_get_connections(self);
 }
 MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_get_connections_obj, bleio_adapter_get_connections);
 
-const mp_obj_property_t bleio_adapter_connections_obj = {
-    .base.type = &mp_type_property,
-    .proxy = { (mp_obj_t)&bleio_adapter_get_connections_obj,
-               MP_ROM_NONE,
-               MP_ROM_NONE },
-};
+MP_PROPERTY_GETTER(bleio_adapter_connections_obj,
+    (mp_obj_t)&bleio_adapter_get_connections_obj);
 
 //|     def connect(self, address: Address, *, timeout: float) -> Connection:
 //|         """Attempts a connection to the device with the given address.
@@ -427,7 +444,7 @@ const mp_obj_property_t bleio_adapter_connections_obj = {
 //|         :param float/int timeout: Try to connect for timeout seconds."""
 //|         ...
 //|
-STATIC mp_obj_t bleio_adapter_connect(mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+static mp_obj_t bleio_adapter_connect(mp_uint_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     bleio_adapter_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
 
     enum { ARG_address, ARG_timeout };
@@ -440,26 +457,28 @@ STATIC mp_obj_t bleio_adapter_connect(mp_uint_t n_args, const mp_obj_t *pos_args
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     bleio_address_obj_t *address = mp_arg_validate_type(args[ARG_address].u_obj, &bleio_address_type, MP_QSTR_address);
-    mp_float_t timeout = mp_obj_get_float(args[ARG_timeout].u_obj);
+    const mp_float_t timeout =
+        mp_arg_validate_obj_float_non_negative(args[ARG_timeout].u_obj, 0.0f, MP_QSTR_timeout);
 
     return common_hal_bleio_adapter_connect(self, address, timeout);
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_KW(bleio_adapter_connect_obj, 1, bleio_adapter_connect);
+static MP_DEFINE_CONST_FUN_OBJ_KW(bleio_adapter_connect_obj, 1, bleio_adapter_connect);
 
 //|     def erase_bonding(self) -> None:
 //|         """Erase all bonding information stored in flash memory."""
 //|         ...
 //|
-STATIC mp_obj_t bleio_adapter_erase_bonding(mp_obj_t self_in) {
+//|
+static mp_obj_t bleio_adapter_erase_bonding(mp_obj_t self_in) {
     bleio_adapter_obj_t *self = MP_OBJ_TO_PTR(self_in);
 
     common_hal_bleio_adapter_erase_bonding(self);
 
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_erase_bonding_obj, bleio_adapter_erase_bonding);
+static MP_DEFINE_CONST_FUN_OBJ_1(bleio_adapter_erase_bonding_obj, bleio_adapter_erase_bonding);
 
-STATIC const mp_rom_map_elem_t bleio_adapter_locals_dict_table[] = {
+static const mp_rom_map_elem_t bleio_adapter_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_enabled), MP_ROM_PTR(&bleio_adapter_enabled_obj) },
     { MP_ROM_QSTR(MP_QSTR_address), MP_ROM_PTR(&bleio_adapter_address_obj) },
     { MP_ROM_QSTR(MP_QSTR_name),    MP_ROM_PTR(&bleio_adapter_name_obj) },
@@ -479,11 +498,12 @@ STATIC const mp_rom_map_elem_t bleio_adapter_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_erase_bonding), MP_ROM_PTR(&bleio_adapter_erase_bonding_obj) },
 };
 
-STATIC MP_DEFINE_CONST_DICT(bleio_adapter_locals_dict, bleio_adapter_locals_dict_table);
+static MP_DEFINE_CONST_DICT(bleio_adapter_locals_dict, bleio_adapter_locals_dict_table);
 
-const mp_obj_type_t bleio_adapter_type = {
-    .base = { &mp_type_type },
-    .name = MP_QSTR_Adapter,
-    .make_new = bleio_adapter_make_new,
-    .locals_dict = (mp_obj_t)&bleio_adapter_locals_dict,
-};
+MP_DEFINE_CONST_OBJ_TYPE(
+    bleio_adapter_type,
+    MP_QSTR_Adapter,
+    MP_TYPE_FLAG_HAS_SPECIAL_ACCESSORS,
+    make_new, bleio_adapter_make_new,
+    locals_dict, &bleio_adapter_locals_dict
+    );

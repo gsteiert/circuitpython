@@ -1,39 +1,20 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2019 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2019 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "supervisor/shared/display.h"
 
 #include <string.h>
+#include "supervisor/port.h"
 
 #include "py/mpstate.h"
+#include "py/gc.h"
 #include "shared-bindings/displayio/Bitmap.h"
 #include "shared-bindings/displayio/Group.h"
 #include "shared-bindings/displayio/Palette.h"
 #include "shared-bindings/displayio/TileGrid.h"
-#include "supervisor/memory.h"
 
 #if CIRCUITPY_RGBMATRIX
 #include "shared-module/displayio/__init__.h"
@@ -45,247 +26,359 @@
 #include "shared-module/sharpdisplay/SharpMemoryFramebuffer.h"
 #endif
 
+#if CIRCUITPY_AURORA_EPAPER
+#include "shared-module/displayio/__init__.h"
+#include "shared-bindings/aurora_epaper/aurora_framebuffer.h"
+#include "shared-module/aurora_epaper/aurora_framebuffer.h"
+#endif
+
+#if CIRCUITPY_STATUS_BAR
+#include "supervisor/shared/status_bar.h"
+#endif
+
+#if CIRCUITPY_TERMINALIO
+#include "supervisor/port.h"
+
+#if CIRCUITPY_SETTINGS_TOML
+#include "supervisor/shared/settings.h"
+#endif
+
+#if CIRCUITPY_LVFONTIO
+#include "shared-bindings/lvfontio/OnDiskFont.h"
+#include "supervisor/filesystem.h"
+
+#include "supervisor/shared/serial.h"
+
+// Check if a custom font file exists and return its path if found
+// Returns true if font file exists, false otherwise
+static bool check_for_custom_font(const char **font_path_out) {
+    if (!filesystem_present()) {
+        return false;
+    }
+
+    // Check for the font through the supervisor filesystem
+    // API so it works on FAT and littlefs mounts.
+    supervisor_vfs_t *vfs = filesystem_circuitpy();
+    if (vfs == NULL) {
+        return false;
+    }
+
+    const char *default_font_path = "/fonts/terminal.lvfontbin";
+    const char *font_path = default_font_path;
+
+    #if CIRCUITPY_SETTINGS_TOML
+    // Buffer for storing custom font path
+    static char custom_font_path[128];
+    if (settings_get_str("CIRCUITPY_TERMINAL_FONT", custom_font_path, sizeof(custom_font_path)) == SETTINGS_OK) {
+        // Use custom font path from environment variable
+        font_path = custom_font_path;
+    }
+    #endif
+
+    if (supervisor_vfs_stat(vfs, font_path, NULL, NULL, NULL) == SUPERVISOR_FS_OK) {
+        if (font_path_out != NULL) {
+            *font_path_out = font_path;
+        }
+        return true;
+    }
+
+    // If custom font path doesn't exist, use default font
+    font_path = default_font_path;
+
+    if (supervisor_vfs_stat(vfs, font_path, NULL, NULL, NULL) == SUPERVISOR_FS_OK) {
+        if (font_path_out != NULL) {
+            *font_path_out = font_path;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// Initialize a BuiltinFont object with the specified font file and max_slots
+// Returns true on success, false on failure
+static bool init_lvfont(lvfontio_ondiskfont_t *font, const char *font_path, uint16_t max_slots) {
+    if (font == NULL) {
+        return false;
+    }
+
+    font->base.type = &lvfontio_ondiskfont_type;
+
+    // Pass false for use_gc_allocator during startup when garbage collector isn't fully initialized
+    common_hal_lvfontio_ondiskfont_construct(font, font_path, max_slots, false);
+
+    return !common_hal_lvfontio_ondiskfont_deinited(font);
+}
+#endif
+#endif
+
+#if CIRCUITPY_REPL_LOGO
 extern uint32_t blinka_bitmap_data[];
 extern displayio_bitmap_t blinka_bitmap;
+#endif
 extern displayio_group_t circuitpython_splash;
 
 #if CIRCUITPY_TERMINALIO
-static supervisor_allocation *tilegrid_tiles = NULL;
+static uint8_t *tilegrid_tiles = NULL;
+static size_t tilegrid_tiles_size = 0;
+#endif
+
+#if CIRCUITPY_LVFONTIO && CIRCUITPY_TERMINALIO
+static lvfontio_ondiskfont_t *lvfont = NULL;
+static bool skip_lv_font = false;
 #endif
 
 void supervisor_start_terminal(uint16_t width_px, uint16_t height_px) {
-    // Default the scale to 2 because we may show blinka without the terminal for
-    // languages that don't have font support.
-    uint8_t scale = 2;
+    if (supervisor_terminal_started()) {
+        return;
+    }
 
     #if CIRCUITPY_TERMINALIO
-    displayio_tilegrid_t *grid = &supervisor_terminal_text_grid;
-    bool tall = height_px > width_px;
-    uint16_t terminal_width_px = tall ? width_px : width_px - blinka_bitmap.width;
-    uint16_t terminal_height_px = tall ? height_px - blinka_bitmap.height : height_px;
-    uint16_t width_in_tiles = terminal_width_px / grid->tile_width;
-    // determine scale based on h
-    if (width_in_tiles < 80) {
+    // Default the scale to 2 because we may show blinka without the terminal for
+    // languages that don't have font support.
+    mp_int_t scale = 2;
+
+    displayio_tilegrid_t *scroll_area = &supervisor_terminal_scroll_area_text_grid;
+    displayio_tilegrid_t *status_bar = &supervisor_terminal_status_bar_text_grid;
+    bool reset_tiles = tilegrid_tiles == NULL;
+
+    uint16_t glyph_width = 0;
+    uint16_t glyph_height = 0;
+
+    #if CIRCUITPY_LVFONTIO
+    // Check if we have a custom terminal font in the filesystem
+    bool use_lv_font = false;
+    const char *font_path = NULL;
+    const uint16_t display_width_px = width_px;
+    const uint16_t display_height_px = height_px;
+
+    if (!skip_lv_font && check_for_custom_font(&font_path)) {
+        // Initialize a temporary font just to get dimensions
+        lvfontio_ondiskfont_t temp_font;
+        if (init_lvfont(&temp_font, font_path, 1)) {
+            // The terminal fills itself with spaces. With one slot, caching fails if the space is
+            // missing or wider than a cell.
+            if (common_hal_lvfontio_ondiskfont_cache_glyph(&temp_font, ' ', NULL) >= 0) {
+                // Get the font dimensions
+                common_hal_lvfontio_ondiskfont_get_dimensions(&temp_font, &glyph_width, &glyph_height);
+                use_lv_font = true;
+                reset_tiles = true;
+                // TODO: We may want to detect when the files modified time hasn't changed.
+            }
+
+            // Clean up the temp font - we'll create a proper one later
+            common_hal_lvfontio_ondiskfont_deinit(&temp_font);
+        }
+    }
+    #endif
+    #if CIRCUITPY_FONTIO
+    if (glyph_width == 0) {
+        glyph_width = supervisor_terminal_font.width;
+        glyph_height = supervisor_terminal_font.height;
+    }
+    #endif
+
+    uint16_t width_in_tiles = width_px / glyph_width;
+
+    // determine scale based on width
+    if (width_in_tiles <= 120) {
         scale = 1;
     }
+    #if CIRCUITPY_SETTINGS_TOML
+    (void)settings_get_int("CIRCUITPY_TERMINAL_SCALE", &scale);
+    #endif
 
-    width_in_tiles = terminal_width_px / (grid->tile_width * scale);
-    if (width_in_tiles < 1) {
-        width_in_tiles = 1;
-    }
-    uint16_t height_in_tiles = terminal_height_px / (grid->tile_height * scale);
-    uint16_t remaining_pixels = tall ? 0 : terminal_height_px % (grid->tile_height * scale);
-    if (height_in_tiles < 1 || remaining_pixels > 0) {
-        height_in_tiles += 1;
-    }
+    width_in_tiles = MAX(1, width_px / (glyph_width * scale));
+    uint16_t height_in_tiles = MAX(2, height_px / (glyph_height * scale));
 
     uint16_t total_tiles = width_in_tiles * height_in_tiles;
 
-    // Reuse the previous allocation if possible
-    if (tilegrid_tiles) {
-        if (get_allocation_length(tilegrid_tiles) != align32_size(total_tiles)) {
-            free_memory(tilegrid_tiles);
-            tilegrid_tiles = NULL;
-        }
+    // check if the terminal tile dimensions are the same
+    if ((scroll_area->width_in_tiles != width_in_tiles) ||
+        (scroll_area->height_in_tiles != height_in_tiles - 1)) {
+        reset_tiles = true;
     }
-    if (!tilegrid_tiles) {
-        tilegrid_tiles = allocate_memory(align32_size(total_tiles), false, true);
-        if (!tilegrid_tiles) {
+
+    circuitpython_splash.scale = scale;
+    if (!reset_tiles) {
+        return;
+    }
+
+    // Adjust the display dimensions to account for scale of the outer group.
+    width_px /= scale;
+    height_px /= scale;
+
+    // Number of tiles from the left edge to inset the status bar.
+    size_t min_left_padding = 0;
+    status_bar->tile_width = glyph_width;
+    status_bar->tile_height = glyph_height;
+    #if CIRCUITPY_REPL_LOGO
+    // Blinka + 1 px padding minimum
+    min_left_padding = supervisor_blinka_sprite.pixel_width + 1;
+    // Align the status bar to the bottom of the logo.
+    status_bar->y = supervisor_blinka_sprite.pixel_height - status_bar->tile_height;
+    #else
+    status_bar->y = 0;
+    #endif
+    status_bar->width_in_tiles = (width_px - min_left_padding) / status_bar->tile_width;
+    status_bar->height_in_tiles = 1;
+    status_bar->pixel_width = status_bar->width_in_tiles * status_bar->tile_width;
+    status_bar->pixel_height = status_bar->tile_height;
+    // Right align the status bar.
+    status_bar->x = width_px - status_bar->pixel_width;
+    status_bar->top_left_y = 0;
+    status_bar->full_change = true;
+
+    scroll_area->tile_width = glyph_width;
+    scroll_area->tile_height = glyph_height;
+    scroll_area->width_in_tiles = width_in_tiles;
+    // Leave space for the status bar, no matter if we have logo or not.
+    scroll_area->height_in_tiles = height_in_tiles - 1;
+    scroll_area->pixel_width = scroll_area->width_in_tiles * scroll_area->tile_width;
+    scroll_area->pixel_height = scroll_area->height_in_tiles * scroll_area->tile_height;
+    // Right align the scroll area to give margin to the start of each line.
+    scroll_area->x = width_px - scroll_area->pixel_width;
+    scroll_area->top_left_y = 0;
+    // Align the scroll area to the bottom so that the newest line isn't cutoff. The top line
+    // may be clipped by the status bar and that's ok.
+    scroll_area->y = height_px - scroll_area->pixel_height;
+    scroll_area->full_change = true;
+
+    mp_obj_t new_bitmap = mp_const_none;
+    mp_obj_t new_font = mp_const_none;
+
+    #if CIRCUITPY_LVFONTIO
+    if (lvfont != NULL) {
+        common_hal_lvfontio_ondiskfont_deinit(lvfont);
+        // This will also free internal buffers that may change size.
+        port_free(lvfont);
+        lvfont = NULL;
+    }
+
+    if (use_lv_font) {
+        // We found a custom terminal font file, use it instead of the built-in font
+
+        lvfont = port_malloc(sizeof(lvfontio_ondiskfont_t), false);
+        if (lvfont != NULL) {
+            // Use the number of tiles in the terminal and status bar for the number of slots
+            // This ensures we have enough slots to display all characters that could appear on screen
+            uint16_t num_slots = width_in_tiles * height_in_tiles;
+
+            // Initialize the font with our helper function
+            if (init_lvfont(lvfont, font_path, num_slots)) {
+                // Get the bitmap from the font
+                new_bitmap = common_hal_lvfontio_ondiskfont_get_bitmap(lvfont);
+                new_font = MP_OBJ_FROM_PTR(lvfont);
+            } else {
+                // If font initialization failed, free the memory and fall back to built-in font
+                port_free(lvfont);
+                lvfont = NULL;
+            }
+        }
+        if (lvfont == NULL) {
+            // The layout above used the custom font's dimensions, so redo it for the built-in font.
+            skip_lv_font = true;
+            supervisor_start_terminal(display_width_px, display_height_px);
+            skip_lv_font = false;
             return;
         }
     }
-    uint8_t *tiles = (uint8_t *)tilegrid_tiles->ptr;
-
-    grid->y = tall ? blinka_bitmap.height : 0;
-    grid->x = tall ? 0 : blinka_bitmap.width;
-    grid->top_left_y = 0;
-    if (remaining_pixels > 0) {
-        grid->y -= (grid->tile_height - remaining_pixels);
+    #endif
+    #if CIRCUITPY_FONTIO
+    if (new_font == mp_const_none) {
+        new_bitmap = MP_OBJ_FROM_PTR(supervisor_terminal_font.bitmap);
+        new_font = MP_OBJ_FROM_PTR(&supervisor_terminal_font);
     }
-    grid->width_in_tiles = width_in_tiles;
-    grid->height_in_tiles = height_in_tiles;
-    assert(width_in_tiles > 0);
-    assert(height_in_tiles > 0);
-    grid->pixel_width = width_in_tiles * grid->tile_width;
-    grid->pixel_height = height_in_tiles * grid->tile_height;
-    grid->tiles = tiles;
-    grid->full_change = true;
-
-    common_hal_terminalio_terminal_construct(&supervisor_terminal, grid, &supervisor_terminal_font);
     #endif
 
-    circuitpython_splash.scale = scale;
+    if (new_font != mp_const_none) {
+        size_t total_values = common_hal_displayio_bitmap_get_width(new_bitmap) / glyph_width;
+        if (tilegrid_tiles) {
+            port_free(tilegrid_tiles);
+            tilegrid_tiles = NULL;
+        }
+        size_t bytes_per_tile = 1;
+        if (total_tiles > 255) {
+            // Two bytes per tile.
+            bytes_per_tile = 2;
+        }
+        tilegrid_tiles = port_malloc(total_tiles * bytes_per_tile, false);
+        if (!tilegrid_tiles) {
+            return;
+        }
+        status_bar->tiles = tilegrid_tiles;
+        status_bar->tiles_in_bitmap = total_values;
+        status_bar->bitmap_width_in_tiles = total_values;
+        scroll_area->tiles = tilegrid_tiles + width_in_tiles * bytes_per_tile;
+        scroll_area->tiles_in_bitmap = total_values;
+        scroll_area->bitmap_width_in_tiles = total_values;
+
+        common_hal_displayio_tilegrid_set_bitmap(scroll_area, new_bitmap);
+        common_hal_displayio_tilegrid_set_bitmap(status_bar, new_bitmap);
+        common_hal_terminalio_terminal_construct(&supervisor_terminal, scroll_area,
+            new_font, status_bar);
+    }
+    #endif
 }
 
 void supervisor_stop_terminal(void) {
     #if CIRCUITPY_TERMINALIO
     if (tilegrid_tiles != NULL) {
-        free_memory(tilegrid_tiles);
+        port_free(tilegrid_tiles);
         tilegrid_tiles = NULL;
-        supervisor_terminal_text_grid.tiles = NULL;
-        supervisor_terminal.tilegrid = NULL;
+        tilegrid_tiles_size = 0;
+        supervisor_terminal_scroll_area_text_grid.tiles = NULL;
+        supervisor_terminal_status_bar_text_grid.tiles = NULL;
+        supervisor_terminal.scroll_area = NULL;
+        supervisor_terminal.status_bar = NULL;
     }
     #endif
 }
 
-void supervisor_display_move_memory(void) {
+bool supervisor_terminal_started(void) {
     #if CIRCUITPY_TERMINALIO
-    if (tilegrid_tiles != NULL) {
-        supervisor_terminal_text_grid.tiles = (uint8_t *)tilegrid_tiles->ptr;
-    } else {
-        supervisor_terminal_text_grid.tiles = NULL;
-    }
-    #endif
-
-    #if CIRCUITPY_DISPLAYIO
-    for (uint8_t i = 0; i < CIRCUITPY_DISPLAY_LIMIT; i++) {
-        #if CIRCUITPY_RGBMATRIX
-        if (displays[i].rgbmatrix.base.type == &rgbmatrix_RGBMatrix_type) {
-            rgbmatrix_rgbmatrix_obj_t *pm = &displays[i].rgbmatrix;
-            common_hal_rgbmatrix_rgbmatrix_reconstruct(pm, NULL);
-        }
-        #endif
-        #if CIRCUITPY_SHARPDISPLAY
-        if (displays[i].bus_base.type == &sharpdisplay_framebuffer_type) {
-            sharpdisplay_framebuffer_obj_t *sharp = &displays[i].sharpdisplay;
-            common_hal_sharpdisplay_framebuffer_reconstruct(sharp);
-        }
-        #endif
-    }
+    return tilegrid_tiles != NULL;
+    #else
+    return false;
     #endif
 }
-
-uint32_t blinka_bitmap_data[32] = {
-    0x00000011, 0x11000000,
-    0x00000111, 0x53100000,
-    0x00000111, 0x56110000,
-    0x00000111, 0x11140000,
-    0x00000111, 0x20002000,
-    0x00000011, 0x13000000,
-    0x00000001, 0x11200000,
-    0x00000000, 0x11330000,
-    0x00000000, 0x01122000,
-    0x00001111, 0x44133000,
-    0x00032323, 0x24112200,
-    0x00111114, 0x44113300,
-    0x00323232, 0x34112200,
-    0x11111144, 0x44443300,
-    0x11111111, 0x11144401,
-    0x23232323, 0x21111110
-};
-
-displayio_bitmap_t blinka_bitmap = {
-    .base = {.type = &displayio_bitmap_type },
-    .width = 16,
-    .height = 16,
-    .data = blinka_bitmap_data,
-    .stride = 2,
-    .bits_per_value = 4,
-    .x_shift = 3,
-    .x_mask = 0x7,
-    .bitmask = 0xf,
-    .read_only = true
-};
-
-_displayio_color_t blinka_colors[7] = {
-    {
-        .rgb888 = 0x000000,
-        .rgb565 = 0x0000,
-        .luma = 0x00,
-        .chroma = 0,
-        .transparent = true
-    },
-    {
-        .rgb888 = 0x8428bc,
-        .rgb565 = 0x8978,
-        .luma = 0xff, // We cheat the luma here. It is actually 0x60
-        .hue = 184,
-        .chroma = 148
-    },
-    {
-        .rgb888 = 0xff89bc,
-        .rgb565 = 0xFCB8,
-        .luma = 0xb5,
-        .hue = 222,
-        .chroma = 118
-    },
-    {
-        .rgb888 = 0x7beffe,
-        .rgb565 = 0x869F,
-        .luma = 0xe0,
-        .hue = 124,
-        .chroma = 131
-    },
-    {
-        .rgb888 = 0x51395f,
-        .rgb565 = 0x5A0D,
-        .luma = 0x47,
-        .hue = 185,
-        .chroma = 38
-    },
-    {
-        .rgb888 = 0xffffff,
-        .rgb565 = 0xffff,
-        .luma = 0xff,
-        .chroma = 0
-    },
-    {
-        .rgb888 = 0x0736a0,
-        .rgb565 = 0x01f5,
-        .luma = 0x44,
-        .hue = 147,
-        .chroma = 153
-    },
-};
-
-displayio_palette_t blinka_palette = {
-    .base = {.type = &displayio_palette_type },
-    .colors = blinka_colors,
-    .color_count = 7,
-    .needs_refresh = false
-};
-
-displayio_tilegrid_t blinka_sprite = {
-    .base = {.type = &displayio_tilegrid_type },
-    .bitmap = &blinka_bitmap,
-    .pixel_shader = &blinka_palette,
-    .x = 0,
-    .y = 0,
-    .pixel_width = 16,
-    .pixel_height = 16,
-    .bitmap_width_in_tiles = 1,
-    .width_in_tiles = 1,
-    .height_in_tiles = 1,
-    .tile_width = 16,
-    .tile_height = 16,
-    .top_left_x = 16,
-    .top_left_y = 16,
-    .tiles = 0,
-    .partial_change = false,
-    .full_change = false,
-    .hidden = false,
-    .hidden_by_parent = false,
-    .moved = false,
-    .inline_tiles = true,
-    .in_group = true
-};
 
 #if CIRCUITPY_TERMINALIO
-mp_obj_t members[] = { &blinka_sprite, &supervisor_terminal_text_grid, };
+#if CIRCUITPY_REPL_LOGO
+mp_obj_t members[] = { &supervisor_terminal_scroll_area_text_grid, &supervisor_blinka_sprite, &supervisor_terminal_status_bar_text_grid, };
+mp_obj_list_t splash_children = {
+    .base = {.type = &mp_type_list },
+    .alloc = 3,
+    .len = 3,
+    .items = members,
+};
+#else
+mp_obj_t members[] = { &supervisor_terminal_scroll_area_text_grid, &supervisor_terminal_status_bar_text_grid, };
 mp_obj_list_t splash_children = {
     .base = {.type = &mp_type_list },
     .alloc = 2,
     .len = 2,
     .items = members,
 };
+#endif
 #else
-mp_obj_t members[] = { &blinka_sprite };
+#if CIRCUITPY_REPL_LOGO
+mp_obj_t members[] = { &supervisor_blinka_sprite };
 mp_obj_list_t splash_children = {
     .base = {.type = &mp_type_list },
     .alloc = 1,
     .len = 1,
     .items = members,
 };
+#else
+mp_obj_t members[] = {};
+mp_obj_list_t splash_children = {
+    .base = {.type = &mp_type_list },
+    .alloc = 0,
+    .len = 0,
+    .items = members,
+};
+#endif
 #endif
 
 displayio_group_t circuitpython_splash = {
@@ -297,5 +390,6 @@ displayio_group_t circuitpython_splash = {
     .item_removed = false,
     .in_group = false,
     .hidden = false,
-    .hidden_by_parent = false
+    .hidden_by_parent = false,
+    .readonly = true,
 };

@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2014-2017 Damien P. George
+ * Copyright (c) 2014-2017 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,7 +26,7 @@
 
 #include "py/mpstate.h"
 
-#if defined(MICROPY_NLR_XTENSA) && MICROPY_NLR_XTENSA
+#if MICROPY_NLR_XTENSA
 
 #undef nlr_push
 
@@ -55,7 +55,7 @@ unsigned int nlr_push(nlr_buf_t *nlr) {
     return 0; // needed to silence compiler warning
 }
 
-NORETURN void nlr_jump(void *val) {
+MP_NORETURN void nlr_jump(void *val) {
     MP_NLR_JUMP_HEAD(val, top)
 
     __asm volatile (
@@ -74,7 +74,7 @@ NORETURN void nlr_jump(void *val) {
         "ret.n                      \n" // return
         :                           // output operands
         : "r" (top)                 // input operands
-        :                           // clobbered registers
+        : "memory"                  // clobbered registers
         );
 
     MP_UNREACHABLE

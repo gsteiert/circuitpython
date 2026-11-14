@@ -1,112 +1,293 @@
-import pathlib
-import shlex
-import subprocess
+import os
 import sys
 import time
+import shlex
+import pathlib
+import re
+import subprocess
 
-# target will be a board, "test", "docs", "mpy-cross-mac", or "windows"
+TOP = pathlib.Path(__file__).parent.parent
 
-target = sys.argv[1]
-ref = sys.argv[2]
 
-print(target, ref)
+def _git_version():
+    version_str = subprocess.check_output(["git", "--version"], encoding="ascii", errors="replace")
+    version_str = re.search(r"([0-9]\.*)*[0-9]", version_str).group(0)
+    return tuple(int(part) for part in version_str.split("."))
+
+
+clone_supports_filter = (
+    False if "NO_USE_CLONE_FILTER" in os.environ else _git_version() >= (2, 36, 0)
+)
+
+if clone_supports_filter:
+    filter_maybe = "--filter=blob:none"
+else:
+    filter_maybe = ""
+
+
+def _all_submodules():
+    submodule_str = subprocess.check_output(
+        ["git", "submodule", "status"], encoding="ascii", errors="replace", cwd=TOP
+    )
+    return [row.split()[1] for row in submodule_str.strip().split("\n")]
+
+
+all_submodules = _all_submodules()
+
 
 # Submodules needed by port builds outside of their ports directory.
 # Should we try and detect these?
-port_deps = {
+PORT_DEPS = {
+    "analog": [
+        "extmod/ulab/",
+        "lib/tlsf/",
+        "lib/tinyusb/",
+        "lib/protomatter",
+    ],
     "atmel-samd": [
         "extmod/ulab/",
+        "lib/adafruit_floppy/",
         "lib/mp3/",
         "lib/protomatter/",
         "lib/quirc/",
         "lib/tinyusb/",
+        "lib/tlsf",
         "data/nvm.toml/",
     ],
-    "broadcom": ["lib/tinyusb/"],
-    "cxd56": ["extmod/ulab/", "lib/tinyusb/"],
-    "espressif": ["extmod/ulab/", "lib/tinyusb/", "lib/protomatter/", "lib/quirc/"],
-    "litex": ["extmod/ulab/", "lib/tinyusb/"],
-    "mimxrt10xx": ["extmod/ulab/", "lib/tinyusb/", "data/nvm.toml/"],
-    "nrf": ["extmod/ulab/", "lib/mp3/", "lib/protomatter/", "lib/tinyusb/", "data/nvm.toml/"],
+    "cxd56": ["extmod/ulab/", "lib/tlsf", "lib/tinyusb/"],
+    "espressif": [
+        "extmod/ulab/",
+        "lib/certificates/",
+        "lib/mp3/",
+        "lib/protomatter/",
+        "lib/quirc/",
+        "lib/tlsf",
+        "lib/tinyusb/",
+    ],
+    "mimxrt10xx": ["extmod/ulab/", "lib/mp3/", "lib/tinyusb/", "lib/tlsf", "data/nvm.toml/"],
+    "nordic": [
+        "extmod/ulab/",
+        "lib/mbedtls/",
+        "lib/mp3/",
+        "lib/protomatter/",
+        "lib/tinyusb/",
+        "lib/tlsf",
+        "data/nvm.toml/",
+    ],
     "raspberrypi": [
+        "extmod/ulab/",
+        "lib/adafruit_floppy/",
+        "lib/mbedtls/",
+        "lib/mp3/",
+        "lib/certificates/",
+        "lib/protomatter/",
+        "lib/quirc/",
+        "lib/tinyusb/",
+        "lib/tlsf",
+        "data/nvm.toml/",
+    ],
+    "silabs": ["extmod/ulab/", "data/nvm.toml/", "lib/tlsf"],
+    "stm": [
         "extmod/ulab/",
         "lib/mp3/",
         "lib/protomatter/",
-        "lib/quirc/",
         "lib/tinyusb/",
+        "lib/tlsf",
         "data/nvm.toml/",
     ],
-    "stm": ["extmod/ulab/", "lib/mp3/", "lib/protomatter/", "lib/tinyusb/", "data/nvm.toml/"]
+    "zephyr-cp": [
+        "extmod/ulab/",
+        "lib/certificates/",
+        "lib/mp3/",
+        "lib/tinyusb/",
+        "lib/tlsf",
+    ],
     # omit unix which is part of the "test" target below
 }
 
 
-def run(title, command):
+def run(title, command, cwd):
     print("::group::" + title, flush=True)
-    print(command, flush=True)
+    print(f"{command} (in {cwd})", flush=True)
     start = time.monotonic()
-    subprocess.run(shlex.split(command), stderr=subprocess.STDOUT)
-    print("Duration:", time.monotonic() - start, flush=True)
-    print("::endgroup::", flush=True)
+    try:
+        subprocess.run(shlex.split(command), stderr=subprocess.STDOUT, check=True, cwd=cwd)
+    finally:
+        print("::endgroup::", flush=True)
+        print("Duration:", time.monotonic() - start, flush=True)
 
 
-run(
-    "Fetch back to the start of 2021 to get tag history",
-    'git fetch --tags --recurse-submodules=no --shallow-since="2021-07-01" https://github.com/adafruit/circuitpython HEAD',
-)
-run(
-    "Fetch back to the start of 2021 to get commit history",
-    f'git fetch --recurse-submodules=no --shallow-since="2021-07-01" origin {ref}',
-)
-run("Init submodules", "git submodule init")
-run("Submodule status", "git submodule status")
+def matching_submodules(where):
+    for m in all_submodules:
+        if m in where:
+            yield m
+        for w in where:
+            if m.startswith(f"{w}/"):
+                yield m
+                break
 
-submodules = []
 
-if target == "test":
-    submodules = ["extmod/", "lib/", "tools/"]
-elif target == "docs":
-    submodules = ["extmod/ulab/"]
-elif target == "mpy-cross-mac":
-    submodules = ["tools/"]  # for huffman
-elif target == "windows":
-    # This builds one board from a number of ports so fill out a bunch of submodules
-    submodules = ["extmod/", "lib/", "tools/", "ports/", "data/nvm.toml/"]
-elif target == "website":
-    # No submodules needed.
-    pass
-else:
-    p = list(pathlib.Path(".").glob(f"ports/*/boards/{target}/mpconfigboard.mk"))
-    if not p:
-        raise RuntimeError(f"Unsupported target: {target}")
+def fetch(where):
+    if clone_supports_filter:
+        run(
+            "Init submodules (using filter)",
+            f"git submodule update --init {filter_maybe} {' '.join(where)}",
+            cwd=TOP,
+        )
+    else:
+        run(
+            "Init submodules (using depth)",
+            f"git submodule update --init --depth 1 {' '.join(where)}",
+            cwd=TOP,
+        )
+        for s in matching_submodules([w for w in where if w.startswith("frozen")]):
+            run(f"Ensure tags exist in {s}", "git fetch --tags --depth 1", cwd=TOP / s)
 
-    config = p[0]
-    # Add the ports folder to init submodules
-    port_folder = config.parents[2]
-    port = port_folder.name
-    submodules.append(str(port_folder))
-    submodules.append("tools/")  # for huffman
-    submodules.extend(port_deps[port])
-    with config.open() as f:
-        for line in f.readlines():
-            prefix = "FROZEN_MPY_DIRS += $(TOP)/"
-            if line.startswith(prefix):
-                lib_folder = line.strip()[len(prefix) :]
-                # Drop everything after the second folder because the frozen
-                # folder may be inside the submodule.
-                if lib_folder.count("/") > 1:
-                    lib_folder = lib_folder.split("/", maxsplit=2)
-                    lib_folder = "/".join(lib_folder[:2])
-                submodules.append(lib_folder)
+    # mbedtls 4.x keeps its crypto in a nested tf-psa-crypto submodule, and the PSA
+    # driver-wrapper generator needs the framework submodule. Init them by name rather
+    # than with --recursive, which would also pull tf-psa-crypto's own framework copy
+    # and drivers/pqcp/mldsa-native. Those are not needed to build.
+    # Keyed off the checkout rather than off `where`, because the targets that pull
+    # lib/mbedtls name it several different ways ("lib/mbedtls/", "lib/", or "." for
+    # the `all` target).
+    mbedtls = TOP / "lib" / "mbedtls"
+    if (mbedtls / ".gitmodules").exists():
+        depth_maybe = "" if clone_supports_filter else "--depth 1"
+        run(
+            "Init mbedtls nested submodules",
+            f"git submodule update --init {filter_maybe} {depth_maybe} tf-psa-crypto framework",
+            cwd=mbedtls,
+        )
 
-print(submodules)
-if submodules:
-    submodules = " ".join(submodules)
-    # This line will fail because the submodule's need different commits than the tip of the branch. We
-    # fix it later.
-    run("Init the submodules we'll need", f"git submodule update --init -N --depth 1 {submodules}")
+    # ESP-Hosted keeps the protobuf-c runtime in a nested submodule.
+    esp_hosted = TOP / "ports" / "espressif" / "esp-hosted"
+    if (esp_hosted / ".gitmodules").exists():
+        depth_maybe = "" if clone_supports_filter else "--depth 1"
+        run(
+            "Init esp-hosted nested submodules",
+            f"git submodule update --init {filter_maybe} {depth_maybe} common/protobuf-c",
+            cwd=esp_hosted,
+        )
 
-    run(
-        "Fetch the submodule sha",
-        "git submodule foreach 'git fetch --tags --depth 1 origin $sha1 && git checkout -q $sha1'",
-    )
+
+def set_output(name, value):
+    if "GITHUB_OUTPUT" in os.environ:
+        with open(os.environ["GITHUB_OUTPUT"], "at") as f:
+            print(f"{name}={value}", file=f)
+    else:
+        print(f"{name}: {value!r}")
+
+
+SUBMODULES_BY_TARGET = {}
+
+
+def main(target):
+    submodules = []
+
+    print("Target:", target)
+
+    if target == "all":
+        submodules = [".", "frozen"]  # explicitly list frozen to get tags
+    elif target == "scheduler":
+        submodules = ["extmod/ulab", "lib/", "tools/"]
+    elif target == "translate":
+        submodules = ["extmod/ulab"]
+    elif target == "tests":
+        submodules = [
+            "extmod/ulab",
+            "lib/",
+            "tools/",
+            "frozen/Adafruit_CircuitPython_asyncio",
+            "frozen/Adafruit_CircuitPython_Ticks",
+        ]
+    elif target == "docs":
+        # used in .readthedocs.yml to generate RTD
+        submodules = ["extmod/ulab", "frozen"]
+    elif target == "mpy-cross" or target == "mpy-cross-mac":
+        submodules = ["tools/"]  # for huffman
+    elif target == "windows":
+        # This builds one board from a number of ports so fill out a bunch of submodules
+        for port in ("atmel-samd", "nordic", "raspberrypi", "stm"):
+            submodules.append(f"ports/{port}")
+            submodules.extend(PORT_DEPS[port])
+        unique_submodules = set(submodules)
+        submodules = list(unique_submodules)
+    elif target == "windows-zephyr":
+        submodules.append("ports/zephyr-cp")
+        submodules.extend(PORT_DEPS["zephyr-cp"])
+    elif target == "website":
+        submodules = ["tools/adabot", "frozen"]
+    elif target == "pre-commit":
+        submodules = ["extmod/ulab"]
+    elif target in PORT_DEPS:
+        submodules = ["data", "extmod", "lib", "tools", "frozen", f"ports/{target}"] + PORT_DEPS[
+            target
+        ]
+    else:
+        p = list(TOP.glob(f"ports/*/boards/{target}/mpconfigboard.mk"))
+        # Check to see if the board is nested under vendor.
+        if not p:
+            next_underscore = target.find("_")
+            while next_underscore != -1:
+                vendor = target[:next_underscore]
+                board = target[next_underscore + 1 :]
+                p = list(TOP.glob(f"ports/*/boards/{vendor}/{board}/circuitpython.toml"))
+                if p:
+                    break
+                next_underscore = target.find("_", next_underscore + 1)
+
+        if not p:
+            raise RuntimeError(f"Unsupported target: {target}")
+
+        config = p[0]
+        # Add the ports folder to init submodules
+
+        if config.suffix == ".mk":
+            port_folder = config.parents[2]
+        else:
+            port_folder = config.parents[3]
+        port = port_folder.name
+        submodules.append(f"ports/{port}")
+        submodules.append("tools/")  # for huffman
+        submodules.extend(PORT_DEPS[port])
+        if config.suffix == ".mk":
+            with config.open() as f:
+                for line in f.readlines():
+                    prefix = "FROZEN_MPY_DIRS += $(TOP)/"
+                    if line.startswith(prefix):
+                        lib_folder = line.strip()[len(prefix) :]
+                        # Drop everything after the second folder because the frozen
+                        # folder may be inside the submodule.
+                        if lib_folder.count("/") > 1:
+                            lib_folder = lib_folder.split("/", maxsplit=2)
+                            lib_folder = "/".join(lib_folder[:2])
+                        submodules.append(lib_folder)
+                        # The frozen manifest build needs micropython-lib.
+                        if "lib/micropython-lib" not in submodules:
+                            submodules.append("lib/micropython-lib")
+        else:
+            # TODO: Add a way to specify frozen modules in circuitpython.toml
+            pass
+
+    print("Submodules:", " ".join(submodules))
+
+    if submodules:
+        fetch(submodules)
+
+    for submodule in submodules:
+        if submodule.startswith("frozen"):
+            set_output("frozen_tags", True)
+            break
+    else:
+        set_output("frozen_tags", False)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        raise SystemExit("Usage: ci_fetch_deps dep...")
+
+    run("Sync submodule URLs", "git submodule sync --quiet", cwd=TOP)
+
+    # Target will be a board, "test", "docs", "mpy-cross-mac", or "windows"
+    for target in sys.argv[1:]:
+        main(target)

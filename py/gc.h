@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,24 +26,29 @@
 #ifndef MICROPY_INCLUDED_PY_GC_H
 #define MICROPY_INCLUDED_PY_GC_H
 
-#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include "py/mpprint.h"
 
+// CIRCUITPY-CHANGE
 #include "py/mpconfig.h"
 #include "py/mpstate.h"
 #include "py/misc.h"
 
-#define WORDS_PER_BLOCK ((MICROPY_BYTES_PER_GC_BLOCK) / MP_BYTES_PER_OBJ_WORD)
-#define BYTES_PER_BLOCK (MICROPY_BYTES_PER_GC_BLOCK)
-
-// ptr should be of type void*
-#define VERIFY_PTR(ptr) ( \
-    ((uintptr_t)(ptr) & (BYTES_PER_BLOCK - 1)) == 0          /* must be aligned on a block */ \
-    && ptr >= (void *)MP_STATE_MEM(gc_pool_start)        /* must be above start of pool */ \
-    && ptr < (void *)MP_STATE_MEM(gc_pool_end)           /* must be below end of pool */ \
-    )
-
 void gc_init(void *start, void *end);
+// CIRCUITPY-CHANGE
 void gc_deinit(void);
+
+#if MICROPY_GC_SPLIT_HEAP
+// Used to add additional memory areas to the heap.
+void gc_add(void *start, void *end);
+
+#if MICROPY_GC_SPLIT_HEAP_AUTO
+// Port must implement this function to return the maximum available block of
+// RAM to allocate a new heap area into using MP_PLAT_ALLOC_HEAP.
+size_t gc_get_max_new_split(void);
+#endif // MICROPY_GC_SPLIT_HEAP_AUTO
+#endif // MICROPY_GC_SPLIT_HEAP
 
 // These lock/unlock functions can be nested.
 // They can be used to prevent the GC from allocating/freeing.
@@ -54,30 +59,40 @@ bool gc_is_locked(void);
 // A given port must implement gc_collect by using the other collect functions.
 void gc_collect(void);
 void gc_collect_start(void);
+// CIRCUITPY-CHANGE
 void gc_collect_ptr(void *ptr);
 void gc_collect_root(void **ptrs, size_t len);
 void gc_collect_end(void);
 
+// CIRCUITPY-CHANGE
 // Is the gc heap available?
 bool gc_alloc_possible(void);
 
 // Use this function to sweep the whole heap and run all finalisers
 void gc_sweep_all(void);
 
+// These functions are used to manage weakrefs.
+void gc_weakref_mark(void *ptr);
+void gc_weakref_about_to_be_freed(void *ptr);
+void gc_weakref_sweep(void);
+
 enum {
     GC_ALLOC_FLAG_HAS_FINALISER = 1,
+    // CIRCUITPY-CHANGE
+    #if MICROPY_ENABLE_SELECTIVE_COLLECT
+    GC_ALLOC_FLAG_DO_NOT_COLLECT = 2,
+    #endif
 };
 
-void *gc_alloc(size_t n_bytes, unsigned int alloc_flags, bool long_lived);
+void *gc_alloc(size_t n_bytes, unsigned int alloc_flags);
 void gc_free(void *ptr); // does not call finaliser
 size_t gc_nbytes(const void *ptr);
-bool gc_has_finaliser(const void *ptr);
-void *gc_make_long_lived(void *old_ptr);
 void *gc_realloc(void *ptr, size_t n_bytes, bool allow_move);
 
-// Prevents a pointer from ever being freed because it establishes a permanent reference to it. Use
-// very sparingly because it can leak memory.
-bool gc_never_free(void *ptr);
+// CIRCUITPY-CHANGE
+// True if the pointer is on the MP heap. Doesn't require that it is the start
+// of a block.
+bool gc_ptr_on_heap(const void *ptr);
 
 typedef struct _gc_info_t {
     size_t total;
@@ -87,10 +102,14 @@ typedef struct _gc_info_t {
     size_t num_1block;
     size_t num_2block;
     size_t max_block;
+    #if MICROPY_GC_SPLIT_HEAP_AUTO
+    size_t max_new_split;
+    #endif
 } gc_info_t;
 
 void gc_info(gc_info_t *info);
-void gc_dump_info(void);
-void gc_dump_alloc_table(void);
+void gc_info_fast(gc_info_t *info);
+void gc_dump_info(const mp_print_t *print);
+void gc_dump_alloc_table(const mp_print_t *print);
 
 #endif // MICROPY_INCLUDED_PY_GC_H

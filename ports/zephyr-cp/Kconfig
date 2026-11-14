@@ -1,0 +1,13 @@
+# CircuitPython Zephyr port — application Kconfig
+#
+# Sources Zephyr's main Kconfig. CircuitPython-specific symbol defaults live
+# in internal-modules/circuitpython-kconfig/Kconfig, a Kconfig-only Zephyr module:
+# Zephyr merges a
+# module's Kconfig right after the SoC/board defconfigs and BEFORE its kernel/,
+# drivers/, lib/ and subsys/ Kconfigs, so the defaults there take precedence
+# over any default Zephyr's subsystem Kconfigs define. This file is merged
+# after all of Zephyr, where a Zephyr-side default would silently shadow the
+# port's value (first `default` wins). Boards can override any of the defaults
+# in their boards/<vendor>/<board>/board.conf file.
+
+osource "$(ZEPHYR_BASE)/Kconfig.zephyr"

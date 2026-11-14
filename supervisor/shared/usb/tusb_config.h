@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: Copyright (c) 2013, hathach (tinyusb.org)
+//
+// SPDX-License-Identifier: BSD-3-Clause
+
 /**************************************************************************/
 /*!
     @file     tusb_config.h
@@ -38,6 +42,8 @@
 #ifndef _TUSB_CONFIG_H_
 #define _TUSB_CONFIG_H_
 
+#include "py/mpconfig.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -45,8 +51,18 @@ extern "C" {
 // --------------------------------------------------------------------+
 // COMMON CONFIGURATION
 // --------------------------------------------------------------------+
-#ifndef CFG_TUSB_DEBUG
-#define CFG_TUSB_DEBUG              0
+
+// When debugging TinyUSB, only output to the console UART link.
+#if CIRCUITPY_DEBUG_TINYUSB > 0 && defined(CIRCUITPY_CONSOLE_UART)
+#define CFG_TUSB_DEBUG              CIRCUITPY_DEBUG_TINYUSB
+#ifdef __ZEPHYR__
+#define CFG_TUSB_DEBUG_PRINTF       zephyr_printk
+#else
+#define CFG_TUSB_DEBUG_PRINTF       console_uart_printf
+#endif
+
+// Raise the device log level to 3 so we can debug host-only at level 2.
+#define CFG_TUD_LOG_LEVEL           3
 #endif
 
 /*------------- RTOS -------------*/
@@ -59,10 +75,25 @@ extern "C" {
 // DEVICE CONFIGURATION
 // --------------------------------------------------------------------+
 
-#if USB_HIGHSPEED
-#define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_DEVICE | OPT_MODE_HIGH_SPEED)
+#define CFG_TUD_ENABLED CIRCUITPY_USB_DEVICE
+
+#if CIRCUITPY_USB_DEVICE
+
+#if CIRCUITPY_USB_DEVICE_HIGH_SPEED == 1
+#define _DEVICE_SPEED OPT_MODE_HIGH_SPEED
 #else
-#define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_DEVICE)
+#define _DEVICE_SPEED 0
+#endif
+
+#if CIRCUITPY_USB_DEVICE_INSTANCE == 0
+#define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_DEVICE | _DEVICE_SPEED)
+#elif CIRCUITPY_USB_DEVICE_INSTANCE == 1
+#define CFG_TUSB_RHPORT1_MODE       (OPT_MODE_DEVICE | _DEVICE_SPEED)
+#endif
+
+// Use DMA with the USB peripheral.
+#if defined(CONFIG_IDF_TARGET_ESP32P4) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32S3)
+#define CFG_TUD_DWC2_DMA_ENABLE (1)
 #endif
 
 // Vendor name included in Inquiry response, max 8 bytes
@@ -83,7 +114,32 @@ extern "C" {
 #define CFG_TUD_HID                 CIRCUITPY_USB_HID
 #define CFG_TUD_MIDI                CIRCUITPY_USB_MIDI
 #define CFG_TUD_VENDOR              CIRCUITPY_USB_VENDOR
+#define CFG_TUD_AUDIO               CIRCUITPY_USB_AUDIO
 #define CFG_TUD_CUSTOM_CLASS        0
+
+// ------------- AUDIO CLASS (UAC2 microphone) -------------//
+#if CIRCUITPY_USB_AUDIO
+#include "shared-module/usb_audio/usb_audio_descriptors.h"
+
+// EP0 buffer for class-specific control requests (sample-freq range, volume range, ...).
+#define CFG_TUD_AUDIO_CTRL_BUF_SZ                   64
+
+#define CFG_TUD_AUDIO_ENABLE_EP_IN                  1
+// wMaxPacketSize, sized for the highest supported sample rate.
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX           TUD_AUDIO_EP_SIZE(TUD_OPT_HIGH_SPEED, USB_AUDIO_MAX_SAMPLE_RATE, USB_AUDIO_N_BYTES_PER_SAMPLE, USB_AUDIO_N_CHANNELS)
+// Deep software FIFO so the 1 ms refill keeps clear of the underrun floor.
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ        (16 * CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX)
+
+// OUT endpoint (host -> board speaker). Compiled into the class driver
+// unconditionally; whether it actually enumerates is decided by the emitted
+// descriptor (still mic-only until the speaker descriptor lands). Mirrors the
+// IN sizing above.
+#define CFG_TUD_AUDIO_ENABLE_EP_OUT                 1
+// wMaxPacketSize, sized for the highest supported sample rate.
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX          TUD_AUDIO_EP_SIZE(TUD_OPT_HIGH_SPEED, USB_AUDIO_MAX_SAMPLE_RATE, USB_AUDIO_N_BYTES_PER_SAMPLE, USB_AUDIO_N_CHANNELS)
+// Deep software FIFO so the 1 ms drain keeps clear of the overrun ceiling.
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (16 * CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX)
+#endif
 
 /*------------------------------------------------------------------*/
 /* CLASS DRIVER
@@ -91,14 +147,90 @@ extern "C" {
 
 // Product revision string included in Inquiry response, max 4 bytes
 #define CFG_TUD_MSC_PRODUCT_REV     "1.0"
-
+#endif
 
 // --------------------------------------------------------------------+
 // USB RAM PLACEMENT
 // --------------------------------------------------------------------+
-#define CFG_TUSB_ATTR_USBRAM
-#define CFG_TUSB_MEM_ALIGN          __attribute__ ((aligned(4)))
+#if !defined(CIRCUITPY_TUSB_ATTR_USBRAM)
+#define CIRCUITPY_TUSB_ATTR_USBRAM        ".bss.usbram"
+#endif
 
+#define CFG_TUSB_ATTR_USBRAM        __attribute__((section(CIRCUITPY_TUSB_ATTR_USBRAM)))
+
+
+#if !defined(CIRCUITPY_TUSB_MEM_ALIGN)
+#define CIRCUITPY_TUSB_MEM_ALIGN 4
+#endif
+
+#define CFG_TUSB_MEM_ALIGN          __attribute__ ((aligned(CIRCUITPY_TUSB_MEM_ALIGN)))
+
+// --------------------------------------------------------------------
+// HOST CONFIGURATION
+// --------------------------------------------------------------------
+
+#if CIRCUITPY_USB_HOST || CIRCUITPY_MAX3421E
+#define CFG_TUH_ENABLED 1
+
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+#define CFG_TUH_DWC2_DMA_ENABLE (1)
+#endif
+
+// Always use PIO to do host on RP2.
+#if !CIRCUITPY_MAX3421E
+#define CFG_TUH_RPI_PIO_USB 1
+#else
+#define CFG_TUH_RPI_PIO_USB 1
+#endif
+
+#if CIRCUITPY_USB_DEVICE_HIGH_SPEED == 1 || (defined(CONFIG_IDF_TARGET_ESP32P4) && CIRCUITPY_USB_HOST_INSTANCE == 1) || defined(CONFIG_IDF_TARGET_ESP32S31)
+#define _HOST_SPEED OPT_MODE_HIGH_SPEED
+#else
+#define _HOST_SPEED 0
+#endif
+
+#if CIRCUITPY_USB_HOST_INSTANCE == 0
+#define CFG_TUSB_RHPORT0_MODE       (OPT_MODE_HOST | _HOST_SPEED)
+#elif CIRCUITPY_USB_HOST_INSTANCE == 1
+#define CFG_TUSB_RHPORT1_MODE       (OPT_MODE_HOST | _HOST_SPEED)
+#endif
+
+// Size of buffer to hold descriptors and other data used for enumeration
+// CircuitPython itself is 284 bytes of configuration descriptor when both CDC endpoints are
+// enabled, plus 4 bytes for alignment.
+#ifndef CFG_TUH_ENUMERATION_BUFSIZE
+#define CFG_TUH_ENUMERATION_BUFSIZE (284 + 4)
+#endif
+
+#if CIRCUITPY_USB_KEYBOARD_WORKFLOW
+// One keyboard, one mouse and two other HID like gamepad.
+#define CFG_TUH_HID                 4
+#else
+#define CFG_TUH_HID                 0
+#endif
+
+// 2 hubs so we can support "7 port" hubs which have two internal hubs.
+#define CFG_TUH_HUB                 2
+#define CFG_TUH_CDC                 0
+#define CFG_TUH_MSC                 0
+#define CFG_TUH_API_EDPT_XFER       1
+
+// max device support (excluding hub device)
+#define CFG_TUH_DEVICE_MAX          (CFG_TUH_HUB ? 4 : 1) // hub typically has 4 ports
+
+// Number of endpoints per device
+#define CFG_TUH_ENDPOINT_MAX        8
+
+// Enable MAX3421E support
+#define CFG_TUH_MAX3421 (CIRCUITPY_MAX3421E)
+
+#endif
+
+// Hack to work with older nrfx than what TinyUSB is designed for.
+#define nrf52_errata_187 errata_187
+#define nrf52_errata_171 errata_171
+#define nrf52_errata_166 errata_166
+#define nrf52_errata_199 errata_199
 
 #ifdef __cplusplus
 }

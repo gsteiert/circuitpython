@@ -1,4 +1,10 @@
-import micropython
+try:
+    import micropython
+
+    micropython.heap_lock
+except (ImportError, AttributeError):
+    print("SKIP")
+    raise SystemExit
 
 # Does the full test from heapalloc_exc_compressed.py but while the heap is
 # locked (this can only work when the emergency exception buf is enabled).
@@ -8,8 +14,6 @@ try:
     micropython.alloc_emergency_exception_buf(256)
 except AttributeError:
     pass
-
-a = set()
 
 
 def test():
@@ -21,8 +25,8 @@ def test():
         print(type(e).__name__, e)
 
     try:
-        a.pop()
-    except KeyError as e:
+        raise 0
+    except TypeError as e:
         print(type(e).__name__, e)
 
     try:
@@ -31,8 +35,8 @@ def test():
         print(e.args[0])
 
     try:
-        a.pop()
-    except KeyError as e:
+        raise 0
+    except TypeError as e:
         print(e.args[0])
 
     micropython.heap_unlock()

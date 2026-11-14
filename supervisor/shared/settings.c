@@ -1,0 +1,627 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2022 Scott Shawcroft for Adafruit Industries
+// SPDX-FileCopyrightText: Copyright (c) 2026 Dan Halbert for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
+
+#include <math.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+
+#include "py/gc.h"
+#include "py/misc.h"
+#include "py/mpstate.h"
+#include "py/mpprint.h"
+#include "py/objstr.h"
+#include "py/parsenum.h"
+#include "py/runtime.h"
+#include "supervisor/filesystem.h"
+#include "supervisor/shared/settings.h"
+
+#define SETTINGS_PATH "/settings.toml"
+
+#include "extmod/vfs.h"
+#include "extmod/vfs_fat.h"
+
+#if CIRCUITPY_SETTINGS_TOML
+#if defined(UNIX)
+typedef FIL file_arg;
+static bool open_file(const char *name, file_arg *file_handle) {
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t file_obj = mp_call_function_2(
+            MP_OBJ_FROM_PTR(&mp_builtin_open_obj), mp_obj_new_str(name, strlen(name)), MP_ROM_QSTR(MP_QSTR_rb));
+        mp_arg_validate_type(file_obj, &mp_type_vfs_fat_fileio, MP_QSTR_file);
+        pyb_file_obj_t *file = MP_OBJ_TO_PTR(file_obj);
+        *file_handle = file->fp;
+        nlr_pop();
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static void close_file(file_arg *file_handle) {
+    f_close(file_handle);
+}
+
+static bool is_eof(file_arg *file_handle) {
+    return f_eof(file_handle) || f_error(file_handle);
+}
+
+// Return 0 if there is no next character (EOF).
+static uint8_t get_next_byte(FIL *file_handle) {
+    uint8_t character = 0;
+    UINT quantity_read;
+    // If there's an error or quantity_read is 0, character will remain 0.
+    f_read(file_handle, &character, 1, &quantity_read);
+    return character;
+}
+
+static void seek_eof(file_arg *file_handle) {
+    f_lseek(file_handle, f_size(file_handle));
+}
+#else
+// Outside of the unix port, settings.toml is read through the supervisor
+// filesystem API so it works on both FAT and littlefs mounts.
+typedef supervisor_vfs_file_t file_arg;
+
+static bool open_file(const char *name, file_arg *file_handle) {
+    supervisor_vfs_t *fs_mount = filesystem_circuitpy();
+    if (fs_mount == NULL) {
+        return false;
+    }
+    return supervisor_vfs_open_file(fs_mount, name, SUPERVISOR_FS_OPEN_READ, 0, file_handle) == SUPERVISOR_FS_OK;
+}
+
+static void close_file(file_arg *file_handle) {
+    supervisor_vfs_close_file(file_handle);
+}
+
+// Reads mark the end of the file by closing the handle.
+static bool is_eof(file_arg *file_handle) {
+    return !file_handle->open;
+}
+
+// Return 0 if there is no next character (EOF).
+static uint8_t get_next_byte(file_arg *file_handle) {
+    uint8_t character = 0;
+    size_t quantity_read;
+    // If there's an error or quantity_read is 0, character will remain 0.
+    supervisor_fs_err_t err = supervisor_vfs_read_file(file_handle, &character, 1, &quantity_read);
+    // If we hit the end of the file (or an error), close the handle so that
+    // is_eof() reports the file is done.
+    if (err != SUPERVISOR_FS_OK || quantity_read == 0) {
+        close_file(file_handle);
+    }
+    return character;
+}
+
+static void seek_eof(file_arg *file_handle) {
+    supervisor_vfs_seek_file(file_handle, supervisor_vfs_file_size(file_handle));
+}
+#endif
+
+// For a fixed buffer, record the required size rather than throwing
+static void vstr_add_byte_nonstd(vstr_t *vstr, byte b) {
+    if (!vstr->fixed_buf || vstr->alloc > vstr->len) {
+        vstr_add_byte(vstr, b);
+    } else {
+        vstr->len++;
+    }
+}
+
+// For a fixed buffer, record the required size rather than throwing
+static void vstr_add_char_nonstd(vstr_t *vstr, unichar c) {
+    size_t ulen =
+        (c < 0x80) ? 1 :
+        (c < 0x800) ? 2 :
+        (c < 0x10000) ? 3 : 4;
+    if (!vstr->fixed_buf || vstr->alloc > vstr->len + ulen) {
+        vstr_add_char(vstr, c);
+    } else {
+        vstr->len += ulen;
+    }
+}
+
+static void next_line(file_arg *file_handle) {
+    uint8_t character;
+    do {
+        character = get_next_byte(file_handle);
+    } while (character != 0 && character != '\n');
+}
+
+// Discard whitespace, except for newlines, returning the next character after the whitespace.
+// Return 0 if there is no next character (EOF).
+static uint8_t consume_whitespace(file_arg *file_handle) {
+    uint8_t character;
+    do {
+        character = get_next_byte(file_handle);
+    } while (character != '\n' && character != 0 && unichar_isspace(character));
+    return character;
+}
+
+// Starting at the start of a new line, determines if the key matches the given key.
+//
+// If result is true, the key matches and file pointer is pointing just after the "=".
+// If the result is false, the key does NOT match and the file pointer is
+// pointing at the start of the next line, if any
+static bool key_matches(file_arg *file_handle, const char *key) {
+    uint8_t character;
+    character = consume_whitespace(file_handle);
+    // [section] isn't implemented, so skip to end of file.
+    if (character == '[' || character == 0) {
+        seek_eof(file_handle);
+        return false;
+    }
+    while (*key) {
+        if (character != *key++) {
+            // A character didn't match the key, so it's not a match
+            // If the non-matching char was not the end of the line,
+            // then consume the rest of the line
+            if (character != '\n') {
+                next_line(file_handle);
+            }
+            return false;
+        }
+        character = get_next_byte(file_handle);
+    }
+    // the next character could be whitespace; consume if necessary
+    if (unichar_isspace(character)) {
+        character = consume_whitespace(file_handle);
+    }
+    // If we're not looking at the "=" then the key didn't match
+    if (character != '=') {
+        // A character didn't match the key, so it's not a match
+        // If the non-matching char was not the end of the line,
+        // then consume the rest of the line
+        if (character != '\n') {
+            next_line(file_handle);
+        }
+        return false;
+    }
+    return true;
+}
+
+// Parse digits in base 2 to 16, skipping any '_' after the first digit.
+// Used instead of strtol() and strtoul(), which would pull in about 0.8 kB of libc.
+//
+// Returns a pointer past the last digit, or NULL if there are no digits or the value
+// overflows mp_uint_t. *value is not touched on error.
+static const char *parse_digits(const char *str, mp_uint_t base, mp_uint_t *value) {
+    const char *start = str;
+    mp_uint_t val = 0;
+    for (;; str++) {
+        mp_uint_t dig = (unsigned char)*str;
+        if (dig == '_' && str != start) {
+            continue;
+        }
+        if ('0' <= dig && dig <= '9') {
+            dig -= '0';
+        } else if ((dig | 0x20) >= 'a') {
+            // Lowercase; anything past 'z' ends up >= base.
+            dig = (dig | 0x20) - 'a' + 10;
+        } else {
+            break;
+        }
+        if (dig >= base) {
+            break;
+        }
+        if (__builtin_mul_overflow(val, base, &val) || __builtin_add_overflow(val, dig, &val)) {
+            return NULL;
+        }
+    }
+    if (str == start) {
+        return NULL;
+    }
+    *value = val;
+    return str;
+}
+
+static settings_err_t read_unicode_escape(file_arg *file_handle, int sz, vstr_t *vstr) {
+    mp_uint_t c = 0;
+    for (int i = 0; i < sz; i++) {
+        uint8_t hex = get_next_byte(file_handle);
+        if (!unichar_isxdigit(hex)) {
+            return SETTINGS_ERR_BAD_VALUE;
+        }
+        c = c * 16 + unichar_xdigit_value(hex);
+    }
+    if (c >= 0x110000) {
+        return SETTINGS_ERR_UNICODE;
+    }
+    vstr_add_char_nonstd(vstr, c);
+    return SETTINGS_OK;
+}
+
+// Read a quoted string
+static settings_err_t read_string_value(file_arg *file_handle, vstr_t *vstr) {
+    while (true) {
+        int character = get_next_byte(file_handle);
+        switch (character) {
+            case 0:
+            case '\n':
+                return SETTINGS_ERR_BAD_VALUE;
+
+            case '"':
+                character = consume_whitespace(file_handle);
+                switch (character) {
+                    case '#':
+                        next_line(file_handle);
+                        MP_FALLTHROUGH;
+                    case 0:
+                    case '\n':
+                        return SETTINGS_OK;
+                    default:
+                        return SETTINGS_ERR_BAD_VALUE;
+                }
+
+            case '\\':
+                character = get_next_byte(file_handle);
+                switch (character) {
+                    case 0:
+                    case '\n':
+                        return SETTINGS_ERR_BAD_VALUE;
+                    case 'b':
+                        character = '\b';
+                        break;
+                    case 'r':
+                        character = '\r';
+                        break;
+                    case 'n':
+                        character = '\n';
+                        break;
+                    case 't':
+                        character = '\t';
+                        break;
+                    case 'v':
+                        character = '\v';
+                        break;
+                    case 'f':
+                        character = '\f';
+                        break;
+                    case 'U':
+                    case 'u': {
+                        int sz = (character == 'u') ? 4 : 8;
+                        settings_err_t res;
+                        res = read_unicode_escape(file_handle, sz, vstr);
+                        if (res != SETTINGS_OK) {
+                            return res;
+                        }
+                        continue;
+                    }
+                        // default falls through, other escaped characters
+                        // represent themselves
+                }
+                MP_FALLTHROUGH;
+            default:
+                vstr_add_byte_nonstd(vstr, character);
+        }
+    }
+}
+
+// Read a bare value (non-quoted value) as a string
+// Trims leading and trailing spaces/tabs, stops at # comment or newline
+static settings_err_t read_bare_value(file_arg *file_handle, vstr_t *vstr, int first_character) {
+    int character = first_character;
+    size_t trailing_space_count = 0;
+
+    while (true) {
+        switch (character) {
+            case 0:
+            case '\n':
+                // Remove trailing spaces/tabs and \r
+                vstr->len -= trailing_space_count;
+                return SETTINGS_OK;
+            case '#':
+                // Remove trailing spaces/tabs and \r before comment
+                vstr->len -= trailing_space_count;
+                next_line(file_handle);
+                return SETTINGS_OK;
+            case ' ':
+            case '\t':
+            case '\r':
+                // Track potential trailing whitespace
+                vstr_add_byte_nonstd(vstr, character);
+                trailing_space_count++;
+                break;
+            default:
+                // Non-whitespace character resets trailing space count
+                vstr_add_byte_nonstd(vstr, character);
+                trailing_space_count = 0;
+        }
+        character = get_next_byte(file_handle);
+    }
+}
+
+static mp_int_t read_value(file_arg *file_handle, vstr_t *vstr, bool *quoted) {
+    uint8_t character;
+    character = consume_whitespace(file_handle);
+    *quoted = (character == '"');
+
+    if (*quoted) {
+        return read_string_value(file_handle, vstr);
+    } else if (character == '\n' || character == 0) {
+        // Empty value is an error
+        return SETTINGS_ERR_BAD_VALUE;
+    } else {
+        return read_bare_value(file_handle, vstr, character);
+    }
+}
+
+static settings_err_t settings_get_vstr(const char *key, vstr_t *vstr, bool *quoted) {
+    file_arg file_handle;
+    if (!open_file(SETTINGS_PATH, &file_handle)) {
+        return SETTINGS_ERR_OPEN;
+    }
+
+    settings_err_t result = SETTINGS_ERR_NOT_FOUND;
+    while (!is_eof(&file_handle)) {
+        if (key_matches(&file_handle, key)) {
+            result = read_value(&file_handle, vstr, quoted);
+            break;
+        }
+    }
+    close_file(&file_handle);
+    return result;
+}
+
+static settings_err_t settings_get_buf_terminated(const char *key, char *value, size_t value_len, bool *quoted) {
+    vstr_t vstr;
+    vstr_init_fixed_buf(&vstr, value_len, value);
+    settings_err_t result = settings_get_vstr(key, &vstr, quoted);
+
+    if (result == SETTINGS_OK) {
+        vstr_add_byte_nonstd(&vstr, 0);
+        memcpy(value, vstr.buf, MIN(vstr.len, value_len));
+        if (vstr.len > value_len) { // this length includes trailing NUL
+            result = SETTINGS_ERR_LENGTH;
+        }
+    }
+    return result;
+}
+
+static void print_error(const char *key, settings_err_t result) {
+    switch (result) {
+        case SETTINGS_OK:
+        case SETTINGS_ERR_OPEN:
+        case SETTINGS_ERR_NOT_FOUND:
+            // These errors need not be printed.
+            // The code asking for the value is not necessarily expecting to find one.
+            return;
+        default:
+            mp_cprintf(&mp_plat_print, MP_ERROR_TEXT("An error occurred while retrieving '%s':\n"), key);
+            break;
+    }
+
+    switch (result) {
+        case SETTINGS_ERR_UNICODE:
+            mp_cprintf(&mp_plat_print, MP_ERROR_TEXT("Invalid unicode escape"));
+            break;
+        case SETTINGS_ERR_BAD_VALUE:
+            mp_cprintf(&mp_plat_print, MP_ERROR_TEXT("Invalid format"));
+            break;
+        default:
+            mp_cprintf(&mp_plat_print, MP_ERROR_TEXT("Internal error"));
+            break;
+    }
+    mp_printf(&mp_plat_print, "\n");
+}
+
+
+static settings_err_t get_str(const char *key, char *value, size_t value_len) {
+    bool quoted;
+    settings_err_t result = settings_get_buf_terminated(key, value, value_len, &quoted);
+    if (result == SETTINGS_OK && !quoted) {
+        result = SETTINGS_ERR_BAD_VALUE;
+    }
+    return result;
+}
+
+settings_err_t settings_get_str(const char *key, char *value, size_t value_len) {
+    settings_err_t result = get_str(key, value, value_len);
+    print_error(key, result);
+    return result;
+}
+
+static settings_err_t get_int(const char *key, mp_int_t *value) {
+    char buf[16];
+    bool quoted;
+    settings_err_t result = settings_get_buf_terminated(key, buf, sizeof(buf), &quoted);
+    if (result != SETTINGS_OK) {
+        return result;
+    }
+    if (quoted) {
+        return SETTINGS_ERR_BAD_VALUE;
+    }
+    // Accept a superset of TOML: a sign is also allowed before 0x, 0o and 0b, the prefix
+    // may be uppercase, and underscores need not be between digits.
+    const char *str = buf;
+    bool neg = false;
+    if (*str == '+' || *str == '-') {
+        neg = *str == '-';
+        str++;
+    }
+    mp_uint_t base = 10;
+    if (str[0] == '0') {
+        char prefix = str[1] | 0x20;
+        if (prefix == 'x') {
+            base = 16;
+        } else if (prefix == 'o') {
+            base = 8;
+        } else if (prefix == 'b') {
+            base = 2;
+        }
+        if (base != 10) {
+            str += 2;
+        } else if (unichar_isdigit(str[1])) {
+            // TOML does not allow leading zeros on decimal integers.
+            return SETTINGS_ERR_BAD_VALUE;
+        }
+    }
+    mp_uint_t magnitude;
+    str = parse_digits(str, base, &magnitude);
+    // A negative value can be one larger than MP_INT_MAX.
+    if (str == NULL || magnitude > (mp_uint_t)MP_INT_MAX + neg) {
+        return SETTINGS_ERR_BAD_VALUE;
+    }
+    while (unichar_isspace(*str)) {
+        str++;
+    }
+    if (*str) { // If the whole buffer was not consumed it's an error
+        return SETTINGS_ERR_BAD_VALUE;
+    }
+    *value = (mp_int_t)(neg ? 0 - magnitude : magnitude);
+    return SETTINGS_OK;
+}
+
+settings_err_t settings_get_int(const char *key, mp_int_t *value) {
+    settings_err_t result = get_int(key, value);
+    print_error(key, result);
+    return result;
+}
+
+static settings_err_t get_bool(const char *key, bool *value) {
+    char buf[16];
+    bool quoted;
+    settings_err_t result = settings_get_buf_terminated(key, buf, sizeof(buf), &quoted);
+    if (result != SETTINGS_OK) {
+        return result;
+    }
+    if (quoted) {
+        return SETTINGS_ERR_BAD_VALUE;
+    }
+
+    // Check for "true" or "false" (case-sensitive)
+    if (strcmp(buf, "true") == 0) {
+        *value = true;
+        return SETTINGS_OK;
+    } else if (strcmp(buf, "false") == 0) {
+        *value = false;
+        return SETTINGS_OK;
+    }
+
+    // Not a valid boolean value
+    return SETTINGS_ERR_BAD_VALUE;
+}
+
+settings_err_t settings_get_bool(const char *key, bool *value) {
+    settings_err_t result = get_bool(key, value);
+    print_error(key, result);
+    return result;
+}
+
+#if MICROPY_PY_BUILTINS_FLOAT
+// TOML does not allow leading zeros on decimal integers or on the integer part of floats.
+// https://toml.io/en/v1.0.0#integer and https://toml.io/en/v1.0.0#float
+static bool has_leading_zero(const char *str) {
+    if (*str == '+' || *str == '-') {
+        str++;
+    }
+    return str[0] == '0' && unichar_isdigit(str[1]);
+}
+
+static settings_err_t get_float(const char *key, mp_float_t *value) {
+    char buf[48];
+    bool quoted;
+    settings_err_t result = settings_get_buf_terminated(key, buf, sizeof(buf), &quoted);
+    if (result != SETTINGS_OK) {
+        return result;
+    }
+    if (quoted || has_leading_zero(buf)) {
+        return SETTINGS_ERR_BAD_VALUE;
+    }
+
+    const char *str = buf;
+    const char *end = buf + strlen(buf);
+    bool neg = false;
+
+    if (str < end && (*str == '+' || *str == '-')) {
+        neg = (*str == '-');
+        str++;
+    }
+
+    mp_float_t val;
+    if (end - str >= 3 && str[0] == 'i' && str[1] == 'n' && str[2] == 'f') {
+        str += 3;
+        val = (mp_float_t)INFINITY;
+    } else if (end - str >= 3 && str[0] == 'n' && str[1] == 'a' && str[2] == 'n') {
+        str += 3;
+        val = MICROPY_FLOAT_C_FUN(nan)("");
+    } else {
+        const char *num_start = str;
+        str = mp_parse_float_internal(str, end - str, &val);
+        if (str == NULL || str == num_start) {
+            return SETTINGS_ERR_BAD_VALUE;
+        }
+    }
+
+    if (str != end) {
+        return SETTINGS_ERR_BAD_VALUE;
+    }
+
+    *value = neg ? -val : val;
+    return SETTINGS_OK;
+}
+
+settings_err_t settings_get_float(const char *key, mp_float_t *value) {
+    settings_err_t result = get_float(key, value);
+    print_error(key, result);
+    return result;
+}
+#endif
+
+// Get the raw value as a vstr, whether quoted or bare. Value may be an invalid TOML value.
+settings_err_t settings_get_raw_vstr(const char *key, vstr_t *vstr) {
+    bool quoted;
+    return settings_get_vstr(key, vstr, &quoted);
+}
+
+settings_err_t settings_get_obj(const char *key, mp_obj_t *value) {
+    vstr_t vstr;
+    vstr_init(&vstr, 32);
+    bool quoted;
+
+    settings_err_t result = settings_get_vstr(key, &vstr, &quoted);
+    if (result != SETTINGS_OK) {
+        return result;
+    }
+
+    if (quoted) {
+        // Successfully parsed a quoted string
+        *value = mp_obj_new_str_from_vstr(&vstr);
+        return SETTINGS_OK;
+    }
+
+    // Not a quoted string, try boolean
+    bool bool_val;
+    result = get_bool(key, &bool_val);
+    if (result == SETTINGS_OK) {
+        *value = mp_obj_new_bool(bool_val);
+        return SETTINGS_OK;
+    }
+
+    // Not a boolean, try integer
+    mp_int_t int_val;
+    result = get_int(key, &int_val);
+    if (result == SETTINGS_OK) {
+        *value = mp_obj_new_int(int_val);
+        return SETTINGS_OK;
+    }
+
+    // Not an integer, try float
+    #if MICROPY_PY_BUILTINS_FLOAT
+    mp_float_t float_val;
+    result = get_float(key, &float_val);
+    if (result == SETTINGS_OK) {
+        *value = mp_obj_new_float(float_val);
+        return SETTINGS_OK;
+    }
+    #endif
+
+    return SETTINGS_ERR_BAD_VALUE;
+}
+
+#endif

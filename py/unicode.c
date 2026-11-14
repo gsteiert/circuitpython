@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -48,7 +48,7 @@
 #define AT_LX (FL_LOWER | FL_ALPHA | FL_PRINT | FL_XDIGIT)
 
 // table of attributes for ascii characters
-STATIC const uint8_t attr[] = {
+static const uint8_t attr[] = {
     0, 0, 0, 0, 0, 0, 0, 0,
     0, AT_SP, AT_SP, AT_SP, AT_SP, AT_SP, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -180,7 +180,7 @@ mp_uint_t unichar_xdigit_value(unichar c) {
 
 #if MICROPY_PY_BUILTINS_STR_UNICODE
 
-bool utf8_check(const byte *p, size_t len) {
+bool unicode_encoding_check(mp_encoding_t encoding, const byte *p, size_t len) {
     uint8_t need = 0;
     const byte *end = p + len;
     for (; p < end; p++) {
@@ -193,7 +193,7 @@ bool utf8_check(const byte *p, size_t len) {
                 return 0;
             }
         } else {
-            if (c >= 0xc0) {
+            if (encoding == MP_ENCODING_UTF8 && c >= 0xc0) {
                 if (c >= 0xf8) {
                     // mismatch
                     return 0;

@@ -1,0 +1,53 @@
+name: Fetch Zephyr port deps
+
+inputs:
+  sdl:
+    description: 'Install the 32-bit SDL2 packages native_sim needs'
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Show CPU model
+      if: runner.os == 'Linux'
+      run: grep "model name" /proc/cpuinfo | head -1
+      shell: bash
+    - name: Get Linux build dependencies
+      if: runner.os == 'Linux'
+      uses: ./.github/actions/deps/apt_packages
+      with:
+        # The last four are the packages action-zephyr-setup@v1 installs, so its apt-get has nothing to download.
+        packages: libusb-1.0-0-dev libudev-dev pkg-config mtools ccache gperf libc6-dev-i386 g++-multilib
+    - name: Prepare for 32-bit SDL2
+      if: runner.os == 'Linux' && inputs.sdl == 'true'
+      run: |
+        sudo dpkg --add-architecture i386
+        # We have to hold python3 so the following install works. See https://github.com/actions/runner-images/issues/13803
+        sudo apt-mark hold python3
+        echo "PKG_CONFIG_PATH=/usr/lib/i386-linux-gnu/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> $GITHUB_ENV
+      shell: bash
+    - name: Get SDL2 for native_sim
+      if: runner.os == 'Linux' && inputs.sdl == 'true'
+      uses: ./.github/actions/deps/apt_packages
+      with:
+        packages: libsdl2-dev:i386 libsdl2-image-dev:i386
+    - name: Setup Zephyr project
+      uses: zephyrproject-rtos/action-zephyr-setup@v1
+      with:
+        app-path: zephyr-config
+        base-path: ports/zephyr-cp
+        toolchains: arm-zephyr-eabi
+        # The action's ccache stores a new ~150 MB entry per board job under one key
+        # shared by every board, and each job restores whichever entry was saved last.
+        # Measured across all 30 boards: hits on 5 boards by luck, none on the other 25,
+        # and no build-time difference either way. The entries were filling the
+        # repository's 10 GB Actions cache and evicting the SDK and other caches.
+        enable-ccache: false
+    - name: Export cmake info
+      run: west zephyr-export
+      shell: bash
+      working-directory: ports/zephyr-cp
+    - name: Install Zephyr protobuf dependency
+      run: pip install protobuf==6.33.5
+      shell: bash

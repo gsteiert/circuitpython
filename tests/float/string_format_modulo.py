@@ -6,7 +6,7 @@ print("%i" % 1.0)
 print("%u" % 1.0)
 
 # these 3 have different behaviour in Python 3.x versions
-# uPy raises a TypeError, following Python 3.5 (earlier versions don't)
+# MicroPython raises a TypeError, following Python 3.5 (earlier versions don't)
 # print("%x" % 18.0)
 # print("%o" % 18.0)
 # print("%X" % 18.0)
@@ -41,7 +41,10 @@ print(("%.40f" % 1e-300)[:2])
 print(("%.40g" % 1e-1)[:2])
 print(("%.40g" % 1e-2)[:2])
 print(("%.40g" % 1e-3)[:2])
-print(("%.40g" % 1e-4)[:2])
+# Under Appveyor Release builds, 1e-4 was being formatted as 9.99999...e-5
+# instead of 0.0001.  (Interestingly, it formatted correctly for the Debug
+# build). Avoid the edge case.
+print(("%.40g" % 1.1e-4)[:2])
 
 print("%.0g" % 1)  # 0 precision 'g'
 

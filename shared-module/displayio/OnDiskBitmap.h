@@ -1,38 +1,15 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2018 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
-#ifndef MICROPY_INCLUDED_SHARED_MODULE_DISPLAYIO_ONDISKBITMAP_H
-#define MICROPY_INCLUDED_SHARED_MODULE_DISPLAYIO_ONDISKBITMAP_H
+#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "py/obj.h"
-
-#include "extmod/vfs_fat.h"
 
 typedef struct {
     mp_obj_base_t base;
@@ -43,7 +20,7 @@ typedef struct {
     uint32_t r_bitmask;
     uint32_t g_bitmask;
     uint32_t b_bitmask;
-    pyb_file_obj_t *file;
+    mp_obj_t file;
     union {
         mp_obj_base_t *pixel_shader_base;
         struct displayio_palette *palette;
@@ -51,6 +28,27 @@ typedef struct {
     };
     bool bitfield_compressed;
     uint8_t bits_per_pixel;
+    // The last bytes read from the file. Pixels are read along rows, so most reads hit it.
+    uint8_t cache_len;
+    #if CIRCUITPY_STORAGE_MAP_FILE
+    // Flash runs the pixels are read from instead of the cache; 0 = read through the cache.
+    uint8_t map_count;
+    // 8-bit file with every row inside one run, so TileGrid can read whole rows.
+    bool rows_mapped;
+    #endif
+    uint32_t cache_start;
+    union {
+        uint8_t cache[64];
+        #if CIRCUITPY_STORAGE_MAP_FILE
+        struct {
+            const uint8_t *addr;
+            uint32_t len;
+        } map[8];
+        #endif
+    };
 } displayio_ondiskbitmap_t;
 
-#endif // MICROPY_INCLUDED_SHARED_MODULE_DISPLAYIO_ONDISKBITMAP_H
+#if CIRCUITPY_STORAGE_MAP_FILE
+// Row y of an 8-bit file in flash, or NULL if it spans two runs or the file isn't mapped.
+const uint8_t *displayio_ondiskbitmap_row(displayio_ondiskbitmap_t *self, int16_t y);
+#endif

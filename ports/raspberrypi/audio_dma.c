@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "audio_dma.h"
 
@@ -34,49 +14,57 @@
 #include "py/mpstate.h"
 #include "py/runtime.h"
 
-#include "src/rp2_common/hardware_irq/include/hardware/irq.h"
-
-#if CIRCUITPY_AUDIOPWMIO || CIRCUITPY_AUDIOBUSIO
-
-void audio_dma_reset(void) {
-    for (size_t channel = 0; channel < NUM_DMA_CHANNELS; channel++) {
-        if (MP_STATE_PORT(playing_audio)[channel] == NULL) {
-            continue;
-        }
-
-        audio_dma_stop(MP_STATE_PORT(playing_audio)[channel]);
-    }
-}
+#include "hardware/irq.h"
 
 
-STATIC size_t audio_dma_convert_samples(audio_dma_t *dma, uint8_t *input, uint32_t input_length, uint8_t *output, uint32_t output_length) {
+#if CIRCUITPY_AUDIOCORE
+
+// audio_dma and rp2pio cooperate on DMA_IRQ_0 using the SDK's shared interrupt
+// handlers. We add our handler when we enable our first channel and remove it
+// when our last channel is disabled. See the DMA IRQ allocation notes in
+// common-hal/microcontroller/__init__.c.
+static void audio_dma_enable_irq(uint channel);
+static void audio_dma_disable_irq(uint channel);
+
+// Start address of each looping single buffer sample, by DMA channel. The reload DMA reads it
+// once per loop, so it is kept here instead of in the audio object, which may be in PSRAM.
+// A DMA read from PSRAM stalls the other DMA channels, such as picodvi.
+static uint8_t *single_buffer_start[NUM_DMA_CHANNELS];
+
+static size_t audio_dma_convert_samples(audio_dma_t *dma, uint8_t *input, uint32_t input_length, uint8_t *output, uint32_t output_length) {
     #pragma GCC diagnostic push
     #pragma GCC diagnostic ignored "-Wcast-align"
 
     uint32_t output_length_used = input_length / dma->sample_spacing;
 
     if (output_length_used > output_length) {
-        mp_raise_RuntimeError(translate("Internal audio buffer too small"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Internal audio buffer too small"));
     }
 
     uint32_t out_i = 0;
     if (dma->sample_resolution <= 8 && dma->output_resolution > 8) {
         // reading bytes, writing 16-bit words, so output buffer will be bigger.
 
-        output_length_used = output_length * 2;
+        output_length_used *= 2;
         if (output_length_used > output_length) {
-            mp_raise_RuntimeError(translate("Internal audio buffer too small"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("Internal audio buffer too small"));
         }
 
-        size_t shift = dma->output_resolution - dma->sample_resolution;
+        // Correct "rail-to-rail" scaling of arbitrary-depth input to output
+        // requires more operations than this, but at least the vital 8- to
+        // 16-bit cases are correctly scaled now. Prior code was only
+        // considering 8-to-16 anyway, but had a slight DC offset in the
+        // result, so this is no worse off WRT supported resolutions.
+        uint16_t mul = ((1 << dma->output_resolution) - 1) / ((1 << dma->sample_resolution) - 1);
+        uint16_t offset = (1 << dma->output_resolution) / 2;
 
         for (uint32_t i = 0; i < input_length; i += dma->sample_spacing) {
             if (dma->signed_to_unsigned) {
-                ((uint16_t *)output)[out_i] = ((uint16_t)((int8_t *)input)[i] + 0x80) << shift;
+                ((uint16_t *)output)[out_i] = (uint16_t)((((int8_t *)input)[i] + 0x80) * mul);
             } else if (dma->unsigned_to_signed) {
-                ((int16_t *)output)[out_i] = ((int16_t)((uint8_t *)input)[i] - 0x80) << shift;
+                ((int16_t *)output)[out_i] = (int16_t)(((uint8_t *)input)[i] * mul - offset);
             } else {
-                ((uint16_t *)output)[out_i] = ((uint16_t)((uint8_t *)input)[i]) << shift;
+                ((uint16_t *)output)[out_i] = (uint16_t)(((uint8_t *)input)[i] * mul);
             }
             out_i += 1;
         }
@@ -113,14 +101,23 @@ STATIC size_t audio_dma_convert_samples(audio_dma_t *dma, uint8_t *input, uint32
     } else {
         // (dma->sample_resolution > 8 && dma->output_resolution <= 8)
         // Not currently used, but might be in the future.
-        mp_raise_RuntimeError(translate("Audio conversion not implemented"));
+        mp_raise_RuntimeError(MP_ERROR_TEXT("Audio conversion not implemented"));
+    }
+    if (dma->swap_channel) {
+        // Loop for swapping left and right channels
+        for (uint32_t i = 0; i < out_i; i += 2) {
+            uint16_t temp = ((uint16_t *)output)[i];
+            ((uint16_t *)output)[i] = ((uint16_t *)output)[i + 1];
+            ((uint16_t *)output)[i + 1] = temp;
+        }
     }
     #pragma GCC diagnostic pop
     return output_length_used;
 }
 
 // buffer_idx is 0 or 1.
-STATIC void audio_dma_load_next_block(audio_dma_t *dma, size_t buffer_idx) {
+static void audio_dma_load_next_block(audio_dma_t *dma, size_t buffer_idx) {
+    assert(dma->channel[buffer_idx] < NUM_DMA_CHANNELS);
     size_t dma_channel = dma->channel[buffer_idx];
 
     audioio_get_buffer_result_t get_buffer_result;
@@ -131,6 +128,7 @@ STATIC void audio_dma_load_next_block(audio_dma_t *dma, size_t buffer_idx) {
 
     if (get_buffer_result == GET_BUFFER_ERROR) {
         audio_dma_stop(dma);
+        dma->dma_result = AUDIO_DMA_SOURCE_ERROR;
         return;
     }
 
@@ -160,10 +158,16 @@ STATIC void audio_dma_load_next_block(audio_dma_t *dma, size_t buffer_idx) {
                 !dma_channel_is_busy(dma->channel[1])) {
                 // No data has been read, and both DMA channels have now finished, so it's safe to stop.
                 audio_dma_stop(dma);
-                dma->playing_in_progress = false;
+                dma->dma_result = AUDIO_DMA_OK;
+                return;
             }
         }
     }
+    // Enable the channel so that it can be played.
+    if (!dma->paused) {
+        dma_hw->ch[dma_channel].al1_ctrl |= DMA_CH1_CTRL_TRIG_EN_BITS;
+    }
+    dma->dma_result = AUDIO_DMA_OK;
 }
 
 // Playback should be shutdown before calling this.
@@ -176,7 +180,8 @@ audio_dma_result audio_dma_setup_playback(
     bool output_signed,
     uint8_t output_resolution,
     uint32_t output_register_address,
-    uint8_t dma_trigger_source) {
+    uint8_t dma_trigger_source,
+    bool swap_channel) {
 
     // Use two DMA channels to play because the DMA can't wrap to itself without the
     // buffer being power of two aligned.
@@ -203,8 +208,9 @@ audio_dma_result audio_dma_setup_playback(
     dma->output_signed = output_signed;
     dma->sample_spacing = 1;
     dma->output_resolution = output_resolution;
-    dma->sample_resolution = audiosample_bits_per_sample(sample);
+    dma->sample_resolution = audiosample_get_bits_per_sample(sample);
     dma->output_register_address = output_register_address;
+    dma->swap_channel = swap_channel;
 
     audiosample_reset_buffer(sample, single_channel_output, audio_channel);
 
@@ -215,6 +221,7 @@ audio_dma_result audio_dma_setup_playback(
     uint32_t max_buffer_length;
     audiosample_get_buffer_structure(sample, single_channel_output, &single_buffer, &samples_signed,
         &max_buffer_length, &dma->sample_spacing);
+    dma->single_buffer = single_buffer;
 
     // Check to see if we have to scale the resolution up.
     if (dma->sample_resolution <= 8 && dma->output_resolution > 8) {
@@ -226,15 +233,33 @@ audio_dma_result audio_dma_setup_playback(
         max_buffer_length /= dma->sample_spacing;
     }
 
-    dma->buffer[0] = (uint8_t *)m_realloc(dma->buffer[0], max_buffer_length);
+    #if PICO_RP2350
+    dma->buffer[0] = (uint8_t *)port_realloc(dma->buffer[0], max_buffer_length, true);
+    #else
+    dma->buffer[0] = (uint8_t *)m_realloc(dma->buffer[0],
+        #if MICROPY_MALLOC_USES_ALLOCATED_SIZE
+        dma->buffer_length[0], // Old size
+        #endif
+        max_buffer_length);
+    #endif
     dma->buffer_length[0] = max_buffer_length;
+
     if (dma->buffer[0] == NULL) {
         return AUDIO_DMA_MEMORY_ERROR;
     }
 
     if (!single_buffer) {
-        dma->buffer[1] = (uint8_t *)m_realloc(dma->buffer[1], max_buffer_length);
+        #if PICO_RP2350
+        dma->buffer[1] = (uint8_t *)port_realloc(dma->buffer[1], max_buffer_length, true);
+        #else
+        dma->buffer[1] = (uint8_t *)m_realloc(dma->buffer[1],
+            #if MICROPY_MALLOC_USES_ALLOCATED_SIZE
+            dma->buffer_length[1], // Old size
+            #endif
+            max_buffer_length);
+        #endif
         dma->buffer_length[1] = max_buffer_length;
+
         if (dma->buffer[1] == NULL) {
             return AUDIO_DMA_MEMORY_ERROR;
         }
@@ -249,7 +274,7 @@ audio_dma_result audio_dma_setup_playback(
         dma->output_size = 1;
     }
     // Transfer both channels at once.
-    if (!single_channel_output && audiosample_channel_count(sample) == 2) {
+    if (!single_channel_output && audiosample_get_channel_count(sample) == 2) {
         dma->output_size *= 2;
     }
     enum dma_channel_transfer_size dma_size = DMA_SIZE_8;
@@ -278,10 +303,18 @@ audio_dma_result audio_dma_setup_playback(
     MP_STATE_PORT(playing_audio)[dma->channel[0]] = dma;
     MP_STATE_PORT(playing_audio)[dma->channel[1]] = dma;
 
+    dma->paused = false;
+
     // Load the first two blocks up front.
     audio_dma_load_next_block(dma, 0);
+    if (dma->dma_result != AUDIO_DMA_OK) {
+        return dma->dma_result;
+    }
     if (!single_buffer) {
         audio_dma_load_next_block(dma, 1);
+        if (dma->dma_result != AUDIO_DMA_OK) {
+            return dma->dma_result;
+        }
     }
 
     // Special case the DMA for a single buffer. It's commonly used for a single wave length of sound
@@ -290,6 +323,7 @@ audio_dma_result audio_dma_setup_playback(
     // Read and write addresses change with DMA so we need to reset the read address back to the
     // start of the sample.
     if (single_buffer) {
+        single_buffer_start[dma->channel[0]] = dma->buffer[0];
         dma_channel_config c = dma_channel_get_default_config(dma->channel[1]);
         channel_config_set_transfer_data_size(&c, DMA_SIZE_32);
         channel_config_set_dreq(&c, 0x3f); // dma as fast as possible
@@ -298,14 +332,14 @@ audio_dma_result audio_dma_setup_playback(
         channel_config_set_chain_to(&c, dma->channel[1]); // Chain to ourselves so we stop.
         dma_channel_configure(dma->channel[1], &c,
             &dma_hw->ch[dma->channel[0]].al3_read_addr_trig, // write address
-            &dma->buffer[0], // read address
+            &single_buffer_start[dma->channel[0]], // read address
             1, // transaction count
             false); // trigger
     } else {
         // Enable our DMA channels on DMA_IRQ_0 to the CPU. This will wake us up when
         // we're WFI.
-        dma_hw->inte0 |= (1 << dma->channel[0]) | (1 << dma->channel[1]);
-        irq_set_mask_enabled(1 << DMA_IRQ_0, true);
+        audio_dma_enable_irq(dma->channel[0]);
+        audio_dma_enable_irq(dma->channel[1]);
     }
 
     dma->playing_in_progress = true;
@@ -315,16 +349,15 @@ audio_dma_result audio_dma_setup_playback(
 }
 
 void audio_dma_stop(audio_dma_t *dma) {
+    dma->paused = true;
+
     // Disable our interrupts.
-    uint32_t channel_mask = 0;
     if (dma->channel[0] < NUM_DMA_CHANNELS) {
-        channel_mask |= 1 << dma->channel[0];
+        audio_dma_disable_irq(dma->channel[0]);
     }
     if (dma->channel[1] < NUM_DMA_CHANNELS) {
-        channel_mask |= 1 << dma->channel[1];
+        audio_dma_disable_irq(dma->channel[1]);
     }
-    dma_hw->inte0 &= ~channel_mask;
-    irq_set_mask_enabled(1 << DMA_IRQ_0, false);
 
     // Run any remaining audio tasks because we remove ourselves from
     // playing_audio.
@@ -332,12 +365,13 @@ void audio_dma_stop(audio_dma_t *dma) {
 
     for (size_t i = 0; i < 2; i++) {
         size_t channel = dma->channel[i];
+        dma->channel[i] = NUM_DMA_CHANNELS;
         if (channel == NUM_DMA_CHANNELS) {
             // Channel not in use.
             continue;
         }
 
-        dma_channel_config c = dma_channel_get_default_config(dma->channel[i]);
+        dma_channel_config c = dma_channel_get_default_config(channel);
         channel_config_set_enable(&c, false);
         dma_channel_set_config(channel, &c, false /* trigger */);
 
@@ -350,7 +384,6 @@ void audio_dma_stop(audio_dma_t *dma) {
         dma_channel_set_trans_count(channel, 0, false /* trigger */);
         dma_channel_unclaim(channel);
         MP_STATE_PORT(playing_audio)[channel] = NULL;
-        dma->channel[i] = NUM_DMA_CHANNELS;
     }
     dma->playing_in_progress = false;
 
@@ -362,6 +395,7 @@ void audio_dma_stop(audio_dma_t *dma) {
 void audio_dma_pause(audio_dma_t *dma) {
     dma_hw->ch[dma->channel[0]].al1_ctrl &= ~DMA_CH0_CTRL_TRIG_EN_BITS;
     dma_hw->ch[dma->channel[1]].al1_ctrl &= ~DMA_CH1_CTRL_TRIG_EN_BITS;
+    dma->paused = true;
 }
 
 void audio_dma_resume(audio_dma_t *dma) {
@@ -374,35 +408,88 @@ void audio_dma_resume(audio_dma_t *dma) {
         dma_hw->ch[dma->channel[0]].al1_ctrl |= DMA_CH0_CTRL_TRIG_EN_BITS;
         dma_hw->ch[dma->channel[1]].al1_ctrl |= DMA_CH1_CTRL_TRIG_EN_BITS;
     }
+    dma->paused = false;
 }
 
 bool audio_dma_get_paused(audio_dma_t *dma) {
     if (dma->channel[0] >= NUM_DMA_CHANNELS) {
         return false;
     }
-    uint32_t control = dma_hw->ch[dma->channel[0]].ctrl_trig;
+    return dma->playing_in_progress && dma->paused;
+}
 
-    return (control & DMA_CH0_CTRL_TRIG_EN_BITS) == 0;
+uint32_t audio_dma_pause_all(void) {
+    uint32_t result = 0;
+    for (size_t channel = 0; channel < NUM_DMA_CHANNELS; channel++) {
+        audio_dma_t *dma = MP_STATE_PORT(playing_audio)[channel];
+        if (dma != NULL && !audio_dma_get_paused(dma)) {
+            audio_dma_pause(dma);
+            result |= (1 << channel);
+        }
+    }
+    return result;
+}
+
+void audio_dma_unpause_mask(uint32_t channel_mask) {
+    for (size_t channel = 0; channel < NUM_DMA_CHANNELS; channel++) {
+        audio_dma_t *dma = MP_STATE_PORT(playing_audio)[channel];
+        if (dma != NULL && (channel_mask & (1 << channel))) {
+            audio_dma_resume(dma);
+        }
+    }
 }
 
 void audio_dma_init(audio_dma_t *dma) {
     dma->buffer[0] = NULL;
     dma->buffer[1] = NULL;
 
+    dma->buffer_length[0] = 0;
+    dma->buffer_length[1] = 0;
+
     dma->channel[0] = NUM_DMA_CHANNELS;
     dma->channel[1] = NUM_DMA_CHANNELS;
+
+    dma->playing_in_progress = false;
+    dma->paused = false;
 }
 
 void audio_dma_deinit(audio_dma_t *dma) {
+    #if PICO_RP2350
+    port_free(dma->buffer[0]);
+    #else
+    #if MICROPY_MALLOC_USES_ALLOCATED_SIZE
+    m_free(dma->buffer[0], dma->buffer_length[0]);
+    #else
     m_free(dma->buffer[0]);
+    #endif
+    #endif
     dma->buffer[0] = NULL;
+    dma->buffer_length[0] = 0;
 
+    #if PICO_RP2350
+    port_free(dma->buffer[1]);
+    #else
+    #if MICROPY_MALLOC_USES_ALLOCATED_SIZE
+    m_free(dma->buffer[1], dma->buffer_length[1]);
+    #else
     m_free(dma->buffer[1]);
+    #endif
+    #endif
     dma->buffer[1] = NULL;
+    dma->buffer_length[1] = 0;
 }
 
 bool audio_dma_get_playing(audio_dma_t *dma) {
     if (dma->channel[0] == NUM_DMA_CHANNELS) {
+        return false;
+    }
+    // A single-buffer, non-looping sample plays entirely in hardware via DMA
+    // chaining, with no completion interrupt to stop it. Detect when its DMA
+    // channel has drained and finish so that playing_in_progress is cleared.
+    if (dma->single_buffer && !dma->loop &&
+        dma->playing_in_progress && !dma->paused &&
+        !dma_channel_is_busy(dma->channel[0])) {
+        audio_dma_stop(dma);
         return false;
     }
     return dma->playing_in_progress;
@@ -412,7 +499,9 @@ bool audio_dma_get_playing(audio_dma_t *dma) {
 // background tasks such as this and causes a stack overflow.
 // NOTE(dhalbert): I successfully printed from here while debugging.
 // So it's possible, but be careful.
-STATIC void dma_callback_fun(void *arg) {
+static void dma_callback_fun(void *arg) {
+    // Any audio interrupts that happen below will requeue the background task
+    // after updating channels_to_load_mask.
     audio_dma_t *dma = arg;
     if (dma == NULL) {
         return;
@@ -420,36 +509,87 @@ STATIC void dma_callback_fun(void *arg) {
 
     common_hal_mcu_disable_interrupts();
     uint32_t channels_to_load_mask = dma->channels_to_load_mask;
+    // This can be 0 if the background task was queued between the call to
+    // dma_callback_fun and the above read of channels_to_load_mask.
     dma->channels_to_load_mask = 0;
     common_hal_mcu_enable_interrupts();
 
-    // Load the blocks for the requested channels.
-    uint32_t channel = 0;
-    while (channels_to_load_mask) {
-        if (channels_to_load_mask & 1) {
-            if (dma->channel[0] == channel) {
-                audio_dma_load_next_block(dma, 0);
-            }
-            if (dma->channel[1] == channel) {
-                audio_dma_load_next_block(dma, 1);
-            }
-        }
-        channels_to_load_mask >>= 1;
-        channel++;
+    uint8_t first_filled_channel = NUM_DMA_CHANNELS;
+    size_t filled_count = 0;
+    if (dma->channel[0] != NUM_DMA_CHANNELS && (channels_to_load_mask & (1 << dma->channel[0]))) {
+        audio_dma_load_next_block(dma, 0);
+        first_filled_channel = dma->channel[0];
+        filled_count++;
+    }
+    if (dma->channel[1] != NUM_DMA_CHANNELS && (channels_to_load_mask & (1 << dma->channel[1]))) {
+        audio_dma_load_next_block(dma, 1);
+        first_filled_channel = dma->channel[1];
+        filled_count++;
+    }
+
+    // Restart if the other channel has been queued while we were filling the first or we filled two
+    // now. (Two get filled if the second buffer completes while the first is waiting in the
+    // background task queue.)
+    if (first_filled_channel != NUM_DMA_CHANNELS && (dma->channels_to_load_mask != 0 || filled_count == 2)) {
+        dma_channel_start(first_filled_channel);
     }
 }
 
-void isr_dma_0(void) {
+// Shared DMA_IRQ_0 handler for audio. It acknowledges and services only audio
+// channels, leaving any other channels' interrupts for the other shared
+// handlers (e.g. rp2pio) to acknowledge.
+static void __not_in_flash_func(audio_dma_irq_handler)(void) {
     for (size_t i = 0; i < NUM_DMA_CHANNELS; i++) {
         uint32_t mask = 1 << i;
-        if ((dma_hw->intr & mask) != 0 && MP_STATE_PORT(playing_audio)[i] != NULL) {
-            audio_dma_t *dma = MP_STATE_PORT(playing_audio)[i];
-            // Record all channels whose DMA has completed; they need loading.
-            dma->channels_to_load_mask |= mask;
-            background_callback_add(&dma->callback, dma_callback_fun, (void *)dma);
-            dma_hw->ints0 = mask;
+        if ((dma_hw->ints0 & mask) == 0) {
+            continue;
         }
+        audio_dma_t *dma = MP_STATE_PORT(playing_audio)[i];
+        if (dma == NULL) {
+            // Not one of our channels; leave it for another shared handler.
+            continue;
+        }
+        // acknowledge interrupt early. Doing so late means that you could lose an
+        // interrupt if the buffer is very small and the DMA operation
+        // completed by the time callback_add() / dma_complete() returned. This
+        // affected PIO continuous write more than audio.
+        dma_hw->ints0 = mask;
+        // Record all channels whose DMA has completed; they need loading.
+        dma->channels_to_load_mask |= mask;
+        // Disable the channel so that we don't play it without filling it.
+        dma_hw->ch[i].al1_ctrl &= ~DMA_CH0_CTRL_TRIG_EN_BITS;
+        // This is a noop if the callback is already queued.
+        background_callback_add(&dma->callback, dma_callback_fun, (void *)dma);
     }
 }
 
+// Channels (bitmask) audio currently has enabled on DMA_IRQ_0. Used to decide
+// when to add/remove our shared interrupt handler.
+static uint32_t audio_dma_irq0_channel_mask = 0;
+
+static void audio_dma_enable_irq(uint channel) {
+    // Clear any latent interrupt so that we don't immediately disable the channel.
+    dma_hw->ints0 = 1u << channel;
+    if (audio_dma_irq0_channel_mask == 0) {
+        irq_add_shared_handler(DMA_IRQ_0, audio_dma_irq_handler,
+            PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
+    }
+    audio_dma_irq0_channel_mask |= 1u << channel;
+    dma_irqn_set_channel_enabled(0, channel, true);
+    irq_set_enabled(DMA_IRQ_0, true);
+}
+
+static void audio_dma_disable_irq(uint channel) {
+    dma_irqn_set_channel_enabled(0, channel, false);
+    audio_dma_irq0_channel_mask &= ~(1u << channel);
+    if (audio_dma_irq0_channel_mask == 0) {
+        irq_remove_handler(DMA_IRQ_0, audio_dma_irq_handler);
+    }
+    // Turn off the IRQ line entirely once no one (audio or rp2pio) needs it.
+    if (dma_hw->inte0 == 0) {
+        irq_set_enabled(DMA_IRQ_0, false);
+    }
+}
+
+MP_REGISTER_ROOT_POINTER(mp_obj_t playing_audio[enum_NUM_DMA_CHANNELS]);
 #endif

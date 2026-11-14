@@ -1,35 +1,15 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2016-2017 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2016-2017 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
-#ifndef MICROPY_INCLUDED_SUPERVISOR_PORT_H
-#define MICROPY_INCLUDED_SUPERVISOR_PORT_H
+#pragma once
 
-#include "py/mpconfig.h"
+#include <stdbool.h>
+#include <stddef.h>
 
-#include "supervisor/memory.h"
+#include "py/obj.h"
 #include "supervisor/shared/safe_mode.h"
 
 // Provided by the linker;
@@ -44,22 +24,22 @@ extern uint32_t _ebss;
 safe_mode_t port_init(void);
 
 // Reset the microcontroller completely.
-void reset_cpu(void) NORETURN;
+void reset_cpu(void) MP_NORETURN;
+
+// Reset port state that must be torn down before anything else is reset.
+void reset_port_early(void);
 
 // Reset the microcontroller state.
 void reset_port(void);
 
 // Reset to the bootloader
-void reset_to_bootloader(void) NORETURN;
+void reset_to_bootloader(void) MP_NORETURN;
 
 // Get stack limit address
 uint32_t *port_stack_get_limit(void);
 
 // Get stack top address
 uint32_t *port_stack_get_top(void);
-
-// True if stack is not located inside heap (at the top)
-bool port_has_fixed_stack(void);
 
 // Get heap bottom address
 uint32_t *port_heap_get_bottom(void);
@@ -90,17 +70,69 @@ void port_interrupt_after_ticks(uint32_t ticks);
 // may not be a system level sleep.
 void port_idle_until_interrupt(void);
 
-// Execute port specific actions during background tasks.
+// Execute port specific actions during background tick. Only if ticks are enabled.
+void port_background_tick(void);
+
+// Execute port specific actions during background tasks. This is before the
+// background callback system and happens *very* often. Use
+// port_background_tick() when possible.
 void port_background_task(void);
 
-// Take port specific actions at the beginning and end of background tasks.
+// Take port specific actions at the beginning and end of background ticks.
 // This is used e.g., to set a monitoring pin for debug purposes.  "Actual
-// work" should be done in port_background_task() instead.
-void port_start_background_task(void);
-void port_finish_background_task(void);
+// work" should be done in port_background_tick() instead.
+void port_start_background_tick(void);
+void port_finish_background_tick(void);
+
+// Some ports need special handling to wake the main task from another task. The
+// port must implement the necessary code in this function.  A default weak
+// implementation is provided that does nothing.
+void port_wake_main_task(void);
 
 // Some ports need special handling to wake the main task from an interrupt
-// context or other task.  The port must implement the necessary code in this
-// function.  A default weak implementation is provided that does nothing.
-void port_wake_main_task(void);
-#endif  // MICROPY_INCLUDED_SUPERVISOR_PORT_H
+// context.  The port must implement the necessary code in this function.  A
+// default weak implementation is provided that does nothing.
+void port_wake_main_task_from_isr(void);
+
+// Some ports may use real RTOS tasks besides the background task framework of
+// CircuitPython. Calling this will yield to other tasks at the same priority level
+// (or higher priority level if pre-emption is not immediate in the RTOS)
+// and then return to the CircuitPython task when others are done.
+// Note that this does NOT yield to lower priority tasks. Use port_task_sleep_ms() instead.
+void port_task_yield(void);
+
+// On ports using real RTOS tasks, yield to other tasks for at least msecs.
+// This will allow lower priority tasks to run.
+// On non-RTOS implementations, this just sleeps for msecs and will run CircuitPython
+// background tasks.
+void port_task_sleep_ms(uint32_t msecs);
+
+// Some ports want to add information to boot_out.txt.
+// A default weak implementation is provided that does nothing.
+void port_boot_info(void);
+
+// Some ports want to mark additional pointers as gc roots.
+// A default weak implementation is provided that does nothing.
+void port_gc_collect(void);
+
+// Called once the VM heap is torn down and its finalisers have run. Ports free
+// memory here that heap objects may point into.
+// A default weak implementation is provided that does nothing.
+void port_gc_deinit(void);
+
+// Most ports that implement CIRCUITPY_BOOT_BUTTON use a generic version of
+// this function to sense the button. Ports that need to can override this
+// function to provide their own implementation.
+bool port_boot_button_pressed(void);
+
+// Allocating objects on the port heap, not the VM heap.
+#define mp_obj_port_malloc(struct_type, obj_type) ((struct_type *)mp_obj_port_malloc_helper(sizeof(struct_type), obj_type))
+#define mp_obj_port_malloc_var(struct_type, var_field, var_type, var_num, obj_type) ((struct_type *)mp_obj_port_malloc_helper(offsetof(struct_type, var_field) + sizeof(var_type) * (var_num), obj_type))
+
+void *mp_obj_port_malloc_helper(size_t num_bytes, const mp_obj_type_t *type);
+mp_obj_t mp_obj_new_port_tuple(size_t n, const mp_obj_t *items);
+
+// Safely free an object that may have been allocated from either the GC heap or port heap.
+// If the pointer is on the GC heap, it will be freed by the GC automatically.
+// If the pointer is not on the GC heap, it will be freed with port_free.
+void circuitpy_free_obj(mp_obj_t obj);

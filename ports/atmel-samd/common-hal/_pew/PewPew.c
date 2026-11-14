@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2019 Radomir Dopieralski
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2019 Radomir Dopieralski
+//
+// SPDX-License-Identifier: MIT
 
 #include <stdbool.h>
 
@@ -35,7 +15,6 @@
 #include "shared-bindings/digitalio/DigitalInOut.h"
 #include "shared-bindings/util.h"
 #include "samd/timers.h"
-#include "supervisor/shared/translate.h"
 #include "timer_handler.h"
 
 
@@ -59,7 +38,7 @@ void pewpew_interrupt_handler(uint8_t index) {
     tc->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;
 }
 
-void pew_init() {
+void pew_init(void) {
     pew_obj_t *pew = MP_STATE_VM(pew_singleton);
 
     common_hal_digitalio_digitalinout_switch_to_input(pew->buttons, PULL_UP);
@@ -78,7 +57,7 @@ void pew_init() {
         // Find a spare timer.
         uint8_t index = find_free_timer();
         if (index == 0xff) {
-            mp_raise_RuntimeError(translate("All timers in use"));
+            mp_raise_RuntimeError(MP_ERROR_TEXT("All timers in use"));
         }
         Tc *tc = tc_insts[index];
 
@@ -118,14 +97,24 @@ void pew_init() {
     }
 }
 
-void pew_reset(void) {
-    if (pewpew_tc_index != 0xff) {
-        tc_reset(tc_insts[pewpew_tc_index]);
-        pewpew_tc_index = 0xff;
+void pew_deinit(void) {
+    if (pewpew_tc_index == 0xff) {
+        return;
     }
+    Tc *tc = tc_insts[pewpew_tc_index];
+    tc->COUNT16.INTENCLR.reg = TC_INTENCLR_MC0;
+    tc_disable_interrupts(pewpew_tc_index);
+    tc_reset(tc);
+    set_timer_handler(true, pewpew_tc_index, TC_HANDLER_NO_INTERRUPT);
+    turn_off_clocks(TIMER_TYPE_TC, pewpew_tc_index);
+    pewpew_tc_index = 0xff;
+}
+
+void pew_reset(void) {
+    pew_deinit();
     MP_STATE_VM(pew_singleton) = NULL;
 }
 
-uint16_t pew_get_ticks() {
+uint16_t pew_get_ticks(void) {
     return pewpew_ticks;
 }

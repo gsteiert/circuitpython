@@ -1,0 +1,151 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Mark Komus
+//
+// SPDX-License-Identifier: MIT
+
+#include "shared-bindings/microcontroller/Pin.h"
+#include "shared-bindings/adafruit_bus_device/spi_device/SPIDevice.h"
+#include "shared-bindings/util.h"
+#include "shared-module/adafruit_bus_device/spi_device/SPIDevice.h"
+#include "common-hal/digitalio/DigitalInOut.h"
+#include "shared-bindings/digitalio/DigitalInOut.h"
+
+
+#include "shared/runtime/buffer_helper.h"
+#include "shared/runtime/context_manager_helpers.h"
+#include "py/runtime.h"
+
+//| class SPIDevice:
+//|     """SPI Device Manager"""
+//|
+//|     def __init__(
+//|         self,
+//|         spi: busio.SPI,
+//|         chip_select: Optional[digitalio.DigitalInOut] = None,
+//|         *,
+//|         cs_active_value: bool = False,
+//|         baudrate: int = 100000,
+//|         polarity: int = 0,
+//|         phase: int = 0,
+//|         extra_clocks: int = 0,
+//|     ) -> None:
+//|         """
+//|         Represents a single SPI device and manages locking the bus and the device address.
+//|
+//|         :param ~busio.SPI spi: The SPI bus the device is on
+//|         :param ~digitalio.DigitalInOut chip_select: The chip select pin object that implements the DigitalInOut API. ``None`` if a chip select pin is not being used.
+//|         :param bool cs_active_value: Set to ``True`` if your device requires CS to be active high. Defaults to ``False``.
+//|         :param int baudrate: the desired clock rate in Hertz. The value is treated as a ceiling:
+//|           the actual clock rate may be lower due to the granularity of available clock settings,
+//|           but it will not exceed the given value.
+//|         :param int polarity: the base state of the clock line (0 or 1)
+//|         :param int phase: the edge of the clock that data is captured. First (0)
+//|           or second (1). Rising or falling depends on clock polarity.
+//|         :param int extra_clocks: The minimum number of clock cycles to cycle the bus after CS is high. (Used for SD cards.)
+//|
+//|         Example::
+//|
+//|             import busio
+//|             import digitalio
+//|             from board import *
+//|             from adafruit_bus_device.spi_device import SPIDevice
+//|             with busio.SPI(SCK, MOSI, MISO) as spi_bus:
+//|                 cs = digitalio.DigitalInOut(D10)
+//|                 device = SPIDevice(spi_bus, cs)
+//|                 bytes_read = bytearray(4)
+//|                 # The object assigned to spi in the with statements below
+//|                 # is the original spi_bus object. We are using the busio.SPI
+//|                 # operations busio.SPI.readinto() and busio.SPI.write().
+//|                 with device as spi:
+//|                     spi.readinto(bytes_read)
+//|                 # A second transaction
+//|                 with device as spi:
+//|                     spi.write(bytes_read)"""
+//|
+//|     ...
+//|
+static mp_obj_t adafruit_bus_device_spidevice_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *all_args) {
+    enum { ARG_spi, ARG_chip_select, ARG_cs_active_value, ARG_baudrate, ARG_polarity, ARG_phase, ARG_extra_clocks };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_spi, MP_ARG_REQUIRED | MP_ARG_OBJ },
+        { MP_QSTR_chip_select, MP_ARG_OBJ, {.u_obj = mp_const_none} },
+        { MP_QSTR_cs_active_value, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
+        { MP_QSTR_baudrate, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 100000} },
+        { MP_QSTR_polarity, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_phase, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_extra_clocks, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all_kw_array(n_args, n_kw, all_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
+
+    busio_spi_obj_t *spi = args[ARG_spi].u_obj;
+
+    mp_arg_validate_type_or_none(args[ARG_chip_select].u_obj, &digitalio_digitalinout_type, MP_QSTR_chip_select);
+
+    if (args[ARG_chip_select].u_obj != mp_const_none) {
+        digitalinout_result_t result =
+            common_hal_digitalio_digitalinout_switch_to_output(MP_OBJ_TO_PTR(args[ARG_chip_select].u_obj),
+                true,
+                DRIVE_MODE_PUSH_PULL);
+        #if CIRCUITPY_DIGITALIO_HAVE_INPUT_ONLY
+        if (result == DIGITALINOUT_INPUT_ONLY) {
+            mp_raise_NotImplementedError(MP_ERROR_TEXT("Pin is input only"));
+        }
+        #else
+        (void)result;
+        #endif
+    }
+
+    adafruit_bus_device_spidevice_obj_t *self =
+        mp_obj_malloc(adafruit_bus_device_spidevice_obj_t, &adafruit_bus_device_spidevice_type);
+    common_hal_adafruit_bus_device_spidevice_construct(MP_OBJ_TO_PTR(self),
+        spi,
+        args[ARG_chip_select].u_obj,
+        args[ARG_cs_active_value].u_bool,
+        args[ARG_baudrate].u_int,
+        args[ARG_polarity].u_int,
+        args[ARG_phase].u_int,
+        args[ARG_extra_clocks].u_int);
+
+
+    return MP_OBJ_FROM_PTR(self);
+}
+
+//|     def __enter__(self) -> busio.SPI:
+//|         """Starts a SPI transaction by configuring the SPI and asserting chip select."""
+//|         ...
+//|
+static mp_obj_t adafruit_bus_device_spidevice_obj___enter__(mp_obj_t self_in) {
+    adafruit_bus_device_spidevice_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    return common_hal_adafruit_bus_device_spidevice_enter(self);
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(adafruit_bus_device_spidevice___enter___obj, adafruit_bus_device_spidevice_obj___enter__);
+
+
+//|     def __exit__(self) -> None:
+//|         """Ends a SPI transaction by deasserting chip select. See
+//|         :ref:`lifetime-and-contextmanagers` for more info."""
+//|         ...
+//|
+//|
+static mp_obj_t adafruit_bus_device_spidevice_obj___exit__(size_t n_args, const mp_obj_t *args) {
+    common_hal_adafruit_bus_device_spidevice_exit(MP_OBJ_TO_PTR(args[0]));
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(adafruit_bus_device_spidevice___exit___obj, 4, 4, adafruit_bus_device_spidevice_obj___exit__);
+
+static const mp_rom_map_elem_t adafruit_bus_device_spidevice_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR___enter__), MP_ROM_PTR(&adafruit_bus_device_spidevice___enter___obj) },
+    { MP_ROM_QSTR(MP_QSTR___exit__), MP_ROM_PTR(&adafruit_bus_device_spidevice___exit___obj) },
+};
+
+static MP_DEFINE_CONST_DICT(adafruit_bus_device_spidevice_locals_dict, adafruit_bus_device_spidevice_locals_dict_table);
+
+MP_DEFINE_CONST_OBJ_TYPE(
+    adafruit_bus_device_spidevice_type,
+    MP_QSTR_SPIDevice,
+    MP_TYPE_FLAG_NONE,
+    make_new, adafruit_bus_device_spidevice_make_new,
+    locals_dict, &adafruit_bus_device_spidevice_locals_dict
+    );

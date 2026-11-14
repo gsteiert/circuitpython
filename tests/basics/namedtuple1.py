@@ -21,6 +21,9 @@ for t in T(1, 2), T(bar=1, foo=2):
 
     print(isinstance(t, tuple))
 
+    # a NamedTuple can be used as a tuple
+    print("(%d, %d)" % t)
+
     # Check tuple can compare equal to namedtuple with same elements
     print(t == (t[0], t[1]), (t[0], t[1]) == t)
 
@@ -68,6 +71,11 @@ try:
 except TypeError:
     print("TypeError")
 
+# Try single string
+T3 = namedtuple("TupComma", "foo bar")
+t = T3(1, 2)
+print(t.foo, t.bar)
+
 # Try tuple
 T4 = namedtuple("TupTuple", ("foo", "bar"))
 t = T4(1, 2)
@@ -77,3 +85,8 @@ print(t.foo, t.bar)
 # Not implemented so far
 #T2 = namedtuple("TupComma", "foo,bar")
 #t = T2(1, 2)
+
+# Creating an empty namedtuple should not segfault
+T5 = namedtuple("TupEmpty", [])
+t = T5()
+print(t)

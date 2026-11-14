@@ -1,3 +1,9 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2024 Adafruit Industries LLC
+//
+// SPDX-License-Identifier: MIT
+
 /**
  * \file
  *
@@ -154,9 +160,9 @@ static struct sd_mmc_card sd_mmc_cards[CONF_SD_MMC_MEM_CNT];
 
 /** HAL driver instance */
 static void *sd_mmc_hal;
-/** Index of current slot configurated */
+/** Index of current slot configured */
 static uint8_t sd_mmc_slot_sel;
-/** Pointer on current slot configurated */
+/** Pointer on current slot configured */
 static struct sd_mmc_card *sd_mmc_card;
 /** Number of block to read or write on the current transfer */
 static uint16_t sd_mmc_nb_block_to_tranfer = 0;
@@ -232,7 +238,7 @@ static bool mmc_mci_op_cond(void) {
     uint32_t retry, resp;
 
     /*
-     * Timeout 1s = 400KHz / ((6+6)*8) cylces = 4200 retry
+     * Timeout 1s = 400KHz / ((6+6)*8) cycles = 4200 retry
      * 6 = cmd byte size
      * 6 = response byte size
      */
@@ -271,7 +277,7 @@ static bool sd_mci_op_cond(uint8_t v2) {
     uint32_t arg, retry, resp;
 
     /*
-     * Timeout 1s = 400KHz / ((6+6+6+6)*8) cylces = 2100 retry
+     * Timeout 1s = 400KHz / ((6+6+6+6)*8) cycles = 2100 retry
      * 6 = cmd byte size
      * 6 = response byte size
      * 6 = cmd byte size
@@ -333,7 +339,7 @@ static bool sdio_op_cond(void) {
 
     /*
      * Wait card ready
-     * Timeout 1s = 400KHz / ((6+4)*8) cylces = 5000 retry
+     * Timeout 1s = 400KHz / ((6+4)*8) cycles = 5000 retry
      * 6 = cmd byte size
      * 4(SPI) 6(MCI) = response byte size
      */
@@ -1073,7 +1079,7 @@ static void sd_mmc_deselect_slot(void) {
  * \note
  * This function runs the initialization procedure and the identification
  * process, then it sets the SD/MMC card in transfer state.
- * At last, it will automaticly enable maximum bus width and transfer speed.
+ * At last, it will automatically enable maximum bus width and transfer speed.
  *
  * \return true if success, otherwise false
  */
@@ -1205,7 +1211,7 @@ static bool sd_mmc_mci_card_init(void) {
  * \note
  * This function runs the initialization procedure and the identification
  * process, then it sets the SD/MMC card in transfer state.
- * At last, it will automaticly enable maximum bus width and transfer speed.
+ * At last, it will automatically enable maximum bus width and transfer speed.
  *
  * \return true if success, otherwise false
  */
@@ -1270,7 +1276,7 @@ static bool sd_mmc_mci_install_mmc(void) {
     uint8_t retry = 10;
     while (retry--) {
         /* Retry is a WORKAROUND for no compliance card (Atmel Internal ref. MMC19):
-         * These cards seem not ready immediatly
+         * These cards seem not ready immediately
          * after the end of busy of mmc_cmd6_set_high_speed()*/
 
         /* Set default block size */
@@ -1286,13 +1292,13 @@ static bool sd_mmc_mci_install_mmc(void) {
 
 void sd_mmc_init(void *hal, sd_mmc_detect_t *card_detects, sd_mmc_detect_t *wp_detects) {
     /* GPIO will be used to detect card and write protect.
-     * The related clocks and pinmux must be configurated in good
+     * The related clocks and pinmux must be configured in good
      * condition. */
 
     for (uint8_t slot = 0; slot < CONF_SD_MMC_MEM_CNT; slot++) {
         sd_mmc_cards[slot].state = SD_MMC_CARD_STATE_NO_CARD;
     }
-    sd_mmc_slot_sel = 0xFF;     /* No slot configurated */
+    sd_mmc_slot_sel = 0xFF;     /* No slot configured */
     sd_mmc_hal = hal;
     _cd = card_detects;
     _wp = wp_detects;
@@ -1427,7 +1433,7 @@ sd_mmc_err_t sd_mmc_wait_end_of_read_blocks(bool abort) {
         return SD_MMC_OK;
     }
 
-    /* All blocks are transfered then stop read operation */
+    /* All blocks are transferred then stop read operation */
     if (sd_mmc_nb_block_to_tranfer == 1) {
         /* Single block transfer, then nothing to do */
         sd_mmc_deselect_slot();
@@ -1506,7 +1512,7 @@ sd_mmc_err_t sd_mmc_wait_end_of_write_blocks(bool abort) {
         return SD_MMC_OK;
     }
 
-    /* All blocks are transfered then stop write operation */
+    /* All blocks are transferred then stop write operation */
     if (sd_mmc_nb_block_to_tranfer == 1) {
         /* Single block transfer, then nothing to do */
         sd_mmc_deselect_slot();

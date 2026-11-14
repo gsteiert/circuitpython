@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,6 +29,7 @@
 #include <assert.h>
 #include "py/misc.h"
 #include "py/asmbase.h"
+#include "py/persistentcode.h"
 
 #define ASM_THUMB_REG_R0  (0)
 #define ASM_THUMB_REG_R1  (1)
@@ -69,6 +70,21 @@ typedef struct _asm_thumb_t {
     uint32_t push_reglist;
     uint32_t stack_adjust;
 } asm_thumb_t;
+
+#if MICROPY_DYNAMIC_COMPILER
+
+static inline bool asm_thumb_allow_armv7m(asm_thumb_t *as) {
+    return MP_NATIVE_ARCH_ARMV7M <= mp_dynamic_compiler.native_arch
+           && mp_dynamic_compiler.native_arch <= MP_NATIVE_ARCH_ARMV7EMDP;
+}
+
+#else
+
+static inline bool asm_thumb_allow_armv7m(asm_thumb_t *as) {
+    return MICROPY_EMIT_THUMB_ARMV7M;
+}
+
+#endif
 
 static inline void asm_thumb_end_pass(asm_thumb_t *as) {
     (void)as;
@@ -235,6 +251,50 @@ static inline void asm_thumb_bx_reg(asm_thumb_t *as, uint r_src) {
     asm_thumb_format_5(as, ASM_THUMB_FORMAT_5_BX, 0, r_src);
 }
 
+// FORMAT 7: load/store with register offset
+// FORMAT 8: load/store sign-extended byte/halfword
+
+#define ASM_THUMB_FORMAT_7_LDR (0x5800)
+#define ASM_THUMB_FORMAT_7_STR (0x5000)
+#define ASM_THUMB_FORMAT_7_WORD_TRANSFER (0x0000)
+#define ASM_THUMB_FORMAT_7_BYTE_TRANSFER (0x0400)
+#define ASM_THUMB_FORMAT_8_LDRH (0x5A00)
+#define ASM_THUMB_FORMAT_8_STRH (0x5200)
+
+#define ASM_THUMB_FORMAT_7_8_ENCODE(op, rlo_dest, rlo_base, rlo_index) \
+    ((op) | ((rlo_index) << 6) | ((rlo_base) << 3) | ((rlo_dest)))
+
+static inline void asm_thumb_format_7_8(asm_thumb_t *as, uint op, uint rlo_dest, uint rlo_base, uint rlo_index) {
+    assert(rlo_dest < ASM_THUMB_REG_R8);
+    assert(rlo_base < ASM_THUMB_REG_R8);
+    assert(rlo_index < ASM_THUMB_REG_R8);
+    asm_thumb_op16(as, ASM_THUMB_FORMAT_7_8_ENCODE(op, rlo_dest, rlo_base, rlo_index));
+}
+
+static inline void asm_thumb_ldrb_rlo_rlo_rlo(asm_thumb_t *as, uint rlo_dest, uint rlo_base, uint rlo_index) {
+    asm_thumb_format_7_8(as, ASM_THUMB_FORMAT_7_LDR | ASM_THUMB_FORMAT_7_BYTE_TRANSFER, rlo_dest, rlo_base, rlo_index);
+}
+
+static inline void asm_thumb_ldrh_rlo_rlo_rlo(asm_thumb_t *as, uint rlo_dest, uint rlo_base, uint rlo_index) {
+    asm_thumb_format_7_8(as, ASM_THUMB_FORMAT_8_LDRH, rlo_dest, rlo_base, rlo_index);
+}
+
+static inline void asm_thumb_ldr_rlo_rlo_rlo(asm_thumb_t *as, uint rlo_dest, uint rlo_base, uint rlo_index) {
+    asm_thumb_format_7_8(as, ASM_THUMB_FORMAT_7_LDR | ASM_THUMB_FORMAT_7_WORD_TRANSFER, rlo_dest, rlo_base, rlo_index);
+}
+
+static inline void asm_thumb_strb_rlo_rlo_rlo(asm_thumb_t *as, uint rlo_src, uint rlo_base, uint rlo_index) {
+    asm_thumb_format_7_8(as, ASM_THUMB_FORMAT_7_STR | ASM_THUMB_FORMAT_7_BYTE_TRANSFER, rlo_src, rlo_base, rlo_index);
+}
+
+static inline void asm_thumb_strh_rlo_rlo_rlo(asm_thumb_t *as, uint rlo_dest, uint rlo_base, uint rlo_index) {
+    asm_thumb_format_7_8(as, ASM_THUMB_FORMAT_8_STRH, rlo_dest, rlo_base, rlo_index);
+}
+
+static inline void asm_thumb_str_rlo_rlo_rlo(asm_thumb_t *as, uint rlo_src, uint rlo_base, uint rlo_index) {
+    asm_thumb_format_7_8(as, ASM_THUMB_FORMAT_7_STR | ASM_THUMB_FORMAT_7_WORD_TRANSFER, rlo_src, rlo_base, rlo_index);
+}
+
 // FORMAT 9: load/store with immediate offset
 // For word transfers the offset must be aligned, and >>2
 
@@ -257,24 +317,6 @@ static inline void asm_thumb_format_9_10(asm_thumb_t *as, uint op, uint rlo_dest
     asm_thumb_op16(as, ASM_THUMB_FORMAT_9_10_ENCODE(op, rlo_dest, rlo_base, offset));
 }
 
-static inline void asm_thumb_str_rlo_rlo_i5(asm_thumb_t *as, uint rlo_src, uint rlo_base, uint word_offset) {
-    asm_thumb_format_9_10(as, ASM_THUMB_FORMAT_9_STR | ASM_THUMB_FORMAT_9_WORD_TRANSFER, rlo_src, rlo_base, word_offset);
-}
-static inline void asm_thumb_strb_rlo_rlo_i5(asm_thumb_t *as, uint rlo_src, uint rlo_base, uint byte_offset) {
-    asm_thumb_format_9_10(as, ASM_THUMB_FORMAT_9_STR | ASM_THUMB_FORMAT_9_BYTE_TRANSFER, rlo_src, rlo_base, byte_offset);
-}
-static inline void asm_thumb_strh_rlo_rlo_i5(asm_thumb_t *as, uint rlo_src, uint rlo_base, uint byte_offset) {
-    asm_thumb_format_9_10(as, ASM_THUMB_FORMAT_10_STRH, rlo_src, rlo_base, byte_offset);
-}
-static inline void asm_thumb_ldr_rlo_rlo_i5(asm_thumb_t *as, uint rlo_dest, uint rlo_base, uint word_offset) {
-    asm_thumb_format_9_10(as, ASM_THUMB_FORMAT_9_LDR | ASM_THUMB_FORMAT_9_WORD_TRANSFER, rlo_dest, rlo_base, word_offset);
-}
-static inline void asm_thumb_ldrb_rlo_rlo_i5(asm_thumb_t *as, uint rlo_dest, uint rlo_base, uint byte_offset) {
-    asm_thumb_format_9_10(as, ASM_THUMB_FORMAT_9_LDR | ASM_THUMB_FORMAT_9_BYTE_TRANSFER, rlo_dest, rlo_base, byte_offset);
-}
-static inline void asm_thumb_ldrh_rlo_rlo_i5(asm_thumb_t *as, uint rlo_dest, uint rlo_base, uint byte_offset) {
-    asm_thumb_format_9_10(as, ASM_THUMB_FORMAT_10_LDRH, rlo_dest, rlo_base, byte_offset);
-}
 static inline void asm_thumb_lsl_rlo_rlo_i5(asm_thumb_t *as, uint rlo_dest, uint rlo_src, uint shift) {
     asm_thumb_format_1(as, ASM_THUMB_FORMAT_1_LSL, rlo_dest, rlo_src, shift);
 }
@@ -308,12 +350,7 @@ static inline void asm_thumb_sxth_rlo_rlo(asm_thumb_t *as, uint rlo_dest, uint r
 #define ASM_THUMB_OP_MOVT (0xf2c0)
 
 void asm_thumb_mov_reg_reg(asm_thumb_t *as, uint reg_dest, uint reg_src);
-
-#if MICROPY_EMIT_THUMB_ARMV7M
-size_t asm_thumb_mov_reg_i16(asm_thumb_t *as, uint mov_op, uint reg_dest, int i16_src);
-#else
-void asm_thumb_mov_rlo_i16(asm_thumb_t *as, uint rlo_dest, int i16_src);
-#endif
+void asm_thumb_mov_reg_i16(asm_thumb_t *as, uint mov_op, uint reg_dest, int i16_src);
 
 // these return true if the destination is in range, false otherwise
 bool asm_thumb_b_n_label(asm_thumb_t *as, uint label);
@@ -327,7 +364,10 @@ void asm_thumb_mov_reg_local(asm_thumb_t *as, uint rlo_dest, int local_num); // 
 void asm_thumb_mov_reg_local_addr(asm_thumb_t *as, uint rlo_dest, int local_num); // convenience
 void asm_thumb_mov_reg_pcrel(asm_thumb_t *as, uint rlo_dest, uint label);
 
-void asm_thumb_ldr_reg_reg_i12_optimised(asm_thumb_t *as, uint reg_dest, uint reg_base, uint byte_offset); // convenience
+// Generate optimised load dest, [src, #offset] sequence
+void asm_thumb_load_reg_reg_offset(asm_thumb_t *as, uint reg_dest, uint reg_base, uint offset, uint operation_size);
+// Generate optimised store src, [dest, #offset] sequence
+void asm_thumb_store_reg_reg_offset(asm_thumb_t *as, uint reg_src, uint reg_base, uint offset, uint operation_size);
 
 void asm_thumb_b_label(asm_thumb_t *as, uint label); // convenience: picks narrow or wide branch
 void asm_thumb_bcc_label(asm_thumb_t *as, int cc, uint label); // convenience: picks narrow or wide branch
@@ -338,6 +378,7 @@ void asm_thumb_b_rel12(asm_thumb_t *as, int rel);
 // Holds a pointer to mp_fun_table
 #define ASM_THUMB_REG_FUN_TABLE ASM_THUMB_REG_R7
 
+// CIRCUITPY-CHANGE: prevent #if warning
 #if defined(GENERIC_ASM_API) && GENERIC_ASM_API
 
 // The following macros provide a (mostly) arch-independent API to
@@ -363,12 +404,12 @@ void asm_thumb_b_rel12(asm_thumb_t *as, int rel);
 
 #define REG_FUN_TABLE ASM_THUMB_REG_FUN_TABLE
 
-#define ASM_T               asm_thumb_t
-#define ASM_END_PASS        asm_thumb_end_pass
-#define ASM_ENTRY           asm_thumb_entry
-#define ASM_EXIT            asm_thumb_exit
+#define ASM_T                           asm_thumb_t
+#define ASM_END_PASS                    asm_thumb_end_pass
+#define ASM_ENTRY(as, num_locals, name) asm_thumb_entry((as), (num_locals))
+#define ASM_EXIT                        asm_thumb_exit
 
-#define ASM_JUMP            asm_thumb_b_label
+#define ASM_JUMP                        asm_thumb_b_label
 #define ASM_JUMP_IF_REG_ZERO(as, reg, label, bool_test) \
     do { \
         asm_thumb_cmp_rlo_i8(as, reg, 0); \
@@ -389,17 +430,13 @@ void asm_thumb_b_rel12(asm_thumb_t *as, int rel);
 
 #define ASM_MOV_LOCAL_REG(as, local_num, reg) asm_thumb_mov_local_reg((as), (local_num), (reg))
 #define ASM_MOV_REG_IMM(as, reg_dest, imm) asm_thumb_mov_reg_i32_optimised((as), (reg_dest), (imm))
-#if MICROPY_EMIT_THUMB_ARMV7M
-#define ASM_MOV_REG_IMM_FIX_U16(as, reg_dest, imm) asm_thumb_mov_reg_i16((as), ASM_THUMB_OP_MOVW, (reg_dest), (imm))
-#else
-#define ASM_MOV_REG_IMM_FIX_U16(as, reg_dest, imm) asm_thumb_mov_rlo_i16((as), (reg_dest), (imm))
-#endif
-#define ASM_MOV_REG_IMM_FIX_WORD(as, reg_dest, imm) asm_thumb_mov_reg_i32((as), (reg_dest), (imm))
 #define ASM_MOV_REG_LOCAL(as, reg_dest, local_num) asm_thumb_mov_reg_local((as), (reg_dest), (local_num))
 #define ASM_MOV_REG_REG(as, reg_dest, reg_src) asm_thumb_mov_reg_reg((as), (reg_dest), (reg_src))
 #define ASM_MOV_REG_LOCAL_ADDR(as, reg_dest, local_num) asm_thumb_mov_reg_local_addr((as), (reg_dest), (local_num))
 #define ASM_MOV_REG_PCREL(as, rlo_dest, label) asm_thumb_mov_reg_pcrel((as), (rlo_dest), (label))
 
+#define ASM_NOT_REG(as, reg_dest) asm_thumb_mvn_rlo_rlo((as), (reg_dest), (reg_dest))
+#define ASM_NEG_REG(as, reg_dest) asm_thumb_neg_rlo_rlo((as), (reg_dest), (reg_dest))
 #define ASM_LSL_REG_REG(as, reg_dest, reg_shift) asm_thumb_format_4((as), ASM_THUMB_FORMAT_4_LSL, (reg_dest), (reg_shift))
 #define ASM_LSR_REG_REG(as, reg_dest, reg_shift) asm_thumb_format_4((as), ASM_THUMB_FORMAT_4_LSR, (reg_dest), (reg_shift))
 #define ASM_ASR_REG_REG(as, reg_dest, reg_shift) asm_thumb_format_4((as), ASM_THUMB_FORMAT_4_ASR, (reg_dest), (reg_shift))
@@ -410,17 +447,50 @@ void asm_thumb_b_rel12(asm_thumb_t *as, int rel);
 #define ASM_SUB_REG_REG(as, reg_dest, reg_src) asm_thumb_sub_rlo_rlo_rlo((as), (reg_dest), (reg_dest), (reg_src))
 #define ASM_MUL_REG_REG(as, reg_dest, reg_src) asm_thumb_format_4((as), ASM_THUMB_FORMAT_4_MUL, (reg_dest), (reg_src))
 
-#define ASM_LOAD_REG_REG(as, reg_dest, reg_base) asm_thumb_ldr_rlo_rlo_i5((as), (reg_dest), (reg_base), 0)
-#define ASM_LOAD_REG_REG_OFFSET(as, reg_dest, reg_base, word_offset) asm_thumb_ldr_reg_reg_i12_optimised((as), (reg_dest), (reg_base), (word_offset))
-#define ASM_LOAD8_REG_REG(as, reg_dest, reg_base) asm_thumb_ldrb_rlo_rlo_i5((as), (reg_dest), (reg_base), 0)
-#define ASM_LOAD16_REG_REG(as, reg_dest, reg_base) asm_thumb_ldrh_rlo_rlo_i5((as), (reg_dest), (reg_base), 0)
-#define ASM_LOAD32_REG_REG(as, reg_dest, reg_base) asm_thumb_ldr_rlo_rlo_i5((as), (reg_dest), (reg_base), 0)
+#define ASM_LOAD_REG_REG_OFFSET(as, reg_dest, reg_base, word_offset) ASM_LOAD32_REG_REG_OFFSET((as), (reg_dest), (reg_base), (word_offset))
+#define ASM_LOAD8_REG_REG(as, reg_dest, reg_base) ASM_LOAD8_REG_REG_OFFSET((as), (reg_dest), (reg_base), 0)
+#define ASM_LOAD8_REG_REG_OFFSET(as, reg_dest, reg_base, byte_offset) asm_thumb_load_reg_reg_offset((as), (reg_dest), (reg_base), (byte_offset), 0)
+#define ASM_LOAD16_REG_REG(as, reg_dest, reg_base) ASM_LOAD16_REG_REG_OFFSET((as), (reg_dest), (reg_base), 0)
+#define ASM_LOAD16_REG_REG_OFFSET(as, reg_dest, reg_base, halfword_offset) asm_thumb_load_reg_reg_offset((as), (reg_dest), (reg_base), (halfword_offset), 1)
+#define ASM_LOAD32_REG_REG(as, reg_dest, reg_base) ASM_LOAD32_REG_REG_OFFSET((as), (reg_dest), (reg_base), 0)
+#define ASM_LOAD32_REG_REG_OFFSET(as, reg_dest, reg_base, word_offset) asm_thumb_load_reg_reg_offset((as), (reg_dest), (reg_base), (word_offset), 2)
 
-#define ASM_STORE_REG_REG(as, reg_src, reg_base) asm_thumb_str_rlo_rlo_i5((as), (reg_src), (reg_base), 0)
-#define ASM_STORE_REG_REG_OFFSET(as, reg_src, reg_base, word_offset) asm_thumb_str_rlo_rlo_i5((as), (reg_src), (reg_base), (word_offset))
-#define ASM_STORE8_REG_REG(as, reg_src, reg_base) asm_thumb_strb_rlo_rlo_i5((as), (reg_src), (reg_base), 0)
-#define ASM_STORE16_REG_REG(as, reg_src, reg_base) asm_thumb_strh_rlo_rlo_i5((as), (reg_src), (reg_base), 0)
-#define ASM_STORE32_REG_REG(as, reg_src, reg_base) asm_thumb_str_rlo_rlo_i5((as), (reg_src), (reg_base), 0)
+#define ASM_STORE_REG_REG_OFFSET(as, reg_src, reg_base, word_offset) ASM_STORE32_REG_REG_OFFSET((as), (reg_src), (reg_base), (word_offset))
+#define ASM_STORE8_REG_REG(as, reg_src, reg_base) ASM_STORE8_REG_REG_OFFSET((as), (reg_src), (reg_base), 0)
+#define ASM_STORE8_REG_REG_OFFSET(as, reg_src, reg_base, byte_offset) asm_thumb_store_reg_reg_offset((as), (reg_src), (reg_base), (byte_offset), 0)
+#define ASM_STORE16_REG_REG(as, reg_src, reg_base) ASM_STORE16_REG_REG_OFFSET((as), (reg_src), (reg_base), 0)
+#define ASM_STORE16_REG_REG_OFFSET(as, reg_src, reg_base, halfword_offset) asm_thumb_store_reg_reg_offset((as), (reg_src), (reg_base), (halfword_offset), 1)
+#define ASM_STORE32_REG_REG(as, reg_src, reg_base) ASM_STORE32_REG_REG_OFFSET((as), (reg_src), (reg_base), 0)
+#define ASM_STORE32_REG_REG_OFFSET(as, reg_src, reg_base, word_offset) asm_thumb_store_reg_reg_offset((as), (reg_src), (reg_base), (word_offset), 2)
+
+#define ASM_LOAD8_REG_REG_REG(as, reg_dest, reg_base, reg_index) asm_thumb_ldrb_rlo_rlo_rlo((as), (reg_dest), (reg_base), (reg_index))
+#define ASM_LOAD16_REG_REG_REG(as, reg_dest, reg_base, reg_index) \
+    do { \
+        asm_thumb_lsl_rlo_rlo_i5((as), REG_TEMP2, (reg_index), 1); \
+        asm_thumb_ldrh_rlo_rlo_rlo((as), (reg_dest), (reg_base), REG_TEMP2); \
+    } while (0)
+#define ASM_LOAD32_REG_REG_REG(as, reg_dest, reg_base, reg_index) \
+    do { \
+        asm_thumb_lsl_rlo_rlo_i5((as), REG_TEMP2, (reg_index), 2); \
+        asm_thumb_ldr_rlo_rlo_rlo((as), (reg_dest), (reg_base), REG_TEMP2); \
+    } while (0)
+#define ASM_STORE8_REG_REG_REG(as, reg_val, reg_base, reg_index) asm_thumb_strb_rlo_rlo_rlo((as), (reg_val), (reg_base), (reg_index))
+#define ASM_STORE16_REG_REG_REG(as, reg_val, reg_base, reg_index) \
+    do { \
+        asm_thumb_op16((as), 0xB400 | (1 << reg_index)); \
+        asm_thumb_lsl_rlo_rlo_i5((as), (reg_index), (reg_index), 1); \
+        asm_thumb_strh_rlo_rlo_rlo((as), (reg_val), (reg_base), (reg_index)); \
+        asm_thumb_op16((as), 0xBC00 | (1 << reg_index)); \
+    } while (0)
+#define ASM_STORE32_REG_REG_REG(as, reg_val, reg_base, reg_index) \
+    do { \
+        asm_thumb_op16((as), 0xB400 | (1 << reg_index)); \
+        asm_thumb_lsl_rlo_rlo_i5((as), (reg_index), (reg_index), 2); \
+        asm_thumb_str_rlo_rlo_rlo((as), (reg_val), (reg_base), (reg_index)); \
+        asm_thumb_op16((as), 0xBC00 | (1 << reg_index)); \
+    } while (0)
+
+#define ASM_CLR_REG(as, reg_dest) asm_thumb_mov_rlo_i8((as), (reg_dest), 0)
 
 #endif // GENERIC_ASM_API
 

@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2020 Jeff Epler for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2020 Jeff Epler for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include <math.h>
 #include <string.h>
@@ -34,20 +14,21 @@
 
 #include "common-hal/canio/__init__.h"
 #include "common-hal/canio/Listener.h"
+#include "shared-bindings/canio/CAN.h"
 #include "shared-bindings/canio/Listener.h"
 #include "shared-bindings/util.h"
 #include "supervisor/shared/tick.h"
 #include "supervisor/shared/safe_mode.h"
 
-STATIC void allow_filter_change(canio_can_obj_t *can) {
+static void allow_filter_change(canio_can_obj_t *can) {
     can->filter_hw->FMR |= CAN_FMR_FINIT;
 }
 
-STATIC void prevent_filter_change(canio_can_obj_t *can) {
+static void prevent_filter_change(canio_can_obj_t *can) {
     can->filter_hw->FMR &= ~CAN_FMR_FINIT;
 }
 
-STATIC bool filter_in_use(canio_can_obj_t *can, int idx) {
+static bool filter_in_use(canio_can_obj_t *can, int idx) {
     return can->filter_hw->FA1R & (1 << idx);
 }
 
@@ -58,7 +39,7 @@ STATIC bool filter_in_use(canio_can_obj_t *can, int idx) {
 //  * four extended ids
 // However, stm needs two filters to permit RTR and non-RTR messages
 // so we ONLY use mask-type filter banks
-STATIC size_t num_filters_needed(size_t nmatch, canio_match_obj_t **matches) {
+static size_t num_filters_needed(size_t nmatch, canio_match_obj_t **matches) {
     if (nmatch == 0) {
         return 1;
     }
@@ -74,7 +55,7 @@ STATIC size_t num_filters_needed(size_t nmatch, canio_match_obj_t **matches) {
     return num_extended_mask + num_standard_mask / 2;
 }
 
-STATIC size_t num_filters_available(canio_can_obj_t *can) {
+static size_t num_filters_available(canio_can_obj_t *can) {
     size_t available = 0;
     for (size_t i = can->start_filter_bank; i < can->end_filter_bank; i++) {
         if (!filter_in_use(can, i)) {
@@ -84,7 +65,7 @@ STATIC size_t num_filters_available(canio_can_obj_t *can) {
     return available;
 }
 
-STATIC void clear_filters(canio_listener_obj_t *self) {
+static void clear_filters(canio_listener_obj_t *self) {
     canio_can_obj_t *can = self->can;
 
     allow_filter_change(can);
@@ -98,15 +79,14 @@ STATIC void clear_filters(canio_listener_obj_t *self) {
     prevent_filter_change(can);
 }
 
-STATIC int next_filter(canio_can_obj_t *can) {
+static int next_filter(canio_can_obj_t *can) {
     uint32_t fa1r = can->filter_hw->FA1R;
     for (size_t i = can->start_filter_bank; i < can->end_filter_bank; i++) {
         if (!(fa1r & (1 << i))) {
             return i;
         }
     }
-    reset_into_safe_mode(MICROPY_FATAL_ERROR);
-    return -1;
+    mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("%q"), MP_QSTR_Listener);
 }
 
 // IDE = "extended ID" flag of packet header.  We always add this bit to the
@@ -114,7 +94,7 @@ STATIC int next_filter(canio_can_obj_t *can) {
 #define FILTER16_IDE (1 << 3)
 #define FILTER32_IDE (1 << 2)
 
-STATIC void install_standard_filter(canio_listener_obj_t *self, canio_match_obj_t *match1, canio_match_obj_t *match2) {
+static void install_standard_filter(canio_listener_obj_t *self, canio_match_obj_t *match1, canio_match_obj_t *match2) {
     int bank = next_filter(self->can);
 
     // filter is already deactivated, so we skip deactivating it here
@@ -143,7 +123,7 @@ STATIC void install_standard_filter(canio_listener_obj_t *self, canio_match_obj_
     SET_BIT(self->can->filter_hw->FA1R, 1 << bank);
 }
 
-STATIC void install_extended_filter(canio_listener_obj_t *self, canio_match_obj_t *match) {
+static void install_extended_filter(canio_listener_obj_t *self, canio_match_obj_t *match) {
     int bank = next_filter(self->can);
 
     // filter is already deactivated, so we skip deactivating it here
@@ -170,7 +150,7 @@ STATIC void install_extended_filter(canio_listener_obj_t *self, canio_match_obj_
     SET_BIT(self->can->filter_hw->FA1R, 1 << bank);
 }
 
-STATIC void install_all_match_filter(canio_listener_obj_t *self) {
+static void install_all_match_filter(canio_listener_obj_t *self) {
     int bank = next_filter(self->can);
 
     // filter is already deactivated, so we skip deactivating it here
@@ -181,14 +161,14 @@ STATIC void install_all_match_filter(canio_listener_obj_t *self) {
 
     // filter mode: 0 = mask
     // (this bit should be clear already, we never set it; but just in case)
-    CLEAR_BIT(self->can->filter_hw->FM1R, bank);
+    CLEAR_BIT(self->can->filter_hw->FM1R, 1 << bank);
     // filter scale: 1 = 32 bits
-    SET_BIT(self->can->filter_hw->FS1R, bank);
+    SET_BIT(self->can->filter_hw->FS1R, 1 << bank);
     // fifo assignment: 1 = FIFO 1
     if (self->fifo_idx) {
-        SET_BIT(self->can->filter_hw->FFA1R, bank);
+        SET_BIT(self->can->filter_hw->FFA1R, 1 << bank);
     } else {
-        CLEAR_BIT(self->can->filter_hw->FFA1R, bank);
+        CLEAR_BIT(self->can->filter_hw->FFA1R, 1 << bank);
     }
 
     // filter activation: 1 = enabled
@@ -224,23 +204,28 @@ void set_filters(canio_listener_obj_t *self, size_t nmatch, canio_match_obj_t **
 
 
 void common_hal_canio_listener_construct(canio_listener_obj_t *self, canio_can_obj_t *can, size_t nmatch, canio_match_obj_t **matches, float timeout) {
+    int fifo_idx;
     if (!can->fifo0_in_use) {
-        self->fifo_idx = 0;
-        self->rfr = &can->handle.Instance->RF0R;
-        can->fifo0_in_use = true;
+        fifo_idx = 0;
     } else if (!can->fifo1_in_use) {
-        self->fifo_idx = 1;
-        self->rfr = &can->handle.Instance->RF1R;
-        can->fifo1_in_use = true;
+        fifo_idx = 1;
     } else {
-        mp_raise_ValueError(translate("All RX FIFOs in use"));
+        mp_raise_ValueError(MP_ERROR_TEXT("All RX FIFOs in use"));
     }
 
     if (num_filters_needed(nmatch, matches) > num_filters_available(can)) {
-        mp_raise_ValueError(translate("Filters too complex"));
+        mp_raise_ValueError(MP_ERROR_TEXT("Filters too complex"));
     }
 
-    // Nothing can fail now so it's safe to assign self->can
+    // Nothing can fail now so it's safe to claim the FIFO and assign self->can
+    self->fifo_idx = fifo_idx;
+    if (fifo_idx == 0) {
+        self->rfr = &can->handle.Instance->RF0R;
+        can->fifo0_in_use = true;
+    } else {
+        self->rfr = &can->handle.Instance->RF1R;
+        can->fifo1_in_use = true;
+    }
     self->can = can;
 
     self->mailbox = &can->handle.Instance->sFIFOMailBox[self->fifo_idx];
@@ -286,8 +271,8 @@ mp_obj_t common_hal_canio_listener_receive(canio_listener_obj_t *self) {
     uint32_t rdtr = self->mailbox->RDTR;
 
     bool rtr = rir & CAN_RI0R_RTR;
-    canio_message_obj_t *message = m_new_obj(canio_message_obj_t);
-    message->base.type = rtr ? &canio_remote_transmission_request_type : &canio_message_type;
+    canio_message_obj_t *message =
+        mp_obj_malloc(canio_message_obj_t, rtr ? &canio_remote_transmission_request_type : &canio_message_type);
     message->extended = rir & CAN_RI0R_IDE;
     if (message->extended) {
         message->id = rir >> 3;
@@ -306,7 +291,7 @@ mp_obj_t common_hal_canio_listener_receive(canio_listener_obj_t *self) {
 }
 
 void common_hal_canio_listener_deinit(canio_listener_obj_t *self) {
-    if (self->can) {
+    if (self->can && !common_hal_canio_can_deinited(self->can)) {
         clear_filters(self);
         if (self->fifo_idx == 0) {
             self->can->fifo0_in_use = false;

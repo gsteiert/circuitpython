@@ -1,33 +1,14 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2016 Scott Shawcroft
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2016 Scott Shawcroft
+//
+// SPDX-License-Identifier: MIT
 
-#ifndef MICROPY_INCLUDED_SHARED_BINDINGS_BUSIO_SPI_H
-#define MICROPY_INCLUDED_SHARED_BINDINGS_BUSIO_SPI_H
+#pragma once
 
 #include "py/obj.h"
+#include "py/runtime.h"
+#include "supervisor/shared/async_flag.h"
 
 #include "common-hal/microcontroller/Pin.h"
 #include "common-hal/busio/SPI.h"
@@ -35,13 +16,24 @@
 // Type object used in Python. Should be shared between ports.
 extern const mp_obj_type_t busio_spi_type;
 
+// Argument tables, also used by async_spi.SPI, which takes the same arguments.
+extern const mp_arg_t busio_spi_make_new_args[4];      // clock, MOSI, MISO, half_duplex
+extern const mp_arg_t busio_spi_configure_args[4];
+extern const mp_arg_t busio_spi_write_args[3];
+extern const mp_arg_t busio_spi_readinto_args[4];
+extern const mp_arg_t busio_spi_write_readinto_args[6];
+
 // Construct an underlying SPI object.
 extern void common_hal_busio_spi_construct(busio_spi_obj_t *self,
     const mcu_pin_obj_t *clock, const mcu_pin_obj_t *mosi,
-    const mcu_pin_obj_t *miso);
+    const mcu_pin_obj_t *miso, bool half_duplex);
 
 extern void common_hal_busio_spi_deinit(busio_spi_obj_t *self);
 extern bool common_hal_busio_spi_deinited(busio_spi_obj_t *self);
+
+// Mark as deinit without deiniting. This is used by displayio after copying the
+// object elsewhere and prevents the heap from deiniting the object.
+extern void common_hal_busio_spi_mark_deinit(busio_spi_obj_t *self);
 
 extern bool common_hal_busio_spi_configure(busio_spi_obj_t *self, uint32_t baudrate, uint8_t polarity, uint8_t phase, uint8_t bits);
 
@@ -51,6 +43,17 @@ extern void common_hal_busio_spi_unlock(busio_spi_obj_t *self);
 
 // Writes out the given data.
 extern bool common_hal_busio_spi_write(busio_spi_obj_t *self, const uint8_t *data, size_t len);
+
+#if CIRCUITPY_BUSIO_SPI_ASYNC
+// Start writing data and return, possibly before it has been sent. *done is set once it has been
+// sent, at the latest by common_hal_busio_spi_end(). data must stay valid and unchanged, and
+// the bus must not be used, until then.
+extern void common_hal_busio_spi_write_start(busio_spi_obj_t *self, const uint8_t *data, size_t len,
+    circuitpy_async_flag_t *done);
+// Finish the transfer started by a common_hal_busio_spi_*_start(), waiting if needed. Returns
+// at once if there is none.
+extern void common_hal_busio_spi_end(busio_spi_obj_t *self);
+#endif
 
 // Reads in len bytes while outputting the byte write_value.
 extern bool common_hal_busio_spi_read(busio_spi_obj_t *self, uint8_t *data, size_t len, uint8_t write_value);
@@ -67,9 +70,8 @@ uint8_t common_hal_busio_spi_get_phase(busio_spi_obj_t *self);
 // Return SPI bus polarity.
 uint8_t common_hal_busio_spi_get_polarity(busio_spi_obj_t *self);
 
-// This is used by the supervisor to claim SPI devices indefinitely.
-extern void common_hal_busio_spi_never_reset(busio_spi_obj_t *self);
+extern busio_spi_obj_t *validate_obj_is_spi_bus(mp_obj_t obj_in, qstr arg_name);
 
-extern busio_spi_obj_t *validate_obj_is_spi_bus(mp_obj_t obj_in);
-
-#endif // MICROPY_INCLUDED_SHARED_BINDINGS_BUSIO_SPI_H
+// Wait as long as needed for the lock. This is used by SD card access from USB.
+// For most ports, busy-wait while running the background tasks.
+MP_WEAK bool common_hal_busio_spi_wait_for_lock(busio_spi_obj_t *self, uint32_t timeout_ms);

@@ -1,9 +1,15 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2019 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
+
 #include "shared-bindings/board/__init__.h"
 
 #include "supervisor/board.h"
 #include "shared-module/displayio/__init__.h"
 
-STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
+static const mp_rom_map_elem_t board_module_globals_table[] = {
     CIRCUITPYTHON_BOARD_DICT_STANDARD_ITEMS
 
     { MP_OBJ_NEW_QSTR(MP_QSTR_SPEAKER),  MP_ROM_PTR(&pin_PA02) },
@@ -48,6 +54,7 @@ STATIC const mp_rom_map_elem_t board_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_LEFT_TFT_DC), MP_ROM_PTR(&pin_PB22) },
 
     { MP_ROM_QSTR(MP_QSTR_I2C), MP_ROM_PTR(&board_i2c_obj) },
+    { MP_ROM_QSTR(MP_QSTR_STEMMA_I2C), MP_ROM_PTR(&board_i2c_obj) },
 
     { MP_ROM_QSTR(MP_QSTR_DISPLAY), MP_ROM_PTR(&displays[0].display)},
     { MP_ROM_QSTR(MP_QSTR_RIGHT_DISPLAY), MP_ROM_PTR(&displays[0].display)}

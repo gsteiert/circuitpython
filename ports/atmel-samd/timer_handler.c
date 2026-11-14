@@ -1,33 +1,16 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Scott Shawcroft for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "timer_handler.h"
+
+#include "samd/clocks.h"
+#include "samd/timers.h"
 
 #include "common-hal/pulseio/PulseIn.h"
 #include "common-hal/pulseio/PulseOut.h"
@@ -37,6 +20,86 @@
 extern void _PM_IRQ_HANDLER(void);
 
 static uint8_t tc_handler[TC_INST_NUM];
+
+// Find the APB mask register and bit that clock a timer. turn_on_clocks() sets this bit.
+static volatile uint32_t *apb_mask(timer_type_t timer_type, uint8_t index, uint32_t *bit) {
+    #ifdef SAM_D5X_E5X
+    if (timer_type == TIMER_TYPE_TC) {
+        switch (index) {
+            case 0:
+                *bit = MCLK_APBAMASK_TC0;
+                return &MCLK->APBAMASK.reg;
+            case 1:
+                *bit = MCLK_APBAMASK_TC1;
+                return &MCLK->APBAMASK.reg;
+            case 2:
+                *bit = MCLK_APBBMASK_TC2;
+                return &MCLK->APBBMASK.reg;
+            case 3:
+                *bit = MCLK_APBBMASK_TC3;
+                return &MCLK->APBBMASK.reg;
+            case 4:
+                *bit = MCLK_APBCMASK_TC4;
+                return &MCLK->APBCMASK.reg;
+            case 5:
+                *bit = MCLK_APBCMASK_TC5;
+                return &MCLK->APBCMASK.reg;
+            case 6:
+                *bit = MCLK_APBDMASK_TC6;
+                return &MCLK->APBDMASK.reg;
+            default:
+                *bit = MCLK_APBDMASK_TC7;
+                return &MCLK->APBDMASK.reg;
+        }
+    }
+    switch (index) {
+        case 0:
+            *bit = MCLK_APBBMASK_TCC0;
+            return &MCLK->APBBMASK.reg;
+        case 1:
+            *bit = MCLK_APBBMASK_TCC1;
+            return &MCLK->APBBMASK.reg;
+        case 2:
+            *bit = MCLK_APBCMASK_TCC2;
+            return &MCLK->APBCMASK.reg;
+        case 3:
+            *bit = MCLK_APBCMASK_TCC3;
+            return &MCLK->APBCMASK.reg;
+        default:
+            *bit = MCLK_APBDMASK_TCC4;
+            return &MCLK->APBDMASK.reg;
+    }
+    #else
+    // TCC0 is APBC slot 8. TC3, which is TC index 0, is slot 11.
+    *bit = 1 << (8 + index + (timer_type == TIMER_TYPE_TC ? 3 : 0));
+    return &PM->APBCMASK.reg;
+    #endif
+}
+
+static bool apb_clock_enabled(timer_type_t timer_type, uint8_t index) {
+    uint32_t bit;
+    return (*apb_mask(timer_type, index, &bit) & bit) != 0;
+}
+
+void turn_off_clocks(timer_type_t timer_type, uint8_t index) {
+    uint32_t bit;
+    *apb_mask(timer_type, index, &bit) &= ~bit;
+
+    // Most timers share a GCLK peripheral channel with one other timer. Leave the channel on while
+    // any timer on it still has its APB clock.
+    uint8_t gclk_id = timer_type == TIMER_TYPE_TC ? tc_gclk_ids[index] : tcc_gclk_ids[index];
+    for (uint8_t i = 0; i < TC_INST_NUM; i++) {
+        if (tc_gclk_ids[i] == gclk_id && apb_clock_enabled(TIMER_TYPE_TC, i)) {
+            return;
+        }
+    }
+    for (uint8_t i = 0; i < TCC_INST_NUM; i++) {
+        if (tcc_gclk_ids[i] == gclk_id && apb_clock_enabled(TIMER_TYPE_TCC, i)) {
+            return;
+        }
+    }
+    disconnect_gclk_from_peripheral(0, gclk_id);
+}
 
 void set_timer_handler(bool is_tc, uint8_t index, uint8_t timer_handler) {
     if (is_tc) {

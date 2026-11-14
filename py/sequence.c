@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  * Copyright (c) 2014 Paul Sokolovsky
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -28,24 +28,19 @@
 #include <string.h>
 
 #include "py/runtime.h"
-#include "supervisor/shared/translate.h"
 
 // Helpers for sequence types
 
 #define SWAP(type, var1, var2) { type t = var2; var2 = var1; var1 = t; }
 
-#if __GNUC__ < 5
-// n.b. does not actually detect overflow!
-#define __builtin_mul_overflow(a, b, x) (*(x) = (a) * (b), false)
-#endif
-
+// CIRCUITPY-CHANGE: detect sequence overflow
 // Detect when a multiply causes an overflow.
 size_t mp_seq_multiply_len(size_t item_sz, size_t len) {
-    size_t new_len;
-    if (__builtin_mul_overflow(item_sz, len, &new_len)) {
+    mp_int_t new_len;
+    if (mp_mul_mp_int_t_overflow(item_sz, len, &new_len)) {
         mp_raise_msg(&mp_type_OverflowError, MP_ERROR_TEXT("small int overflow"));
     }
-    return new_len;
+    return (size_t)new_len;
 }
 
 // Implements backend of sequence * integer operation. Assumes elements are
@@ -78,11 +73,7 @@ bool mp_seq_get_fast_slice_indexes(mp_uint_t len, mp_obj_t slice, mp_bound_slice
     return indexes->step == 1;
 }
 
-#endif
-
-mp_obj_t mp_seq_extract_slice(size_t len, const mp_obj_t *seq, mp_bound_slice_t *indexes) {
-    (void)len; // TODO can we remove len from the arg list?
-
+mp_obj_t mp_seq_extract_slice(const mp_obj_t *seq, mp_bound_slice_t *indexes) {
     mp_int_t start = indexes->start, stop = indexes->stop;
     mp_int_t step = indexes->step;
 
@@ -101,6 +92,8 @@ mp_obj_t mp_seq_extract_slice(size_t len, const mp_obj_t *seq, mp_bound_slice_t 
     }
     return res;
 }
+
+#endif
 
 // Special-case comparison function for sequences of bytes
 // Don't pass MP_BINARY_OP_NOT_EQUAL here
@@ -171,7 +164,7 @@ bool mp_seq_cmp_objs(mp_uint_t op, const mp_obj_t *items1, size_t len1, const mp
             continue;
         }
 
-        // Othewise, if they are not equal, we can have final decision based on them
+        // Otherwise, if they are not equal, we can have final decision based on them
         if (op == MP_BINARY_OP_EQUAL) {
             // In particular, if we are checking for equality, here're the answer
             return false;

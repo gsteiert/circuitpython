@@ -1,60 +1,34 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Lucian Copeland for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Lucian Copeland for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include <stdbool.h>
 #include "py/mpconfig.h"
-#include "py/gc.h"
-#include "py/obj.h"
-#include "py/runtime.h"
+#include "py/misc.h"
 
 #include "peripherals/exti.h"
 
 #if !(CPY_STM32H7)
 
-STATIC bool stm_exti_reserved[STM32_GPIO_PORT_SIZE];
-STATIC bool stm_exti_never_reset[STM32_GPIO_PORT_SIZE];
-STATIC void (*stm_exti_callback[STM32_GPIO_PORT_SIZE])(uint8_t num);
+static bool stm_exti_reserved[STM32_GPIO_PORT_SIZE];
+static void (*stm_exti_callback[STM32_GPIO_PORT_SIZE])(uint8_t num);
+// Bitmask of lines whose interrupt is enabled.
+static uint16_t stm_exti_enabled;
 
-void exti_reset(void) {
-    for (size_t i = 0; i < STM32_GPIO_PORT_SIZE; i++) {
-        if (!stm_exti_never_reset[i]) {
-            stm_exti_reserved[i] = false;
-            stm_exti_callback[i] = NULL;
-            stm_peripherals_exti_disable(i);
-        }
+// Lines 5-9 and 10-15 each share one NVIC IRQ.
+static uint16_t irq_lines_mask(uint8_t num) {
+    if (num >= 5 && num <= 9) {
+        return 0x03e0;
+    } else if (num >= 10 && num <= 15) {
+        return 0xfc00;
     }
-}
-
-void stm_peripherals_exti_never_reset(uint8_t num) {
-    stm_exti_never_reset[num] = true;
+    return 1 << num;
 }
 
 void stm_peripherals_exti_reset_exti(uint8_t num) {
     stm_peripherals_exti_disable(num);
-    stm_exti_never_reset[num] = false;
     stm_exti_reserved[num] = false;
     stm_exti_callback[num] = NULL;
 }
@@ -72,19 +46,19 @@ bool stm_peripherals_exti_reserve(uint8_t num) {
 }
 
 void stm_peripherals_exti_enable(uint8_t num) {
+    stm_exti_enabled |= 1 << num;
     HAL_NVIC_EnableIRQ(stm_peripherals_exti_get_irq(num));
 }
 
 void stm_peripherals_exti_disable(uint8_t num) {
-    HAL_NVIC_DisableIRQ(stm_peripherals_exti_get_irq(num));
+    stm_exti_enabled &= ~(1 << num);
+    if ((stm_exti_enabled & irq_lines_mask(num)) == 0) {
+        HAL_NVIC_DisableIRQ(stm_peripherals_exti_get_irq(num));
+    }
 }
 
 void stm_peripherals_exti_set_callback(void (*callback)(uint8_t num), uint8_t number) {
     stm_exti_callback[number] = callback;
-}
-
-void stm_peripherals_exti_free(uint8_t num) {
-    stm_exti_reserved[num] = true;
 }
 
 IRQn_Type stm_peripherals_exti_get_irq(uint8_t num) {
@@ -107,45 +81,48 @@ IRQn_Type stm_peripherals_exti_get_irq(uint8_t num) {
     }
 }
 
-void EXTI0_IRQHandler(void) {
-    stm_exti_callback[0](0);
-}
-void EXTI1_IRQHandler(void) {
-    stm_exti_callback[1](1);
-}
-void EXTI2_IRQHandler(void) {
-    stm_exti_callback[2](2);
-}
-void EXTI3_IRQHandler(void) {
-    stm_exti_callback[3](3);
-}
-void EXTI4_IRQHandler(void) {
-    stm_exti_callback[4](4);
-}
-
 #ifdef STM32L4
 #define PR PR1
 #endif
-void EXTI9_5_IRQHandler(void) {
+static void exti_irq_handler(uint8_t first, uint8_t last) {
     uint32_t pending = EXTI->PR;
-    for (uint i = 5; i <= 9; i++) {
-        if (pending & (1 << i)) {
-            stm_exti_callback[i](i);
+    for (uint8_t i = first; i <= last; i++) {
+        if (!(pending & (1 << i))) {
+            continue;
         }
-    }
-}
-
-void EXTI15_10_IRQHandler(void) {
-    uint32_t pending = EXTI->PR;
-    for (uint i = 10; i <= 15; i++) {
-        if (pending & (1 << i)) {
+        if ((stm_exti_enabled & (1 << i)) && stm_exti_callback[i] != NULL) {
             stm_exti_callback[i](i);
+        } else {
+            // No one is handling this line: clear it so the IRQ does not fire again.
+            EXTI->PR = 1 << i;
         }
     }
 }
 #ifdef STM32L4
 #undef PR
 #endif
+
+void EXTI0_IRQHandler(void) {
+    exti_irq_handler(0, 0);
+}
+void EXTI1_IRQHandler(void) {
+    exti_irq_handler(1, 1);
+}
+void EXTI2_IRQHandler(void) {
+    exti_irq_handler(2, 2);
+}
+void EXTI3_IRQHandler(void) {
+    exti_irq_handler(3, 3);
+}
+void EXTI4_IRQHandler(void) {
+    exti_irq_handler(4, 4);
+}
+void EXTI9_5_IRQHandler(void) {
+    exti_irq_handler(5, 9);
+}
+void EXTI15_10_IRQHandler(void) {
+    exti_irq_handler(10, 15);
+}
 
 
 #endif

@@ -1,28 +1,8 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2021 Jeff Epler for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2021 Jeff Epler for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "py/obj.h"
 #include "py/runtime.h"
@@ -50,34 +30,34 @@
 #define PIN_PCC_CLK (PIN_PA14)
 
 void common_hal_imagecapture_parallelimagecapture_construct(imagecapture_parallelimagecapture_obj_t *self,
-    const uint8_t data_pins[],
+    const mcu_pin_obj_t **data_pins,
     uint8_t data_count,
     const mcu_pin_obj_t *data_clock,
     const mcu_pin_obj_t *vertical_sync,
     const mcu_pin_obj_t *horizontal_reference) {
 
     for (int i = 0; i < data_count; i++) {
-        if (data_pins[i] != PIN_PCC_D0 + i) {
-            mp_raise_ValueError_varg(translate("Invalid data_pins[%d]"), i);
+        if (common_hal_mcu_pin_number(data_pins[i]) != PIN_PCC_D0 + i) {
+            mp_raise_ValueError_varg(MP_ERROR_TEXT("Invalid data_pins[%d]"), i);
         }
     }
     // The peripheral supports 8, 10, 12, or 14 data bits, but the code only supports 8 at present
     if (data_count != 8) {
-        mp_raise_ValueError_varg(translate("Invalid data_count %d"), data_count);
+        mp_arg_error_invalid(MP_QSTR_datacount);
     }
     if (vertical_sync && vertical_sync->number != PIN_PCC_DEN1) {
-        mp_raise_ValueError_varg(translate("Invalid %q pin"), MP_QSTR_vsync);
+        raise_ValueError_invalid_pin_name(MP_QSTR_vsync);
     }
     if (horizontal_reference && horizontal_reference->number != PIN_PCC_DEN2) {
-        mp_raise_ValueError_varg(translate("Invalid %q pin"), MP_QSTR_href);
+        raise_ValueError_invalid_pin_name(MP_QSTR_href);
     }
     if (data_clock->number != PIN_PCC_CLK) {
-        mp_raise_ValueError_varg(translate("Invalid %q pin"), MP_QSTR_data_clock);
+        raise_ValueError_invalid_pin_name(MP_QSTR_data_clock);
     }
     // technically, 0 was validated as free already but check again
     for (int i = 0; i < data_count; i++) {
-        if (!pin_number_is_free(data_pins[i])) {
-            mp_raise_ValueError_varg(translate("data pin #%d in use"), i);
+        if (!pin_number_is_free(common_hal_mcu_pin_number(data_pins[i]))) {
+            mp_raise_ValueError_varg(MP_ERROR_TEXT("data pin #%d in use"), i);
         }
     }
 
@@ -101,24 +81,24 @@ void common_hal_imagecapture_parallelimagecapture_construct(imagecapture_paralle
     gpio_set_pin_direction(PIN_PCC_CLK, GPIO_DIRECTION_IN);
     gpio_set_pin_pull_mode(PIN_PCC_CLK, GPIO_PULL_OFF);
     gpio_set_pin_function(PIN_PCC_CLK, GPIO_PIN_FUNCTION_PCC);
-    // claim_pin_number(PIN_PCC_CLK);
+    claim_pin_number(PIN_PCC_CLK);
     if (vertical_sync) {
         gpio_set_pin_direction(PIN_PCC_DEN1, GPIO_DIRECTION_IN);
         gpio_set_pin_pull_mode(PIN_PCC_DEN1, GPIO_PULL_OFF);
         gpio_set_pin_function(PIN_PCC_DEN1, GPIO_PIN_FUNCTION_PCC); // VSYNC
-        // claim_pin_number(PIN_PCC_DEN1);
+        claim_pin_number(PIN_PCC_DEN1);
     }
     if (horizontal_reference) {
         gpio_set_pin_direction(PIN_PCC_DEN2, GPIO_DIRECTION_IN);
         gpio_set_pin_pull_mode(PIN_PCC_DEN2, GPIO_PULL_OFF);
         gpio_set_pin_function(PIN_PCC_DEN2, GPIO_PIN_FUNCTION_PCC); // HSYNC
-        // claim_pin_number(PIN_PCC_DEN2);
+        claim_pin_number(PIN_PCC_DEN2);
     }
     for (int i = 0; i < data_count; i++) {
         gpio_set_pin_direction(PIN_PCC_D0 + i, GPIO_DIRECTION_IN);
         gpio_set_pin_pull_mode(PIN_PCC_D0 + i, GPIO_PULL_OFF);
         gpio_set_pin_function(PIN_PCC_D0 + i, GPIO_PIN_FUNCTION_PCC);
-        // claim_pin_number(PIN_PCC_D0+i);
+        claim_pin_number(PIN_PCC_D0 + i);
     }
 }
 
@@ -132,6 +112,14 @@ void common_hal_imagecapture_parallelimagecapture_deinit(imagecapture_parallelim
     for (int i = 0; i < self->data_count; i++) {
         reset_pin_number(PIN_PCC_D0 + i);
     }
+    self->vertical_sync = NO_PIN;
+    self->horizontal_reference = NO_PIN;
+
+    // Disable and power down the PCC peripheral.
+    PCC->MR.bit.PCEN = 0;
+    PCC->IDR.reg = 0b1111;
+    MCLK->APBDMASK.bit.PCC_ = 0;
+
     self->data_count = 0;
 }
 
@@ -155,7 +143,8 @@ void common_hal_imagecapture_parallelimagecapture_singleshot_capture(imagecaptur
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(buffer, &bufinfo, MP_BUFFER_RW);
 
-    uint8_t dma_channel = dma_allocate_channel();
+    // Allocate a permanent channel (not really audio).
+    uint8_t dma_channel = dma_allocate_audio_channel();
 
     uint32_t *dest = bufinfo.buf;
     size_t count = bufinfo.len / 4; // PCC receives 4 bytes (2 pixels) at a time

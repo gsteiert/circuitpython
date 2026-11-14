@@ -1,28 +1,8 @@
-/*
- * This file is part of the Micro Python project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * Copyright (c) 2017 Dan Halbert for Adafruit Industries
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2017 Dan Halbert for Adafruit Industries
+//
+// SPDX-License-Identifier: MIT
 
 #include "shared-bindings/microcontroller/__init__.h"
 #include "shared-bindings/microcontroller/Processor.h"
@@ -30,9 +10,17 @@
 #include <math.h>
 #include <stdint.h>
 
-#include "py/objproperty.h"
+#include "shared-bindings/util.h"
 
+#include "shared/runtime/buffer_helper.h"
+#include "shared/runtime/context_manager_helpers.h"
+#include "py/mperrno.h"
+#include "py/objtype.h"
+#include "py/objproperty.h"
+#include "py/objstr.h"
+#include "py/persistentcode.h"
 #include "py/runtime.h"
+
 
 //| class Processor:
 //|     """Microcontroller CPU information and control
@@ -58,64 +46,103 @@
 //|         ...
 //|
 
-//|     frequency: int
-//|     """The CPU operating frequency in Hertz. (read-only)"""
+//|     architecture: Optional[str]
+//|     """The native ``.mpy`` architecture this build can load, as a `str`. (read-only)
 //|
-STATIC mp_obj_t mcu_processor_get_frequency(mp_obj_t self) {
+//|     This is the name ``mpy-cross`` takes for ``-march``, such as ``"armv6m"``,
+//|     ``"armv7emsp"``, ``"xtensawin"`` or ``"rv32imc"``.
+//|
+//|     Is `None` if this build cannot load native code from ``.mpy`` files.
+//|     """
+#if MICROPY_PERSISTENT_CODE_LOAD_NATIVE
+static const MP_DEFINE_STR_OBJ(mcu_processor_architecture_str_obj, MPY_FEATURE_ARCH_NAME);
+#endif
+
+static mp_obj_t mcu_processor_get_architecture(mp_obj_t self) {
+    #if MICROPY_PERSISTENT_CODE_LOAD_NATIVE
+    return MP_OBJ_FROM_PTR(&mcu_processor_architecture_str_obj);
+    #else
+    return mp_const_none;
+    #endif
+}
+
+MP_DEFINE_CONST_FUN_OBJ_1(mcu_processor_get_architecture_obj, mcu_processor_get_architecture);
+
+MP_PROPERTY_GETTER(mcu_processor_architecture_obj,
+    (mp_obj_t)&mcu_processor_get_architecture_obj);
+
+//|     frequency: int
+//|     """The CPU operating frequency in Hertz.
+//|
+//|     **Limitations:** On most boards, ``frequency`` is read-only. Setting
+//|     the ``frequency`` is possible on RP2040 boards, some ESP32 boards and some i.MX boards.
+//|
+//|     .. warning:: Overclocking likely voids your warranties and may reduce
+//|       the lifetime of the chip.
+//|
+//|     .. warning:: Changing the frequency may cause issues with other
+//|       subsystems, such as USB, PWM, and PIO. To minimize issues, set the CPU
+//|       frequency before initializing other systems.
+//|     """
+
+#if CIRCUITPY_SETTABLE_PROCESSOR_FREQUENCY
+static mp_obj_t mcu_processor_set_frequency(mp_obj_t self, mp_obj_t freq) {
+    uint32_t value_of_freq = (uint32_t)mp_arg_validate_int_min(mp_obj_get_int(freq), 0, MP_QSTR_frequency);
+    common_hal_mcu_processor_set_frequency(self, value_of_freq);
+    return mp_const_none;
+}
+
+MP_DEFINE_CONST_FUN_OBJ_2(mcu_processor_set_frequency_obj, mcu_processor_set_frequency);
+#endif
+
+
+static mp_obj_t mcu_processor_get_frequency(mp_obj_t self) {
     return mp_obj_new_int_from_uint(common_hal_mcu_processor_get_frequency());
 }
 
 MP_DEFINE_CONST_FUN_OBJ_1(mcu_processor_get_frequency_obj, mcu_processor_get_frequency);
 
-const mp_obj_property_t mcu_processor_frequency_obj = {
-    .base.type = &mp_type_property,
-    .proxy = {(mp_obj_t)&mcu_processor_get_frequency_obj,  // getter
-              MP_ROM_NONE,            // no setter
-              MP_ROM_NONE,            // no deleter
-    },
-};
+#if CIRCUITPY_SETTABLE_PROCESSOR_FREQUENCY
+MP_PROPERTY_GETSET(mcu_processor_frequency_obj,
+    (mp_obj_t)&mcu_processor_get_frequency_obj,
+    (mp_obj_t)&mcu_processor_set_frequency_obj);
+#else
+MP_PROPERTY_GETTER(mcu_processor_frequency_obj,
+    (mp_obj_t)&mcu_processor_get_frequency_obj);
+#endif
 
 //|     reset_reason: microcontroller.ResetReason
 //|     """The reason the microcontroller started up from reset state."""
-//|
-STATIC mp_obj_t mcu_processor_get_reset_reason(mp_obj_t self) {
+static mp_obj_t mcu_processor_get_reset_reason(mp_obj_t self) {
     return cp_enum_find(&mcu_reset_reason_type, common_hal_mcu_processor_get_reset_reason());
 }
 
 MP_DEFINE_CONST_FUN_OBJ_1(mcu_processor_get_reset_reason_obj, mcu_processor_get_reset_reason);
 
-const mp_obj_property_t mcu_processor_reset_reason_obj = {
-    .base.type = &mp_type_property,
-    .proxy = {(mp_obj_t)&mcu_processor_get_reset_reason_obj,  // getter
-              MP_ROM_NONE,            // no setter
-              MP_ROM_NONE,            // no deleter
-    },
-};
+MP_PROPERTY_GETTER(mcu_processor_reset_reason_obj,
+    (mp_obj_t)&mcu_processor_get_reset_reason_obj);
 
 //|     temperature: Optional[float]
 //|     """The on-chip temperature, in Celsius, as a float. (read-only)
 //|
-//|     Is `None` if the temperature is not available."""
+//|     Is `None` if the temperature is not available.
 //|
-STATIC mp_obj_t mcu_processor_get_temperature(mp_obj_t self) {
+//|     **Limitations:** Not available on ESP32 or ESP32-S3. On small SAMD21 builds without external flash,
+//|     the reported temperature has reduced accuracy and precision, to save code space.
+//|     """
+static mp_obj_t mcu_processor_get_temperature(mp_obj_t self) {
     float temperature = common_hal_mcu_processor_get_temperature();
     return isnan(temperature) ? mp_const_none : mp_obj_new_float(temperature);
 }
 
 MP_DEFINE_CONST_FUN_OBJ_1(mcu_processor_get_temperature_obj, mcu_processor_get_temperature);
 
-const mp_obj_property_t mcu_processor_temperature_obj = {
-    .base.type = &mp_type_property,
-    .proxy = {(mp_obj_t)&mcu_processor_get_temperature_obj,  // getter
-              MP_ROM_NONE,            // no setter
-              MP_ROM_NONE,            // no deleter
-    },
-};
+MP_PROPERTY_GETTER(mcu_processor_temperature_obj,
+    (mp_obj_t)&mcu_processor_get_temperature_obj);
 
 //|     uid: bytearray
 //|     """The unique id (aka serial number) of the chip as a `bytearray`. (read-only)"""
-//|
-STATIC mp_obj_t mcu_processor_get_uid(mp_obj_t self) {
+static mp_obj_t mcu_processor_get_uid(mp_obj_t self) {
     uint8_t raw_id[COMMON_HAL_MCU_PROCESSOR_UID_LENGTH];
     common_hal_mcu_processor_get_uid(raw_id);
     return mp_obj_new_bytearray(sizeof(raw_id), raw_id);
@@ -123,35 +150,27 @@ STATIC mp_obj_t mcu_processor_get_uid(mp_obj_t self) {
 
 MP_DEFINE_CONST_FUN_OBJ_1(mcu_processor_get_uid_obj, mcu_processor_get_uid);
 
-const mp_obj_property_t mcu_processor_uid_obj = {
-    .base.type = &mp_type_property,
-    .proxy = {(mp_obj_t)&mcu_processor_get_uid_obj,  // getter
-              MP_ROM_NONE,      // no setter
-              MP_ROM_NONE,      // no deleter
-    },
-};
+MP_PROPERTY_GETTER(mcu_processor_uid_obj,
+    (mp_obj_t)&mcu_processor_get_uid_obj);
 
 //|     voltage: Optional[float]
 //|     """The input voltage to the microcontroller, as a float. (read-only)
 //|
 //|     Is `None` if the voltage is not available."""
 //|
-STATIC mp_obj_t mcu_processor_get_voltage(mp_obj_t self) {
+//|
+static mp_obj_t mcu_processor_get_voltage(mp_obj_t self) {
     float voltage = common_hal_mcu_processor_get_voltage();
     return isnan(voltage) ? mp_const_none : mp_obj_new_float(voltage);
 }
 
 MP_DEFINE_CONST_FUN_OBJ_1(mcu_processor_get_voltage_obj, mcu_processor_get_voltage);
 
-const mp_obj_property_t mcu_processor_voltage_obj = {
-    .base.type = &mp_type_property,
-    .proxy = {(mp_obj_t)&mcu_processor_get_voltage_obj,  // getter
-              MP_ROM_NONE,            // no setter
-              MP_ROM_NONE,            // no deleter
-    },
-};
+MP_PROPERTY_GETTER(mcu_processor_voltage_obj,
+    (mp_obj_t)&mcu_processor_get_voltage_obj);
 
-STATIC const mp_rom_map_elem_t mcu_processor_locals_dict_table[] = {
+static const mp_rom_map_elem_t mcu_processor_locals_dict_table[] = {
+    { MP_ROM_QSTR(MP_QSTR_architecture), MP_ROM_PTR(&mcu_processor_architecture_obj) },
     { MP_ROM_QSTR(MP_QSTR_frequency), MP_ROM_PTR(&mcu_processor_frequency_obj) },
     { MP_ROM_QSTR(MP_QSTR_reset_reason), MP_ROM_PTR(&mcu_processor_reset_reason_obj) },
     { MP_ROM_QSTR(MP_QSTR_temperature), MP_ROM_PTR(&mcu_processor_temperature_obj) },
@@ -159,10 +178,11 @@ STATIC const mp_rom_map_elem_t mcu_processor_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_voltage), MP_ROM_PTR(&mcu_processor_voltage_obj) },
 };
 
-STATIC MP_DEFINE_CONST_DICT(mcu_processor_locals_dict, mcu_processor_locals_dict_table);
+static MP_DEFINE_CONST_DICT(mcu_processor_locals_dict, mcu_processor_locals_dict_table);
 
-const mp_obj_type_t mcu_processor_type = {
-    { &mp_type_type },
-    .name = MP_QSTR_Processor,
-    .locals_dict = (mp_obj_dict_t *)&mcu_processor_locals_dict,
-};
+MP_DEFINE_CONST_OBJ_TYPE(
+    mcu_processor_type,
+    MP_QSTR_Processor,
+    MP_TYPE_FLAG_HAS_SPECIAL_ACCESSORS,
+    locals_dict, &mcu_processor_locals_dict
+    );

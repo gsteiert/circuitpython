@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  * Copyright (c) 2015 Daniel Campora
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -31,7 +31,6 @@
 
 #include "py/runtime.h"
 #include "shared/netutils/netutils.h"
-#include "supervisor/shared/translate.h"
 
 // Takes an array with a raw IPv4 address and returns something like '192.168.0.1'.
 mp_obj_t netutils_format_ipv4_addr(uint8_t *ip, netutils_endian_t endian) {
@@ -64,7 +63,13 @@ void netutils_parse_ipv4_addr(mp_obj_t addr_in, uint8_t *out_ip, netutils_endian
         return;
     }
     const char *s = addr_str;
-    const char *s_top = addr_str + addr_len;
+    const char *s_top;
+    // Scan for the end of valid address characters
+    for (s_top = addr_str; s_top < addr_str + addr_len; s_top++) {
+        if (!(*s_top == '.' || (*s_top >= '0' && *s_top <= '9'))) {
+            break;
+        }
+    }
     for (mp_uint_t i = 3; ; i--) {
         mp_uint_t val = 0;
         for (; s < s_top && *s != '.'; s++) {

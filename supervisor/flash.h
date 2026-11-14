@@ -1,30 +1,9 @@
-/*
- * This file is part of the MicroPython project, http://micropython.org/
- *
- * The MIT License (MIT)
- *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-#ifndef MICROPY_INCLUDED_SUPERVISOR_FLASH_H
-#define MICROPY_INCLUDED_SUPERVISOR_FLASH_H
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+//
+// SPDX-License-Identifier: MIT
+#pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -49,5 +28,14 @@ struct _fs_user_mount_t;
 void supervisor_flash_init_vfs(struct _fs_user_mount_t *vfs);
 void supervisor_flash_flush(void);
 void supervisor_flash_release_cache(void);
+void supervisor_flash_mark_dirty(void);
 
-#endif  // MICROPY_INCLUDED_SUPERVISOR_FLASH_H
+#if CIRCUITPY_STORAGE_MAP_FILE
+// storage.map_file: flash address of a CIRCUITPY FatFs sector, NULL if the port cannot map the
+// drive there; *contiguous receives how many sectors from it are contiguous in the mapping.
+const uint8_t *supervisor_flash_xip_address(uint32_t fatfs_sector, uint32_t *contiguous);
+#endif
+
+void supervisor_flash_set_extended(bool extended);
+bool supervisor_flash_get_extended(void);
+void supervisor_flash_update_extended(void);

@@ -1,3 +1,9 @@
+// This file is part of the CircuitPython project: https://circuitpython.org
+//
+// SPDX-FileCopyrightText: Copyright (c) 2024 Adafruit Industries LLC
+//
+// SPDX-License-Identifier: MIT
+
 // For CircuitPython, use SERCOM settings as prototypes to set
 // the default settings. This file defines these SERCOMs
 //
@@ -15,8 +21,7 @@
 #define PROTOTYPE_SERCOM_USART_ASYNC_CLOCK_FREQUENCY CONF_GCLK_SERCOM2_CORE_FREQUENCY
 
 /* Auto-generated config file hpl_sercom_config.h */
-#ifndef HPL_SERCOM_CONFIG_H
-#define HPL_SERCOM_CONFIG_H
+#pragma once
 
 // <<< Use Configuration Wizard in Context Menu >>>
 
@@ -426,7 +431,7 @@
 // <0x2=>8x arithmetic
 // <0x3=>8x fractional
 // <0x3=>3x
-// <i> How many over-sampling bits used when samling data state
+// <i> How many over-sampling bits used when sampling data state
 // <id> usart_arch_sampr
 #ifndef CONF_SERCOM_2_USART_SAMPR
 #define CONF_SERCOM_2_USART_SAMPR 0x0
@@ -747,5 +752,3 @@
 #endif
 
 // <<< end of configuration section >>>
-
-#endif // HPL_SERCOM_CONFIG_H

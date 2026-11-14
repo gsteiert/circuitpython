@@ -3,7 +3,7 @@
  *
  * The MIT License (MIT)
  *
- * SPDX-FileCopyrightText: Copyright (c) 2013, 2014 Damien P. George
+ * Copyright (c) 2013, 2014 Damien P. George
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,15 +25,24 @@
  */
 
 #include <stdint.h>
-#include <string.h>
+#include <stddef.h>
 
+// CIRCUITPY-CHANGE: additional includes
+#include <stdlib.h>  // for the atoi() prototype
+#include <string.h>
+#include "py/mpconfig.h"
+
+// CIRCUITPY-CHANGE: ifndef
 #ifndef likely
 #define likely(x) __builtin_expect((x), 1)
 #endif
 
+// CIRCUITPY-CHANGE: avoid compiler warnings
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wcast-align"
 void *memcpy(void *dst, const void *src, size_t n) {
+// CIRCUITPY-CHANGE: fancier copy only for full build
+#if CIRCUITPY_FULL_BUILD
     if (likely(!(((uintptr_t)dst) & 3) && !(((uintptr_t)src) & 3))) {
         // pointers aligned
         uint32_t *d = dst;
@@ -46,16 +55,18 @@ void *memcpy(void *dst, const void *src, size_t n) {
 
         if (n & 2) {
             // copy half-word
-            *(uint16_t*)d = *(const uint16_t*)s;
-            d = (uint32_t*)((uint16_t*)d + 1);
-            s = (const uint32_t*)((const uint16_t*)s + 1);
+            *(uint16_t *)d = *(const uint16_t *)s;
+            d = (uint32_t *)((uint16_t *)d + 1);
+            s = (const uint32_t *)((const uint16_t *)s + 1);
         }
 
         if (n & 1) {
             // copy byte
-            *((uint8_t*)d) = *((const uint8_t*)s);
+            *((uint8_t *)d) = *((const uint8_t *)s);
         }
-    } else {
+    } else
+#endif
+    {
         // unaligned access, copy bytes
         uint8_t *d = dst;
         const uint8_t *s = src;
@@ -68,11 +79,20 @@ void *memcpy(void *dst, const void *src, size_t n) {
     return dst;
 }
 
+// CIRCUITPY-CHANGE: extern
+extern void *__memcpy_chk(void *dest, const void *src, size_t len, size_t slen);
+void *__memcpy_chk(void *dest, const void *src, size_t len, size_t slen) {
+    if (len > slen) {
+        return NULL;
+    }
+    return memcpy(dest, src, len);
+}
+
 void *memmove(void *dest, const void *src, size_t n) {
-    if (src < dest && (uint8_t*)dest < (const uint8_t*)src + n) {
+    if (src < dest && (uint8_t *)dest < (const uint8_t *)src + n) {
         // need to copy backwards
-        uint8_t *d = (uint8_t*)dest + n - 1;
-        const uint8_t *s = (const uint8_t*)src + n - 1;
+        uint8_t *d = (uint8_t *)dest + n - 1;
+        const uint8_t *s = (const uint8_t *)src + n - 1;
         for (; n > 0; n--) {
             *d-- = *s--;
         }
@@ -84,6 +104,8 @@ void *memmove(void *dest, const void *src, size_t n) {
 }
 
 void *memset(void *s, int c, size_t n) {
+// CIRCUITPY-CHANGE: fancier copy only for full build
+#if CIRCUITPY_FULL_BUILD
     if (c == 0 && ((uintptr_t)s & 3) == 0) {
         // aligned store of 0
         uint32_t *s32 = s;
@@ -91,13 +113,15 @@ void *memset(void *s, int c, size_t n) {
             *s32++ = 0;
         }
         if (n & 2) {
-            *((uint16_t*)s32) = 0;
-            s32 = (uint32_t*)((uint16_t*)s32 + 1);
+            *((uint16_t *)s32) = 0;
+            s32 = (uint32_t *)((uint16_t *)s32 + 1);
         }
         if (n & 1) {
-            *((uint8_t*)s32) = 0;
+            *((uint8_t *)s32) = 0;
         }
-    } else {
+    } else
+#endif
+    {
         uint8_t *s2 = s;
         for (; n > 0; n--) {
             *s2++ = c;
@@ -106,6 +130,7 @@ void *memset(void *s, int c, size_t n) {
     return s;
 }
 
+// CIRCUITPY-CHANGE
 #pragma GCC diagnostic pop
 
 int memcmp(const void *s1, const void *s2, size_t n) {
@@ -114,8 +139,11 @@ int memcmp(const void *s1, const void *s2, size_t n) {
     while (n--) {
         char c1 = *s1_8++;
         char c2 = *s2_8++;
-        if (c1 < c2) return -1;
-        else if (c1 > c2) return 1;
+        if (c1 < c2) {
+            return -1;
+        } else if (c1 > c2) {
+            return 1;
+        }
     }
     return 0;
 }
@@ -125,8 +153,9 @@ void *memchr(const void *s, int c, size_t n) {
         const unsigned char *p = s;
 
         do {
-            if (*p++ == c)
-                return ((void *)(p - 1));
+            if (*p++ == c) {
+                return (void *)(p - 1);
+            }
         } while (--n != 0);
     }
     return 0;
@@ -144,26 +173,41 @@ int strcmp(const char *s1, const char *s2) {
     while (*s1 && *s2) {
         char c1 = *s1++; // XXX UTF8 get char, next char
         char c2 = *s2++; // XXX UTF8 get char, next char
-        if (c1 < c2) return -1;
-        else if (c1 > c2) return 1;
+        if (c1 < c2) {
+            return -1;
+        } else if (c1 > c2) {
+            return 1;
+        }
     }
-    if (*s2) return -1;
-    else if (*s1) return 1;
-    else return 0;
+    if (*s2) {
+        return -1;
+    } else if (*s1) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 int strncmp(const char *s1, const char *s2, size_t n) {
-    while (*s1 && *s2 && n > 0) {
+    while (n > 0 && *s1 && *s2) {
         char c1 = *s1++; // XXX UTF8 get char, next char
         char c2 = *s2++; // XXX UTF8 get char, next char
         n--;
-        if (c1 < c2) return -1;
-        else if (c1 > c2) return 1;
+        if (c1 < c2) {
+            return -1;
+        } else if (c1 > c2) {
+            return 1;
+        }
     }
-    if (n == 0) return 0;
-    else if (*s2) return -1;
-    else if (*s1) return 1;
-    else return 0;
+    if (n == 0) {
+        return 0;
+    } else if (*s2) {
+        return -1;
+    } else if (*s1) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
 
 char *strcpy(char *dest, const char *src) {
@@ -178,21 +222,21 @@ char *strcpy(char *dest, const char *src) {
 // Public Domain implementation of strncpy from:
 // http://en.wikibooks.org/wiki/C_Programming/Strings#The_strncpy_function
 char *strncpy(char *s1, const char *s2, size_t n) {
-     char *dst = s1;
-     const char *src = s2;
-     /* Copy bytes, one at a time.  */
-     while (n > 0) {
-         n--;
-         if ((*dst++ = *src++) == '\0') {
-             /* If we get here, we found a null character at the end
-                of s2, so use memset to put null bytes at the end of
-                s1.  */
-             memset(dst, '\0', n);
-             break;
-         }
-     }
-     return s1;
- }
+    char *dst = s1;
+    const char *src = s2;
+    /* Copy bytes, one at a time.  */
+    while (n > 0) {
+        n--;
+        if ((*dst++ = *src++) == '\0') {
+            /* If we get here, we found a null character at the end
+               of s2, so use memset to put null bytes at the end of
+               s1.  */
+            memset(dst, '\0', n);
+            break;
+        }
+    }
+    return s1;
+}
 
 // needed because gcc optimises strcpy + strcat to this
 char *stpcpy(char *dest, const char *src) {
@@ -217,29 +261,31 @@ char *strcat(char *dest, const char *src) {
 
 // Public Domain implementation of strchr from:
 // http://en.wikibooks.org/wiki/C_Programming/Strings#The_strchr_function
-char *strchr(const char *s, int c)
-{
+char *strchr(const char *s, int c) {
     /* Scan s for the character.  When this loop is finished,
        s will either point to the end of the string or the
        character we were looking for.  */
-    while (*s != '\0' && *s != (char)c)
+    while (*s != '\0' && *s != (char)c) {
         s++;
-    return ((*s == c) ? (char *) s : 0);
+    }
+    return (*s == c) ? (char *)s : 0;
 }
 
 
 // Public Domain implementation of strstr from:
 // http://en.wikibooks.org/wiki/C_Programming/Strings#The_strstr_function
-char *strstr(const char *haystack, const char *needle)
-{
+char *strstr(const char *haystack, const char *needle) {
     size_t needlelen;
     /* Check for the null needle case.  */
-    if (*needle == '\0')
-        return (char *) haystack;
+    if (*needle == '\0') {
+        return (char *)haystack;
+    }
     needlelen = strlen(needle);
-    for (; (haystack = strchr(haystack, *needle)) != 0; haystack++)
-        if (strncmp(haystack, needle, needlelen) == 0)
-            return (char *) haystack;
+    for (; (haystack = strchr(haystack, *needle)) != 0; haystack++) {
+        if (strncmp(haystack, needle, needlelen) == 0) {
+            return (char *)haystack;
+        }
+    }
     return 0;
 }
 
@@ -257,4 +303,14 @@ size_t strcspn(const char *s, const char *reject) {
         ++s;
     }
     return s - ss;
+}
+
+// Decimal-only, non-negative integers; no leading whitespace handling.
+// Marked weak so a libc-provided atoi() takes precedence if available.
+__attribute__((weak)) int atoi(const char *num) {
+    int value = 0;
+    while (*num >= '0' && *num <= '9') {
+        value = value * 10 + (*num++ - '0');
+    }
+    return value;
 }

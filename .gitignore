@@ -2,13 +2,17 @@
 #
 # SPDX-License-Identifier: MIT
 
+# CIRCUITPY-CHANGES: many additions
+
 # Compiled Sources
 ###################
 *.o
 *.a
 !atmel-samd/asf/**/*.a
+!ports/espressif/microros-lib/**/*.a
 *.elf
 *.bin
+!*.toml.bin
 *.map
 *.hex
 *.dis
@@ -32,13 +36,18 @@ dist/
 ######################
 build/
 bin/
+sizes/
+node_modules/
 circuitpython-stubs/
 test-stubs/
 build-*/
+docs/genrst/
+.mpy_ld_cache-*/
 
-# Test failure outputs
+# Test failure outputs and intermediate artifacts
 ######################
 tests/results/*
+tests/ports/unix/ffi_lib.so
 
 # Python cache files
 ######################
@@ -49,6 +58,9 @@ __pycache__/
 ######################
 GNUmakefile
 user.props
+user_pre_mpconfigport.mk
+user_post_mpconfigport.mk
+user_post_circuitpy_defns.mk
 
 # Sphinx output
 ###############
@@ -72,6 +84,7 @@ TAGS
 ####################
 *~
 
+# MacOS desktop metadata files
 *.DS_Store
 **/*.DS_Store
 *.icloud
@@ -90,3 +103,20 @@ TAGS
 
 # Uncrustify formatting
 *.uncrustify
+
+# clangd cache
+##############
+.cache
+
+**/CLAUDE.local.md
+.claude
+
+# windsurf rules
+.windsurfrules
+
+# git-review-web outputs
+.review
+
+# Zephyr trace files
+**/channel0_0
+**/*.perfetto-trace
